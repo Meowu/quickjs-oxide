@@ -468,7 +468,7 @@ impl<'source> Parser<'source> {
         let value = match token.kind {
             TokenKind::Identifier(identifier) => {
                 self.advance()?;
-                JsString::try_from_utf8(&self.identifier_text(&identifier))?
+                self.intern_identifier_string(&identifier)?
             }
             TokenKind::Keyword(keyword) => {
                 self.advance()?;
