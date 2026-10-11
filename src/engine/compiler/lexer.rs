@@ -1116,12 +1116,11 @@ impl<'a> Lexer<'a> {
                 } else {
                     None
                 };
-                if !private {
-                    if let Some(keyword) =
+                if !private
+                    && let Some(keyword) =
                         keyword_hint.filter(|keyword| self.keyword_is_active(*keyword))
-                    {
-                        return Ok(TokenKind::Keyword(keyword));
-                    }
+                {
+                    return Ok(TokenKind::Keyword(keyword));
                 }
                 let identifier = Identifier {
                     raw,
@@ -3014,10 +3013,10 @@ mod tests {
         let mut escaped = Vec::new();
         loop {
             let token = lexer.next_token().unwrap();
-            if let TokenKind::Identifier(identifier) = token.kind {
-                if identifier.has_escape {
-                    escaped.push((token, identifier));
-                }
+            if let TokenKind::Identifier(identifier) = token.kind
+                && identifier.has_escape
+            {
+                escaped.push((token, identifier));
             }
             if matches!(token.kind, TokenKind::Eof) {
                 break;

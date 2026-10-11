@@ -101,11 +101,11 @@ impl<'source> LookaheadCache<'source> {
             if index < self.base {
                 continue;
             }
-            if let Some(entry) = self.entries.get(index) {
-                if (entry.start, entry.goal, entry.context) == key {
-                    self.cursor.set(index);
-                    return Some(&entry.token);
-                }
+            if let Some(entry) = self.entries.get(index)
+                && (entry.start, entry.goal, entry.context) == key
+            {
+                self.cursor.set(index);
+                return Some(&entry.token);
             }
         }
         let index = self

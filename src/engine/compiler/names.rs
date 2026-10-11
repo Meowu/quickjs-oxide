@@ -66,10 +66,10 @@ impl NameTable {
         // Collisions only miss this one slot; the authoritative map still
         // uses randomized SipHash for arbitrary untrusted identifiers.
         let slot = &self.recent_names[recent_name_slot(name)];
-        if let Some(id) = slot.get() {
-            if self.name(id) == name {
-                return Some(id);
-            }
+        if let Some(id) = slot.get()
+            && self.name(id) == name
+        {
+            return Some(id);
         }
         let id = self.by_name.get(name).copied();
         if id.is_some() {
