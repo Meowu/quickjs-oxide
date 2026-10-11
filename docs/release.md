@@ -46,5 +46,5 @@ The Pages build unpacks every release's playground archive under
 cargo binstall --git https://github.com/pocket-nexus/quickjs-oxide quickjs-oxide-cli
 # From source at a release tag
 cargo install --locked --git https://github.com/pocket-nexus/quickjs-oxide \
-  --tag v0.1.0 quickjs-oxide-cli
+  --tag v0.1.1 quickjs-oxide-cli
 ```

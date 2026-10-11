@@ -4,6 +4,28 @@ All notable changes to quickjs-oxide are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/); before 1.0, minor versions may
 change the embedding API.
 
+## 0.1.1
+
+### Fixed
+
+- Deeply nested source code throws a catchable `SyntaxError: stack overflow`
+  at depths close to QuickJS's instead of aborting the process.
+- `JSON.parse` accepts 10,891 levels of nesting and its reviver 3,630,
+  matching QuickJS at top level; deeper input throws a catchable
+  `stack overflow`.
+- Assigning to an object whose prototype is a module namespace creates the
+  property on that object, as in QuickJS, instead of throwing a `TypeError`.
+
+### Performance
+
+- The lexer and parser compile source 1.1× to 1.35× faster.
+
+### Embedding
+
+- `declare_thread_stack` tells the engine the stack size of a host thread, so
+  parsing can use the whole stack. The `qjs` command line evaluates on a
+  32 MiB thread.
+
 ## 0.1.0
 
 The first release of quickjs-oxide, a JavaScript engine in safe Rust that
