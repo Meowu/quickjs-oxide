@@ -106,14 +106,14 @@ impl<'source> Parser<'source> {
             }
             TokenKind::Punctuator(Punctuator::LeftParen) => {
                 self.advance()?;
-                self.parse_expression()?;
+                self.parse_recursion(ParserStackFrame::Parenthesized, Self::parse_expression)?;
                 self.expect_punctuator(Punctuator::RightParen)?;
             }
             TokenKind::Punctuator(Punctuator::LeftBrace) => {
-                self.parse_object_literal()?;
+                self.parse_recursion(ParserStackFrame::ObjectLiteral, Self::parse_object_literal)?;
             }
             TokenKind::Punctuator(Punctuator::LeftBracket) => {
-                self.parse_array_literal()?;
+                self.parse_recursion(ParserStackFrame::ArrayLiteral, Self::parse_array_literal)?;
             }
             TokenKind::Template(_) => {
                 self.parse_template_literal()?;
@@ -401,6 +401,7 @@ impl<'source> Parser<'source> {
 }
 
 use crate::engine::compiler::lexer::NumericRadix;
+use crate::engine::compiler::stack_guard::ParserStackFrame;
 use crate::engine::value::bigint::JsBigInt;
 use num_bigint::BigUint;
 

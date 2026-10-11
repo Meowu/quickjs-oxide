@@ -23,6 +23,7 @@ use crate::engine::compiler::parser::diagnostics::IdentifierContext;
 use crate::engine::compiler::parser::diagnostics::source_offset;
 use crate::engine::compiler::parser::diagnostics::source_span;
 use crate::engine::compiler::parser::tokens::for_head_regexp_allowed_after;
+use crate::engine::compiler::stack_guard::ParserStackFrame;
 use crate::source::SourceOffset;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,21 +295,27 @@ impl<'source> Parser<'source> {
         self.finish_identifier_parameter_environment()?;
         self.functions[child].context.in_function_body = true;
 
-        let range_end = if block_body {
-            self.parse_function_body()?;
-            let closing_brace = self.current().span;
-            self.relex_current_with_context(parent_context)?;
-            self.expect_punctuator(Punctuator::RightBrace)?;
-            closing_brace.end.byte_offset
-        } else {
-            self.parse_assignment()?;
-            self.emit_instruction(Instruction::Return)?;
-            let range_end = self
-                .previous_end
-                .unwrap_or(self.current().span.start.byte_offset);
-            self.relex_current_with_context(parent_context)?;
-            range_end
-        };
+        // Every arrow is one parser edge; a braced body adds its own frame
+        // cost, matching the pinned first-throw depths for concise (`x=>`)
+        // and block-bodied (`x=>{`) arrow chains.
+        let range_end = self.parse_recursion(ParserStackFrame::Arrow, |parser| {
+            if block_body {
+                parser
+                    .parse_recursion(ParserStackFrame::ArrowBlockBody, Self::parse_function_body)?;
+                let closing_brace = parser.current().span;
+                parser.relex_current_with_context(parent_context)?;
+                parser.expect_punctuator(Punctuator::RightBrace)?;
+                Ok(closing_brace.end.byte_offset)
+            } else {
+                parser.parse_assignment()?;
+                parser.emit_instruction(Instruction::Return)?;
+                let range_end = parser
+                    .previous_end
+                    .unwrap_or(parser.current().span.start.byte_offset);
+                parser.relex_current_with_context(parent_context)?;
+                Ok(range_end)
+            }
+        })?;
         self.functions[child].source.range = Some(
             source_offset(function_span)?
                 ..SourceOffset::try_from_usize(range_end)

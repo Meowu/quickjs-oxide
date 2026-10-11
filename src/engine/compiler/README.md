@@ -43,5 +43,11 @@ first error position are preserved. Escaped identifiers are checked by their
 decoded names; private-name identity and length limits that include `#` are
 preserved. Lazy text handling still reports malformed bytes and length errors
 at scan time. Diagnostic phase, message text, position, first error and
-evaluation order follow the existing contracts and oracle, and parser resource
-limits and stack-exhaustion behavior are checked against the oracle.
+evaluation order follow the existing contracts and oracle.
+
+`stack_guard` bounds parser recursion. Each recursive grammar edge enters
+through `parse_recursion` (or `enter_recursion`/`leave_recursion` for headed
+statements) and charges a weight calibrated to QuickJS's nesting depths;
+every committed token advance also checks the native stack against the
+thread's floor. Both report a catchable `SyntaxError: stack overflow`. A new
+recursive production enters through `parse_recursion` with the closest frame.

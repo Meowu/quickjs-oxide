@@ -513,6 +513,7 @@ fn parameter_assignment_prescan_retains_quickjs_bits_at_the_depth_bound() {
         anonymous_function_definition: None,
         pending_unsupported: None,
         lookahead: Default::default(),
+        stack_guard: crate::engine::compiler::stack_guard::ParserStackGuard::new(),
     };
 
     assert_eq!(parser.parenthesized_parameter_has_assignment(), Some(true));
@@ -571,6 +572,7 @@ fn lookahead_test_parser(source: &str) -> Parser<'_> {
         anonymous_function_definition: None,
         pending_unsupported: None,
         lookahead: Default::default(),
+        stack_guard: crate::engine::compiler::stack_guard::ParserStackGuard::new(),
     }
 }
 

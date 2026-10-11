@@ -17,6 +17,7 @@ use crate::engine::compiler::model::ir::SpannedIrOp;
 use crate::engine::compiler::parser::builder::FunctionBuilder;
 use crate::engine::compiler::parser::context::Parser;
 use crate::engine::compiler::parser::diagnostics::source_offset;
+use crate::engine::compiler::stack_guard::ParserStackFrame;
 use crate::engine::value::PrimitiveValue as Value;
 
 /// One nullish edge in a parser-owned optional chain.
@@ -82,7 +83,7 @@ impl<'source> Parser<'source> {
     pub(super) fn parse_optional_member_suffix(&mut self, member_span: Span) -> Result<(), Error> {
         if self.is_punctuator(Punctuator::LeftBracket) {
             self.advance_expression_start()?;
-            self.parse_expression()?;
+            self.parse_recursion(ParserStackFrame::MemberAccess, Self::parse_expression)?;
             self.expect_punctuator(Punctuator::RightBracket)?;
             let operation =
                 self.emit_instruction_at(Instruction::GetArrayEl, source_offset(member_span)?)?;

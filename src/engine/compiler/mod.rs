@@ -99,6 +99,7 @@ mod object_literal;
 mod optional_chain;
 mod private_reference;
 mod pseudo_binding;
+pub(crate) mod stack_guard;
 mod template;
 
 #[cfg(test)]

@@ -20,6 +20,45 @@ enum SourceGoal {
     Module,
 }
 
+/// Host stack reserved for the evaluation thread.
+///
+/// QuickJS bounds its parser with a one-MiB C stack budget, where recursive
+/// descent frames are small. The Rust parser approximates the same nesting
+/// depths with a weighted budget, but some productions (concise arrows,
+/// conditional expressions, nested function bodies) have larger Rust frames.
+/// An explicitly sized thread lets them reach those depths instead of
+/// stopping early at the parser's physical backstop. The reservation is
+/// virtual address space, not resident memory. Debug frames are roughly an
+/// order of magnitude larger than release frames, so the debug binary
+/// reserves proportionally more.
+#[cfg(debug_assertions)]
+const EVALUATION_STACK_SIZE: usize = 256 * 1024 * 1024;
+#[cfg(not(debug_assertions))]
+const EVALUATION_STACK_SIZE: usize = 32 * 1024 * 1024;
+
+/// Run `task` on a thread with [`EVALUATION_STACK_SIZE`] of host stack. The
+/// runtime and all of its `Rc` state are created inside the closure and stay
+/// on the worker thread for its whole lifetime.
+fn run_on_evaluation_stack(task: impl FnOnce() -> ExitCode + Send + 'static) -> ExitCode {
+    let handle = match std::thread::Builder::new()
+        .name("qjs-evaluation".to_owned())
+        .stack_size(EVALUATION_STACK_SIZE)
+        .spawn(|| {
+            quickjs_oxide::engine::api::declare_thread_stack(EVALUATION_STACK_SIZE);
+            task()
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("qjs: unable to start evaluation thread: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match handle.join() {
+        Ok(exit_code) => exit_code,
+        Err(_) => ExitCode::from(101),
+    }
+}
+
 enum EvaluationError {
     Host(String),
     Runtime(RuntimeError),
@@ -319,22 +358,24 @@ fn main() -> ExitCode {
         // realpath("<cmdline>") and leaves import.meta empty. Its Windows path
         // has no realpath call and initializes file://<cmdline> normally.
         #[cfg(windows)]
-        let main_module_path = (source_goal == SourceGoal::Module).then_some("<cmdline>");
+        let main_module_path =
+            (source_goal == SourceGoal::Module).then_some("<cmdline>".to_owned());
         #[cfg(not(windows))]
         let main_module_path = None;
-        return evaluate(
-            EvaluationSource::Utf8(&source),
-            "<cmdline>",
+        let request = EvaluationRequest {
+            source: EvaluationInput::Utf8(source),
+            filename: "<cmdline>".to_owned(),
             source_goal,
             main_module_path,
-            &args[index..],
-            HostOptions {
+            script_args: args[index..].to_vec(),
+            options: HostOptions {
                 debug_info,
                 print_result,
                 dump_unhandled_promise_rejection,
             },
-            &profile,
-        );
+            profile,
+        };
+        return run_on_evaluation_stack(move || evaluate_request(&request));
     }
     let Some(file) = args.get(index) else {
         println!("usage: qjs [options] [file [args]]");
@@ -350,25 +391,59 @@ fn main() -> ExitCode {
                 SourceGoal::Auto => SourceGoal::Script,
                 source_goal => source_goal,
             };
-            evaluate(
-                EvaluationSource::Bytes(&source),
-                file,
+            let filename = file.clone();
+            let request = EvaluationRequest {
+                source: EvaluationInput::Bytes(source),
+                filename: filename.clone(),
                 source_goal,
-                Some(file),
-                &args[index..],
-                HostOptions {
+                main_module_path: Some(filename),
+                script_args: args[index..].to_vec(),
+                options: HostOptions {
                     debug_info,
                     print_result,
                     dump_unhandled_promise_rejection,
                 },
-                &profile,
-            )
+                profile,
+            };
+            run_on_evaluation_stack(move || evaluate_request(&request))
         }
         Err(error) => {
             eprintln!("{file}: {error}");
             ExitCode::from(1)
         }
     }
+}
+
+/// Owned evaluation inputs, safe to move onto the evaluation worker thread.
+enum EvaluationInput {
+    Utf8(String),
+    Bytes(Vec<u8>),
+}
+
+struct EvaluationRequest {
+    source: EvaluationInput,
+    filename: String,
+    source_goal: SourceGoal,
+    main_module_path: Option<String>,
+    script_args: Vec<String>,
+    options: HostOptions,
+    profile: profiling::Options,
+}
+
+fn evaluate_request(request: &EvaluationRequest) -> ExitCode {
+    let source = match &request.source {
+        EvaluationInput::Utf8(source) => EvaluationSource::Utf8(source),
+        EvaluationInput::Bytes(source) => EvaluationSource::Bytes(source),
+    };
+    evaluate(
+        source,
+        &request.filename,
+        request.source_goal,
+        request.main_module_path.as_deref(),
+        &request.script_args,
+        request.options,
+        &request.profile,
+    )
 }
 
 #[derive(Clone, Copy)]

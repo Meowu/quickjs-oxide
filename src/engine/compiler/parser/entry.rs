@@ -264,6 +264,7 @@ impl<'source> Parser<'source> {
             anonymous_function_definition: None,
             pending_unsupported: None,
             lookahead: Default::default(),
+            stack_guard: crate::engine::compiler::stack_guard::ParserStackGuard::new(),
             module: is_module.then(module::IrModule::default),
             module_declaration_export: ModuleDeclarationExport::None,
             module_declaration_export_target: None,

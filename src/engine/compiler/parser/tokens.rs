@@ -26,6 +26,7 @@ use crate::engine::compiler::pseudo_binding::NEW_TARGET_LOCAL_NAME;
 use crate::engine::value::JsString;
 
 use crate::engine::compiler::parser::diagnostics::source_span;
+use crate::engine::compiler::stack_guard::ParserStackFrame;
 
 impl<'source> Parser<'source> {
     pub(in crate::engine::compiler) fn expect_punctuator(
@@ -623,6 +624,12 @@ impl<'source> Parser<'source> {
         goal: LexicalGoal,
     ) -> Result<(), Error> {
         if !self.at_eof() {
+            // QuickJS samples its C stack in next_token(); check at every
+            // committed token edge so productions without a logical weight
+            // still stop before the host stack does.
+            if self.stack_guard.check_physical().is_err() {
+                return Err(self.syntax_here("stack overflow"));
+            }
             let previous_end = self.token.span.end.byte_offset;
             self.scan_next_token(goal)?;
             self.previous_end = Some(previous_end);
@@ -757,6 +764,41 @@ impl<'source> Parser<'source> {
 
     pub(in crate::engine::compiler) fn syntax_here(&self, message: impl Into<String>) -> Error {
         Error::syntax(message, source_span(self.current().span))
+    }
+
+    /// Charge one recursive grammar production at the current token, run
+    /// `parse`, and release the charge on success. Reaching the weighted
+    /// budget or the physical backstop reports a catchable
+    /// `SyntaxError: stack overflow` at the current token.
+    pub(in crate::engine::compiler) fn parse_recursion<T>(
+        &mut self,
+        frame: ParserStackFrame,
+        parse: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let weight = self.enter_recursion(frame)?;
+        let result = parse(self);
+        if result.is_ok() {
+            self.leave_recursion(weight);
+        }
+        result
+    }
+
+    /// Charge a production whose body does not fit one closure. Headed
+    /// statements (`if`, `while`, `with`, labels, ...) enter after their head,
+    /// at the first controlled-body token, which is where QuickJS's
+    /// `next_token()` check reports the overflow. Pair every `Ok` weight with
+    /// [`Self::leave_recursion`] once the body finishes.
+    pub(in crate::engine::compiler) fn enter_recursion(
+        &mut self,
+        frame: ParserStackFrame,
+    ) -> Result<u64, Error> {
+        self.stack_guard
+            .enter(frame)
+            .map_err(|_| self.syntax_here("stack overflow"))
+    }
+
+    pub(in crate::engine::compiler) fn leave_recursion(&mut self, weight: u64) {
+        self.stack_guard.leave(weight);
     }
 
     pub(in crate::engine::compiler) fn unsupported_here(

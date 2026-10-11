@@ -365,6 +365,7 @@ mod tests {
             anonymous_function_definition: None,
             pending_unsupported: None,
             lookahead: Default::default(),
+            stack_guard: crate::engine::compiler::stack_guard::ParserStackGuard::new(),
         };
         parser.push_scope(ScopeKind::ClassPrivate);
         parser

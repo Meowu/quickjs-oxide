@@ -291,6 +291,9 @@ pub(in crate::engine::compiler) struct Parser<'source> {
     /// keeps every probe `&self`; entries are pure `(offset, goal, context)`
     /// memoizations and only need memory-bounding invalidation.
     pub(in crate::engine::compiler) lookahead: RefCell<LookaheadCache<'source>>,
+    /// Shared logical and physical recursion guard for this parse.
+    pub(in crate::engine::compiler) stack_guard:
+        crate::engine::compiler::stack_guard::ParserStackGuard,
 }
 
 pub(in crate::engine::compiler) enum RootCompileContext {
