@@ -138,6 +138,22 @@ Pinned QuickJS prints `accepted`; Rust prints `SyntaxError`.
 
 ## Open implementation frontiers
 
+- Deeply nested source throws a catchable `SyntaxError: stack overflow`, and
+  the runtime continues afterward. QuickJS stops when its parser exceeds a
+  one-MiB C stack budget, so its limit depends on C frame sizes and shifts by
+  a few percent with the compiler that builds it. The Rust parser charges each
+  recursive grammar edge a weight calibrated to one QuickJS reference build
+  (`src/engine/compiler/stack_guard.rs`), and a token-edge stack check stops
+  productions that carry no weight. Single-production chains such as
+  parentheses, arrays, blocks or arrows therefore throw within that margin of
+  QuickJS. Chains that interleave several productions (a function body inside
+  a call argument, a method body inside an object literal, class heritage,
+  class element and default-parameter heads) are the sum of their edge
+  weights and can throw at a different depth than QuickJS. QuickJS also names
+  the production where its check trips, for example
+  `missing formal parameter`, where Rust reports `stack overflow`. The `qjs`
+  CLI evaluates on a 32 MiB (release) thread so that release builds reach
+  these depths.
 - Dynamic import retries failed acyclic source graphs as pinned QuickJS does.
   Parse-in-progress definitions and request prefixes are published in the same
   callback order as pinned QuickJS, including its one-shot resolution latch.

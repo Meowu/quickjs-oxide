@@ -348,9 +348,13 @@ mod tests {
         )
         .unwrap();
         let mut parser = Parser {
+            token_context: (
+                lexer.context(),
+                crate::engine::compiler::lexer::LexicalGoal::Div,
+            ),
             lexer,
-            tokens: vec![first_token],
-            cursor: 0,
+            token: first_token,
+            previous_end: None,
             current_function: 0,
             in_mode: InMode::Allow,
             functions: vec![root],
@@ -361,6 +365,7 @@ mod tests {
             anonymous_function_definition: None,
             pending_unsupported: None,
             lookahead: Default::default(),
+            stack_guard: crate::engine::compiler::stack_guard::ParserStackGuard::new(),
         };
         parser.push_scope(ScopeKind::ClassPrivate);
         parser

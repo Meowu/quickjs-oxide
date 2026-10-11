@@ -23,6 +23,7 @@ use crate::engine::compiler::parser::diagnostics::IdentifierContext;
 use crate::engine::compiler::parser::diagnostics::source_offset;
 use crate::engine::compiler::parser::diagnostics::source_span;
 use crate::engine::compiler::parser::tokens::for_head_regexp_allowed_after;
+use crate::engine::compiler::stack_guard::ParserStackFrame;
 use crate::source::SourceOffset;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,7 +252,7 @@ impl<'source> Parser<'source> {
             self.advance()?;
         }
         let has_use_strict = if block_body {
-            self.directive_prologue_has_use_strict(self.cursor, parent_strict)?
+            self.directive_prologue_has_use_strict(parent_strict)?
         } else {
             false
         };
@@ -294,29 +295,33 @@ impl<'source> Parser<'source> {
         self.finish_identifier_parameter_environment()?;
         self.functions[child].context.in_function_body = true;
 
-        let range_end = if block_body {
-            self.parse_function_body()?;
-            let closing_brace = self.current().span;
-            self.relex_current_with_context(parent_context)?;
-            self.expect_punctuator(Punctuator::RightBrace)?;
-            closing_brace.end.byte_offset
-        } else {
-            self.parse_assignment()?;
-            self.emit_instruction(Instruction::Return)?;
-            let range_end = self
-                .tokens
-                .get(self.cursor.saturating_sub(1))
-                .map_or(self.current().span.start.byte_offset, |token| {
-                    token.span.end.byte_offset
-                });
-            self.relex_current_with_context(parent_context)?;
-            range_end
-        };
+        // Every arrow is one parser edge; a braced body adds its own frame
+        // cost, matching the pinned first-throw depths for concise (`x=>`)
+        // and block-bodied (`x=>{`) arrow chains.
+        let range_end = self.parse_recursion(ParserStackFrame::Arrow, |parser| {
+            if block_body {
+                parser
+                    .parse_recursion(ParserStackFrame::ArrowBlockBody, Self::parse_function_body)?;
+                let closing_brace = parser.current().span;
+                parser.relex_current_with_context(parent_context)?;
+                parser.expect_punctuator(Punctuator::RightBrace)?;
+                Ok(closing_brace.end.byte_offset)
+            } else {
+                parser.parse_assignment()?;
+                parser.emit_instruction(Instruction::Return)?;
+                let range_end = parser
+                    .previous_end
+                    .unwrap_or(parser.current().span.start.byte_offset);
+                parser.relex_current_with_context(parent_context)?;
+                Ok(range_end)
+            }
+        })?;
         self.functions[child].source.range = Some(
             source_offset(function_span)?
                 ..SourceOffset::try_from_usize(range_end)
                     .map_err(|error| Error::internal(error.to_string()))?,
         );
+        self.functions[child].finish_parsing()?;
         self.current_function = parent;
         let constant = self.add_constant(IrConstant::Child(child))?;
         self.emit(IrOp::MakeClosure(constant))?;
@@ -329,6 +334,9 @@ impl<'source> Parser<'source> {
     /// substitutions and RegExp lexical goals, and accepts `=>` only when no
     /// LineTerminator separates it from the closing parenthesis.
     fn parenthesized_arrow_ahead(&self, opening: Span) -> bool {
+        if let Some(arrow) = self.cached_parenthesized_arrow(opening.start.byte_offset) {
+            return arrow;
+        }
         let mut lexer = self.lexer.clone();
         lexer.seek(opening.start);
         let Ok(first) = self.probe_token(&mut lexer, LexicalGoal::Div) else {
@@ -339,6 +347,8 @@ impl<'source> Parser<'source> {
         }
 
         let mut delimiters = vec![ForHeadDelimiter::Parenthesis];
+        let mut parentheses = vec![opening.start.byte_offset];
+        let mut closed_parenthesis = None;
         let mut goal = LexicalGoal::Div;
         let mut regexp_allowed = true;
         loop {
@@ -347,6 +357,13 @@ impl<'source> Parser<'source> {
             let Ok(mut token) = self.probe_token(&mut lexer, requested_goal) else {
                 return false;
             };
+            if let Some(start) = closed_parenthesis.take() {
+                self.cache_parenthesized_arrow(
+                    start,
+                    !token.line_terminator_before
+                        && matches!(token.kind, TokenKind::Punctuator(Punctuator::Arrow)),
+                );
+            }
             if requested_goal == LexicalGoal::Div
                 && regexp_allowed
                 && matches!(
@@ -367,6 +384,7 @@ impl<'source> Parser<'source> {
                         return false;
                     }
                     delimiters.push(ForHeadDelimiter::Parenthesis);
+                    parentheses.push(token.span.start.byte_offset);
                 }
                 TokenKind::Punctuator(Punctuator::LeftBracket) => {
                     if delimiters.len() >= 255 {
@@ -384,13 +402,17 @@ impl<'source> Parser<'source> {
                     if delimiters.pop() != Some(ForHeadDelimiter::Parenthesis) {
                         return false;
                     }
+                    let start = parentheses.pop().expect("balanced parenthesis probe");
                     if delimiters.is_empty() {
                         let Ok(arrow) = self.probe_token(&mut lexer, LexicalGoal::Div) else {
                             return false;
                         };
-                        return !arrow.line_terminator_before
+                        let result = !arrow.line_terminator_before
                             && matches!(arrow.kind, TokenKind::Punctuator(Punctuator::Arrow));
+                        self.cache_parenthesized_arrow(start, result);
+                        return result;
                     }
+                    closed_parenthesis = Some(start);
                 }
                 TokenKind::Punctuator(Punctuator::RightBracket) => {
                     if delimiters.pop() != Some(ForHeadDelimiter::Bracket) {
@@ -436,6 +458,9 @@ impl<'source> Parser<'source> {
     pub(super) fn arrow_head_ahead(&self) -> Option<ArrowHead> {
         match &self.current().kind {
             TokenKind::Identifier(_) => {
+                if !self.arrow_may_follow_current() {
+                    return None;
+                }
                 let mut lexer = self.lexer.clone();
                 lexer.seek(self.current().span.end);
                 let next = self.probe_token(&mut lexer, LexicalGoal::Div).ok()?;
@@ -449,6 +474,22 @@ impl<'source> Parser<'source> {
                 Some(ArrowHead::Parenthesized)
             }
             _ => None,
+        }
+    }
+
+    /// Reject the ordinary ASCII non-arrow cases before cloning the lexer and
+    /// maintaining its token cache. Comments/Unicode still use the complete
+    /// scanner, including Annex B trivia and LineTerminator restrictions.
+    fn arrow_may_follow_current(&self) -> bool {
+        let bytes = self.lexer.source().as_bytes();
+        let mut offset = self.current().span.end.byte_offset;
+        while matches!(bytes.get(offset), Some(b' ' | b'\t' | 0x0b | 0x0c)) {
+            offset += 1;
+        }
+        match bytes.get(offset) {
+            Some(b'=') => bytes.get(offset + 1) == Some(&b'>'),
+            Some(b'/' | b'<' | b'-' | 0x80..=0xff) => true,
+            _ => false,
         }
     }
 

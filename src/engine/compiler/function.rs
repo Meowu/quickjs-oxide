@@ -21,6 +21,7 @@ use crate::engine::compiler::parser::builder::FunctionBuilder;
 use crate::engine::compiler::parser::context::AnonymousFunctionDefinition;
 use crate::engine::compiler::parser::context::Parser;
 use crate::engine::compiler::relocation::insert_hoist_fragment;
+use crate::engine::compiler::stack_guard::ParserStackFrame;
 use crate::source::SourceOffset;
 
 pub(super) struct ParsedFunctionDefinition {
@@ -616,7 +617,7 @@ impl<'source> Parser<'source> {
         }
         self.expect_punctuator(Punctuator::LeftBrace)?;
 
-        let has_use_strict = self.directive_prologue_has_use_strict(self.cursor, parent_strict)?;
+        let has_use_strict = self.directive_prologue_has_use_strict(parent_strict)?;
         let strict = parent_strict || has_use_strict;
         child_context.strict = strict;
         self.relex_current_with_context(child_context)?;
@@ -715,7 +716,7 @@ impl<'source> Parser<'source> {
             self.insert_generator_initial_yield()?;
         }
         self.functions[child].context.in_function_body = true;
-        self.parse_function_body()?;
+        self.parse_recursion(ParserStackFrame::FunctionBody, Self::parse_function_body)?;
         let closing_brace = self.current().span;
         self.relex_current_with_context(parent_context)?;
         self.expect_punctuator(Punctuator::RightBrace)?;
@@ -724,6 +725,7 @@ impl<'source> Parser<'source> {
                 ..SourceOffset::try_from_usize(closing_brace.end.byte_offset)
                     .map_err(|error| Error::internal(error.to_string()))?,
         );
+        self.functions[child].finish_parsing()?;
         self.current_function = parent;
 
         let constant = self.add_constant(IrConstant::Child(child))?;

@@ -18,6 +18,7 @@ use crate::engine::compiler::model::ir::IrOp;
 use crate::engine::compiler::parser::context::Parser;
 use crate::engine::compiler::parser::diagnostics::source_offset;
 use crate::engine::compiler::parser::diagnostics::source_span;
+use crate::engine::compiler::stack_guard::ParserStackFrame;
 use crate::engine::value::JsString;
 use crate::engine::value::PrimitiveValue as Value;
 
@@ -38,8 +39,16 @@ impl<'source> Parser<'source> {
                 ));
             };
             let kind = part.kind;
-            let invalid_span = part.invalid_escape.map(|error| error.span);
             let Some(cooked) = self.decode_template_cooked(&part, token.span)? else {
+                let initial = matches!(
+                    kind,
+                    TemplatePartKind::Head | TemplatePartKind::NoSubstitution
+                );
+                let invalid_span = self
+                    .lexer
+                    .template_escape_error(token.span.start, initial)
+                    .map_err(crate::engine::compiler::parser::diagnostics::lex_error)?
+                    .map(|error| error.span);
                 return Err(Error::syntax(
                     "malformed escape sequence in string literal",
                     source_span(invalid_span.unwrap_or(token.span)),
@@ -85,7 +94,7 @@ impl<'source> Parser<'source> {
             }
 
             self.advance()?;
-            self.parse_expression()?;
+            self.parse_recursion(ParserStackFrame::Template, Self::parse_expression)?;
             depth += 1;
             self.expect_template_substitution_end()?;
         }
@@ -157,7 +166,7 @@ impl<'source> Parser<'source> {
             }
 
             self.advance()?;
-            self.parse_expression()?;
+            self.parse_recursion(ParserStackFrame::Template, Self::parse_expression)?;
             argument_count = argument_count
                 .checked_add(1)
                 .ok_or_else(|| Error::new(ErrorKind::JsInternal, "stack overflow"))?;
