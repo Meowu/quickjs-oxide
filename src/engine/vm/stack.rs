@@ -13,7 +13,6 @@ use crate::engine::value::JsValue;
 use crate::engine::vm::bindings::{FrameBinding, release_frame_binding as release_binding};
 use crate::engine::vm::exception::runtime_error_to_vm_error;
 use std::ops::Range;
-use std::rc::Rc;
 mod call;
 mod construct;
 
@@ -27,7 +26,8 @@ pub(in crate::engine::vm) struct SlotStore {
     // Native readable-argument buffers: internal values recycled across
     // activations; the public boundary converts at the call site.
     native_argument_buffers: Vec<Vec<JsValue>>,
-    owner: Rc<()>,
+    // Process-unique store identity; windows copy it without a refcount.
+    owner: u64,
     next_window: u64,
     windows: Vec<u64>,
     limit: usize,
@@ -42,7 +42,7 @@ pub(in crate::engine::vm) struct SlotStore {
 /// Not Clone: releasing a frame consumes its authority over the window.
 pub(in crate::engine::vm) struct FrameWindow {
     actual_count: usize,
-    owner: Rc<()>,
+    owner: u64,
     id: u64,
     // Consecutive regions share their boundaries. Keep usize widths and
     // derive the same Range values rather than storing each boundary twice.
@@ -238,12 +238,11 @@ impl Drop for FrameStorageGuard<'_> {
             return;
         }
         let _unwind = self.runtime.unwind_guard();
-        if let Some(storage) = self.storage.take() {
-            if release_frame_storage_in_state(&mut self.runtime.0.state.borrow_mut(), storage)
+        if let Some(storage) = self.storage.take()
+            && release_frame_storage_in_state(&mut self.runtime.0.state.borrow_mut(), storage)
                 .is_err()
-            {
-                self.runtime.0.poisoned.set(true);
-            }
+        {
+            self.runtime.0.poisoned.set(true);
         }
     }
 }
@@ -288,10 +287,10 @@ impl Drop for StateFrameStorageGuard<'_> {
             return;
         }
         let _unwind = crate::engine::api::runtime::RuntimeUnwindGuard::from_flag(self.poisoned);
-        if let Some(storage) = self.storage.take() {
-            if release_frame_storage_in_state(self.state, storage).is_err() {
-                self.poisoned.set(true);
-            }
+        if let Some(storage) = self.storage.take()
+            && release_frame_storage_in_state(self.state, storage).is_err()
+        {
+            self.poisoned.set(true);
         }
     }
 }
@@ -319,8 +318,14 @@ pub(in crate::engine::vm) struct NamedReadOperation {
 }
 pub(in crate::engine::vm) use window::{
     CheckedOrdinaryCallOperands, DirectSlot, FrameExecution, FrameSlots, FrameTransaction,
-    FrameTurn, LinkedReadCompletion,
+    FrameTurn,
 };
+
+fn next_store_identity() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 impl SlotStore {
     pub(in crate::engine::vm) fn new(limit: usize) -> Self {
@@ -329,7 +334,7 @@ impl SlotStore {
             active_end: 0,
             argument_buffer: Vec::new(),
             native_argument_buffers: Vec::new(),
-            owner: Rc::new(()),
+            owner: next_store_identity(),
             next_window: 1,
             windows: Vec::new(),
             limit,
@@ -783,7 +788,7 @@ impl SlotStore {
         }
         Ok(FrameWindow {
             actual_count,
-            owner: self.owner.clone(),
+            owner: self.owner,
             id,
             base,
             original_end,
@@ -816,7 +821,7 @@ impl SlotStore {
     fn check_current(&self, window: &FrameWindow) -> Result<(), Error> {
         #[cfg(feature = "profiling")]
         crate::engine::api::profiling::record_owned_execution_event("slot_authentication");
-        if !Rc::ptr_eq(&self.owner, &window.owner)
+        if self.owner != window.owner
             || self.windows.last() != Some(&window.id)
             || self.active_end != window.whole().end
         {
@@ -1064,6 +1069,25 @@ impl SlotStore {
         Ok(())
     }
 
+    /// Push without building an error: a full stack or an occupied slot hands
+    /// the owner back, and the caller reports it through `push_pending`.
+    #[inline(always)]
+    fn try_push_current(
+        &mut self,
+        window: &mut FrameWindow,
+        value: JsValue,
+    ) -> Result<(), JsValue> {
+        if window.depth >= window.operands().len() {
+            return Err(value);
+        }
+        let index = window.operands().start + window.depth;
+        if self.slots[index].is_some() {
+            return Err(value);
+        }
+        self.install_operand(window, index, value);
+        Ok(())
+    }
+
     #[inline]
     fn push_pending_current(
         &mut self,
@@ -1197,6 +1221,35 @@ impl SlotStore {
     ) -> Result<JsValue, Error> {
         self.check_current(window)?;
         self.pop_current(window)
+    }
+
+    /// The top two operands, deeper first, when both are direct values.
+    #[inline(always)]
+    fn top_pair_current(&self, window: &FrameWindow) -> Option<(&JsValue, &JsValue)> {
+        let top = window.depth.checked_sub(1)?;
+        let below = top.checked_sub(1)?;
+        let start = window.operands().start;
+        match (&self.slots[start + below], &self.slots[start + top]) {
+            (Some(FrameBinding::Direct(below)), Some(FrameBinding::Direct(top))) => {
+                Some((below, top))
+            }
+            _ => None,
+        }
+    }
+
+    /// Drop the two direct operands [`Self::top_pair_current`] returned. The
+    /// caller has already released or never owned their edges.
+    #[inline(always)]
+    fn discard_top_pair_current(&mut self, window: &mut FrameWindow) {
+        let start = window.operands().start;
+        window.depth -= 2;
+        self.slots[start + window.depth] = None;
+        self.slots[start + window.depth + 1] = None;
+        #[cfg(feature = "profiling")]
+        {
+            self.live_slots -= 2;
+            record_owned_storage(Cost::Move(2));
+        }
     }
 
     #[inline]
@@ -1348,6 +1401,46 @@ impl SlotStore {
         runtime: &crate::engine::api::runtime::Runtime,
     ) -> Result<Vec<JsValue>, Error> {
         self.snapshot_argument_tail(window, runtime, 0)
+    }
+
+    /// Append data slots for actual arguments `start..` read from the current
+    /// parameter bindings. The slots borrow the frame's edges; their new
+    /// owner retains them. Returns `false`, appending nothing further, when a
+    /// binding is neither a plain value nor an ordinary captured cell.
+    pub(in crate::engine::vm) fn argument_data_slots_in_state(
+        &self,
+        window: &FrameWindow,
+        state: &crate::engine::heap::runtime::RuntimeState,
+        start: usize,
+        slots: &mut Vec<crate::engine::heap::PropertySlot>,
+    ) -> Result<bool, Error> {
+        use crate::engine::heap::PropertySlot;
+        self.check_current(window)?;
+        let count = window.actual_count;
+        if count > window.parameters().len() {
+            return Err(Error::internal(
+                "actual argument count exceeds parameter window",
+            ));
+        }
+        for index in window.parameters().start + start.min(count)..window.parameters().start + count
+        {
+            let raw = match self.slots[index].as_ref() {
+                Some(FrameBinding::Direct(value)) => value.as_raw(),
+                Some(FrameBinding::Captured(cell)) => {
+                    let cell = state
+                        .heap
+                        .var_ref(*cell)
+                        .map_err(|error| Error::internal(error.to_string()))?;
+                    if cell.kind.is_private() {
+                        return Ok(false);
+                    }
+                    cell.value.clone()
+                }
+                _ => return Ok(false),
+            };
+            slots.push(PropertySlot::Data(raw));
+        }
+        Ok(true)
     }
 
     pub(in crate::engine::vm) fn actual_argument_count(

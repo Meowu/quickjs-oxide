@@ -103,6 +103,7 @@ impl SlotStore {
             count,
             function,
             observes_arguments,
+            None,
         )?;
         let start = prepared.start;
         let base = prepared.window.base;
@@ -124,13 +125,93 @@ impl SlotStore {
             JsValue::Undefined
         };
         let function = callee;
-        let input = crate::engine::vm::CallInput::new(runtime, receiver, JsValue::Undefined, None);
+        let input = crate::engine::vm::CallInput::new(receiver, JsValue::Undefined, None);
         let window = self.publish_ordinary_window(parent, consumed, prepared);
         Ok(InstalledOrdinaryFrame {
             function,
             input,
             window,
         })
+    }
+
+    /// `Function.prototype.apply` on an ordinary callee: the caller's top
+    /// `operands` are `[f, apply, thisArg?, array?]` and the actual arguments
+    /// are copies of `values`, read from that array. All fallible work ends
+    /// before any caller operand moves; `f` and `thisArg` move into the child
+    /// and the apply function and the array return for release afterwards.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn push_current_apply_frame_in_state(
+        &mut self,
+        runtime: &Runtime,
+        state: &mut crate::engine::heap::runtime::RuntimeState,
+        layout: &FrameLayout<'_>,
+        parent: &mut FrameWindow,
+        operands: usize,
+        values: &[JsValue],
+        function: crate::engine::heap::ObjectId,
+        observes_arguments: bool,
+    ) -> Result<(InstalledOrdinaryFrame, [JsValue; 2]), Error> {
+        if !(2..=4).contains(&operands) || operands > parent.depth {
+            return Err(Error::internal("apply call exceeds caller operands"));
+        }
+        let count = values.len();
+        let prepared = self.prepare_ordinary_window_in_state(
+            runtime,
+            state,
+            layout,
+            parent,
+            count,
+            function,
+            observes_arguments,
+            Some(values),
+        )?;
+        // With retained originals, `prepare` filled the parameters; the
+        // originals region at `base` takes a second copy. Otherwise the
+        // parameters start at `base` and take the only copy.
+        let base = prepared.window.base;
+        for (index, value) in values.iter().enumerate() {
+            match state.dup_jsvalue(value) {
+                Ok(copied) => self.slots[base + index] = Some(FrameBinding::Direct(copied)),
+                Err(error) => {
+                    self.clear_unpublished_owned_in_state(
+                        state,
+                        &runtime.0.poisoned,
+                        base..prepared.window.locals_end,
+                    )?;
+                    return Err(runtime_error_to_vm_error(error));
+                }
+            }
+        }
+        let first = parent.operands().start + parent.depth - operands;
+        let mut take = |index: usize| match self.slots[first + index].take() {
+            Some(FrameBinding::Direct(value)) => value,
+            _ => unreachable!("checked apply operand is direct"),
+        };
+        let JsValue::Object(callee) = take(0) else {
+            unreachable!("selected apply receiver is an object")
+        };
+        let apply = take(1);
+        let this_value = if operands > 2 {
+            take(2)
+        } else {
+            JsValue::Undefined
+        };
+        let array = if operands > 3 {
+            take(3)
+        } else {
+            JsValue::Undefined
+        };
+        debug_assert_eq!(callee, function);
+        let input = crate::engine::vm::CallInput::new(this_value, JsValue::Undefined, None);
+        let window = self.publish_ordinary_window(parent, operands, prepared);
+        Ok((
+            InstalledOrdinaryFrame {
+                function: callee,
+                input,
+                window,
+            },
+            [apply, array],
+        ))
     }
 
     /// Prepare the unpublished parameter/local suffix while the caller owns
@@ -146,8 +227,11 @@ impl SlotStore {
         count: usize,
         function: crate::engine::heap::ObjectId,
         observes_arguments: bool,
+        values: Option<&[JsValue]>,
     ) -> Result<PreparedOrdinaryWindow, Error> {
-        let start = parent.operands().start + parent.depth - count;
+        // Actual arguments are the caller's top `count` operands, or `values`.
+        let start =
+            parent.operands().start + parent.depth - if values.is_some() { 0 } else { count };
         // Only language-visible original arguments need a second owner.
         // WeakRef liveness belongs to the enclosing execution turn.
         let keep_originals = observes_arguments;
@@ -191,8 +275,14 @@ impl SlotStore {
         if keep_originals {
             // Complete all fallible retains before moving any caller owner.
             for index in 0..count {
-                let Some(FrameBinding::Direct(value)) = &self.slots[start + index] else {
-                    unreachable!()
+                let value = match values {
+                    Some(values) => &values[index],
+                    None => {
+                        let Some(FrameBinding::Direct(value)) = &self.slots[start + index] else {
+                            unreachable!()
+                        };
+                        value
+                    }
                 };
                 #[cfg(feature = "profiling")]
                 {
@@ -252,7 +342,7 @@ impl SlotStore {
             start,
             next_window,
             window: FrameWindow {
-                owner: self.owner.clone(),
+                owner: self.owner,
                 id: self.next_window,
                 base,
                 original_end,
@@ -349,13 +439,12 @@ impl SlotStore {
         range: std::ops::Range<usize>,
     ) -> Result<(), Error> {
         for index in range {
-            if let Some(binding) = self.slots[index].take() {
-                if let Err(error) =
+            if let Some(binding) = self.slots[index].take()
+                && let Err(error) =
                     crate::engine::vm::bindings::release_frame_binding_in_state(state, binding)
-                {
-                    poisoned.set(true);
-                    return Err(runtime_error_to_vm_error(error));
-                }
+            {
+                poisoned.set(true);
+                return Err(runtime_error_to_vm_error(error));
             }
         }
         Ok(())
@@ -375,6 +464,8 @@ impl SlotStore {
 
     /// The exclusive execution producer supplies the actual retiring window.
     /// No detached window/currentness proof is accepted outside this module.
+    /// Kept out of the interpreter loop: a return there is dispatch plus a call.
+    #[inline(never)]
     pub(super) fn clear_current_frame_owned_in_state(
         &mut self,
         state: &mut crate::engine::heap::runtime::RuntimeState,
@@ -391,11 +482,34 @@ impl SlotStore {
             record_owned_storage(Cost::Clear(cleared));
         }
         self.active_end = window.whole().start;
-        self.clear_unpublished_owned_in_state(
-            state,
-            poisoned,
-            window.whole().start..window.operands().start + window.depth,
-        )?;
+        for index in window.whole().start..window.operands().start + window.depth {
+            // Immediates and empty slots own nothing; only edges are released.
+            let binding = match self.slots[index].take() {
+                None
+                | Some(FrameBinding::Uninitialized)
+                | Some(FrameBinding::Direct(
+                    JsValue::Undefined
+                    | JsValue::Null
+                    | JsValue::Bool(_)
+                    | JsValue::Int(_)
+                    | JsValue::Float(_)
+                    | JsValue::ShortBigInt(_),
+                )) => continue,
+                // A non-final object edge needs only the trusted decrement.
+                Some(FrameBinding::Direct(JsValue::Object(id)))
+                    if state.heap.release_object_nonfinal_trusted(id) =>
+                {
+                    continue;
+                }
+                Some(binding) => binding,
+            };
+            if let Err(error) =
+                crate::engine::vm::bindings::release_frame_binding_in_state(state, binding)
+            {
+                poisoned.set(true);
+                return Err(runtime_error_to_vm_error(error));
+            }
+        }
         debug_assert!(self.slots[window.whole()].iter().all(Option::is_none));
         self.windows.pop();
         Ok(())
@@ -712,7 +826,7 @@ mod tests {
         let receiver = copy_value(&runtime, slots.peek(&parent, 1).unwrap()).unwrap();
         let input = crate::engine::vm::protocol::CallInputGuard::new(
             &runtime,
-            crate::engine::vm::CallInput::new(&runtime, receiver, JsValue::Undefined, None),
+            crate::engine::vm::CallInput::new(receiver, JsValue::Undefined, None),
         );
         assert_eq!(
             runtime
@@ -792,7 +906,7 @@ mod tests {
         let receiver_copy = copy_value(&runtime, slots.peek(&parent, 3).unwrap()).unwrap();
         let input = crate::engine::vm::protocol::CallInputGuard::new(
             &runtime,
-            crate::engine::vm::CallInput::new(&runtime, receiver_copy, JsValue::Undefined, None),
+            crate::engine::vm::CallInput::new(receiver_copy, JsValue::Undefined, None),
         );
         assert_eq!(
             runtime

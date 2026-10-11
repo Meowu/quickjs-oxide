@@ -87,7 +87,6 @@ pub(super) enum ConstructorReturn {
 
 #[derive(Default)]
 pub(super) struct FrameRare {
-    pub property_keys: std::collections::HashMap<u32, crate::engine::object::PropertyKey>,
     pub normalized_this: Option<JsValue>,
     property_wait: Option<Box<super::proxy_get_driver::PendingProxyGet>>,
     pub iterator_wait: Option<crate::engine::vm::iterator_driver::PendingIterator>,
@@ -124,7 +123,7 @@ pub(super) struct FrameEntry {
 impl FrameEntry {
     pub(super) fn release(mut self, runtime: &Runtime) -> Result<(), RuntimeError> {
         runtime.check_poison()?;
-        self.cold.release_legacy();
+        self.cold.release_legacy(runtime);
         runtime.check_poison()?;
         {
             let mut state = runtime.0.state.borrow_mut();
@@ -170,10 +169,10 @@ impl Drop for FrameEntryGuard<'_> {
             return;
         }
         let _unwind = self.runtime.unwind_guard();
-        if let Some(entry) = self.entry.take() {
-            if entry.release(self.runtime).is_err() {
-                self.runtime.0.poisoned.set(true);
-            }
+        if let Some(entry) = self.entry.take()
+            && entry.release(self.runtime).is_err()
+        {
+            self.runtime.0.poisoned.set(true);
         }
     }
 }
@@ -204,14 +203,14 @@ impl<'a> RetiredFrame<'a> {
     }
     pub(super) fn clear_window(&mut self) -> Result<(), Error> {
         let frame = self.frame.as_mut().expect("retired frame owner");
-        if let Some(window) = frame.window.take_optional() {
-            if let Err(error) = self.slots.clear_frame(self.runtime, window) {
-                // Failed window/edge validation means state is not fit for a
-                // second teardown attempt. All ordinary allocation failures
-                // happen before the frame enters this retirement scope.
-                self.runtime.0.poisoned.set(true);
-                return Err(error);
-            }
+        if let Some(window) = frame.window.take_optional()
+            && let Err(error) = self.slots.clear_frame(self.runtime, window)
+        {
+            // Failed window/edge validation means state is not fit for a
+            // second teardown attempt. All ordinary allocation failures
+            // happen before the frame enters this retirement scope.
+            self.runtime.0.poisoned.set(true);
+            return Err(error);
         }
         Ok(())
     }
@@ -248,7 +247,7 @@ impl Drop for RetiredFrame<'_> {
             return;
         }
         if let Some(mut frame) = self.frame.take() {
-            frame.cold.release_legacy();
+            frame.cold.release_legacy(self.runtime);
             if self.runtime.is_poisoned() {
                 return;
             }
@@ -454,11 +453,19 @@ impl FrameStore {
 
     pub(super) fn put_pending(
         &mut self,
+        runtime: &Runtime,
         id: FrameId,
         pending: Box<super::proxy_get_driver::PendingProxyGet>,
     ) -> Result<(), Error> {
-        let frame = self.current_mut(id)?;
+        let frame = match self.current_mut(id) {
+            Ok(frame) => frame,
+            Err(error) => {
+                pending.release(runtime);
+                return Err(error);
+            }
+        };
         if frame.cold.property_wait.is_some() {
+            pending.release(runtime);
             return Err(Error::internal("request overwrote a pending reply"));
         }
         let depth = pending.continuation_depth();
@@ -625,20 +632,37 @@ impl FrameCold {
 
     /// Temporary public-root continuations still use their existing cleanup
     /// protocol. Call this outside the state borrow until their B migration.
-    pub(super) fn release_legacy(&mut self) {
+    pub(super) fn release_legacy(&mut self, runtime: &Runtime) {
         if let Some(rare) = self.rare.get_mut() {
-            rare.property_keys.clear();
-            rare.property_wait = None;
+            if let Some(pending) = rare.property_wait.take() {
+                pending.release(runtime);
+            }
             rare.iterator_wait = None;
             rare.conversion = None;
         }
     }
 
     pub(super) fn release_owned(&mut self, state: &mut RuntimeState) -> Result<(), RuntimeError> {
-        self.release_normalized_this(state)?;
-        self.release_eval_arguments(state)?;
-        self.release_resume_throw(state)?;
-        self.release_constructor_return(state)?;
+        // One borrow of the rare cell takes every payload in a single pass.
+        // Recycle drops the empty shell, so ordinary frames skip this whole
+        // block; keeping it inline avoids four helper calls and four repeated
+        // cell dereferences per rare-carrying frame.
+        if let Some(rare) = self.rare.get_mut() {
+            if let Some(value) = rare.normalized_this.take() {
+                state.release_jsvalue(value)?;
+            }
+            if let Some(values) = rare.eval_arguments.take() {
+                for value in values {
+                    state.release_jsvalue(value)?;
+                }
+            }
+            if let Some(value) = rare.resume_throw.take() {
+                state.release_jsvalue(value)?;
+            }
+            if let Some(ConstructorReturn::Base(value)) = rare.constructor_return.take() {
+                state.release_jsvalue(value)?;
+            }
+        }
         if let Some(guard) = self.entry_guard.take() {
             guard.finish(state)?;
         }
@@ -846,6 +870,7 @@ mod tests {
         let first_id = push(&runtime, &mut first_slots, &mut frames, first).unwrap();
         frames
             .put_pending(
+                &runtime,
                 first_id,
                 PendingProxyGet::with_parent_depth_for_test(context.realm, 3),
             )
@@ -864,7 +889,7 @@ mod tests {
         let pending = frames.take_pending(second_id).unwrap();
         assert_eq!(pending.continuation_depth(), 4);
         assert_wait_depth_matches_scan(&frames);
-        frames.put_pending(second_id, pending).unwrap();
+        frames.put_pending(&runtime, second_id, pending).unwrap();
         assert_wait_depth_matches_scan(&frames);
         release(&runtime, &mut second_slots, frames.pop(second_id).unwrap());
         assert_wait_depth_matches_scan(&frames);
@@ -891,6 +916,7 @@ mod tests {
         assert!(
             frames
                 .put_pending(
+                    &runtime,
                     invalid,
                     PendingProxyGet::with_parent_depth_for_test(context.realm, 2)
                 )
@@ -900,6 +926,7 @@ mod tests {
         assert_wait_depth_matches_scan(&frames);
         frames
             .put_pending(
+                &runtime,
                 id,
                 PendingProxyGet::with_parent_depth_for_test(context.realm, 3),
             )
@@ -908,6 +935,7 @@ mod tests {
         assert!(
             frames
                 .put_pending(
+                    &runtime,
                     id,
                     PendingProxyGet::with_parent_depth_for_test(context.realm, 5)
                 )
@@ -985,7 +1013,6 @@ mod tests {
             return_to: None,
             entry_guard: None,
             input: (CallInput::new(
-                runtime,
                 JsValue::Undefined,
                 JsValue::Undefined,
                 Some(function.try_clone().expect("duplicate root")),

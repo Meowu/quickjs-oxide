@@ -27,7 +27,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
-  RUST_VERSION: "1.88.0"
+  RUST_VERSION: "1.95.0"
 
 jobs:
   fast:
@@ -73,6 +73,7 @@ jobs:
           node --check scripts/test262/audit-negative-diagnostics.mjs
           node --check scripts/test262/test-negative-diagnostic-generator.mjs
           node --check scripts/test262/generate-test262-dynamic-import-a.mjs
+          node --check scripts/test262/generate-test262-dynamic-import-b.mjs
           node --check scripts/test262/generate-test262-tla-core-a.mjs
           node --check scripts/test262/generate-test262-tla-b.mjs
           node --check scripts/test262/test-generate-test262-tla-b.mjs
@@ -99,6 +100,8 @@ jobs:
           cargo test --locked --workspace --all-targets
           cargo test --locked -p quickjs-oxide-cli --features profiling --test profiling --bin qjs
           cargo test --locked -p quickjs-oxide --features profiling --lib profiling_
+          # Release-optimized engine tests with trusted-handle checks restored.
+          cargo test --locked --release -p quickjs-oxide --features checked-handles --lib
           cargo test --locked --workspace --doc
           cargo test --locked --workspace --features test262-host --lib --bins
           cargo test --locked --features test262-host \
@@ -107,8 +110,9 @@ jobs:
             --test oracle test262_
           ./scripts/checks/check-oracle-registry.sh --compiled
 
-      - name: Lint production targets
+      - name: Lint targets
         run: |
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
           cargo clippy --locked --workspace --lib --bins -- -D warnings
           cargo clippy --locked -p quickjs-oxide-cli --features profiling --bin qjs -- -D warnings
           cargo clippy --locked --test oracle -- -D warnings

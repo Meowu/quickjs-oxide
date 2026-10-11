@@ -47,6 +47,90 @@ impl std::ops::Deref for PublishedEvalEnvironment {
     }
 }
 
+/// One remembered ordinary callee per call site. Object ids are generational
+/// and never reused, so an equal id is the same function object, whose
+/// bytecode publication and closure cells never change. The executable is
+/// held weakly: a recursive function's own table must not keep it alive.
+#[derive(Default)]
+pub(crate) struct CallSiteCache(std::cell::RefCell<Option<CachedCallee>>);
+
+struct CachedCallee {
+    function: crate::engine::heap::ObjectId,
+    bytecode: FunctionBytecodeId,
+    data: std::rc::Weak<PublishedFunctionData>,
+    closure: Rc<[crate::engine::heap::VarRefId]>,
+}
+
+impl std::fmt::Debug for CallSiteCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CallSiteCache")
+            .field("filled", &self.0.borrow().is_some())
+            .finish()
+    }
+}
+
+impl CallSiteCache {
+    /// The facts last authenticated for `function` at this site, if any.
+    #[inline]
+    pub(crate) fn hit(
+        &self,
+        domain_id: u64,
+        function: crate::engine::heap::ObjectId,
+    ) -> Option<(
+        PublishedFunctionSnapshot,
+        Rc<[crate::engine::heap::VarRefId]>,
+    )> {
+        let cached = self.0.borrow();
+        let cached = cached
+            .as_ref()
+            .filter(|cached| cached.function == function)?;
+        let data = cached.data.upgrade()?;
+        Some((
+            PublishedFunctionSnapshot {
+                root: Default::default(),
+                bytecode: Some(cached.bytecode),
+                runtime_domain: domain_id,
+                data,
+            },
+            Rc::clone(&cached.closure),
+        ))
+    }
+
+    /// Remember facts that were just authenticated against the live callee.
+    pub(crate) fn fill(
+        &self,
+        function: crate::engine::heap::ObjectId,
+        executable: &PublishedFunctionSnapshot,
+        closure: &Rc<[crate::engine::heap::VarRefId]>,
+    ) {
+        let Some(bytecode) = executable.bytecode else {
+            return;
+        };
+        *self.0.borrow_mut() = Some(CachedCallee {
+            function,
+            bytecode,
+            data: Rc::downgrade(&executable.data),
+            closure: Rc::clone(closure),
+        });
+    }
+}
+
+pub(crate) type CallSiteCacheTable =
+    crate::engine::object::property_ic::SiteCacheTable<CallSiteCache>;
+
+impl crate::engine::object::property_ic::SiteCacheTable<CallSiteCache> {
+    pub(crate) fn new_exec(code: &crate::engine::code::exec::ExecCode) -> Self {
+        use crate::engine::code::exec_opcode::Opcode;
+        Self::new_exec_sites(code, |opcode| {
+            matches!(
+                opcode,
+                Opcode::Call | Opcode::TailCall | Opcode::CallMethod | Opcode::TailCallMethod
+            )
+        })
+    }
+}
+
 /// Heap-resident certificate contains only immutable publication facts, never
 /// Runtime or an external root. The function payload owns the bytecode edge.
 #[derive(Debug, Clone)]
@@ -143,6 +227,11 @@ impl PublishedFunctionSnapshot {
         self.runtime_domain == domain
     }
 
+    #[cfg(test)]
+    pub(crate) fn data_for_test(&self) -> Rc<PublishedFunctionData> {
+        Rc::clone(&self.data)
+    }
+
     pub(crate) fn bytecode_id(&self) -> Option<FunctionBytecodeId> {
         self.bytecode
     }
@@ -154,11 +243,11 @@ impl PublishedFunctionSnapshot {
         if self.bytecode.is_some() && !self.belongs_to(runtime) {
             return Err(RuntimeError::WrongRuntime("function bytecode"));
         }
-        if self.root.get().is_none() {
-            if let Some(id) = self.bytecode {
-                let root = FunctionBytecodeRef::from_borrowed_handle(runtime.clone(), id)?;
-                let _ = self.root.set(root);
-            }
+        if self.root.get().is_none()
+            && let Some(id) = self.bytecode
+        {
+            let root = FunctionBytecodeRef::from_borrowed_handle(runtime.clone(), id)?;
+            let _ = self.root.set(root);
         }
         Ok(())
     }
@@ -187,6 +276,7 @@ impl PublishedFunctionSnapshot {
             runtime_domain: 0,
             data: Rc::new(PublishedFunctionData {
                 has_captured_locals: true,
+                uses_unwind_regions: false,
                 observes_arguments: true,
                 plain_local_initializers: true,
 
@@ -194,6 +284,11 @@ impl PublishedFunctionSnapshot {
                     crate::engine::object::property_ic::PropertyReadCacheTable::new_exec(
                         &crate::engine::code::exec::ExecCode::empty(),
                     ),
+                property_append_ic:
+                    crate::engine::object::append_ic::PropertyAppendCacheTable::new_exec(
+                        &crate::engine::code::exec::ExecCode::empty(),
+                    ),
+                call_ic: CallSiteCacheTable::new_exec(&crate::engine::code::exec::ExecCode::empty()),
                 exec: crate::engine::code::exec::ExecCode::empty(),
                 constants: Rc::from([]),
                 property_key_atoms: None,
@@ -225,10 +320,15 @@ impl std::ops::DerefMut for PublishedFunctionSnapshot {
 #[derive(Debug)]
 pub(crate) struct PublishedFunctionData {
     pub(crate) has_captured_locals: bool,
+    /// The body can push an unwind region (try/catch, for-of iteration), so
+    /// its frame acquires a rare shell; installation prefers a pooled one.
+    pub(crate) uses_unwind_regions: bool,
     pub(crate) observes_arguments: bool,
     pub(crate) plain_local_initializers: bool,
 
     pub(crate) property_read_ic: crate::engine::object::property_ic::PropertyReadCacheTable,
+    pub(crate) property_append_ic: crate::engine::object::append_ic::PropertyAppendCacheTable,
+    pub(crate) call_ic: CallSiteCacheTable,
     pub(crate) exec: crate::engine::code::exec::ExecCode,
     pub(crate) constants: Rc<[BytecodeConstant]>,
     pub(crate) property_key_atoms: Option<Rc<[Atom]>>,
@@ -318,62 +418,79 @@ impl RuntimeState {
 // Both external snapshots and internal authentication share the immutable
 // projection resident on this publication. Building it owns no heap edge.
 fn published_function_data(bytecode: &FunctionBytecodeData) -> Rc<PublishedFunctionData> {
-    let data = bytecode.executable.get_or_init(|| {
-        let data = Rc::new(PublishedFunctionData {
-            has_captured_locals: !bytecode.local_definitions.is_empty()
-                && (0..bytecode.exec.instruction_len()).any(|pc| {
+    let data =
+        bytecode.executable.get_or_init(|| {
+            let data = Rc::new(PublishedFunctionData {
+                has_captured_locals: !bytecode.local_definitions.is_empty()
+                    && (0..bytecode.exec.instruction_len()).any(|pc| {
+                        matches!(
+                            bytecode.exec.opcode_at_source(pc),
+                            Some(
+                                crate::engine::code::exec_opcode::Opcode::FClosure
+                                    | crate::engine::code::exec_opcode::Opcode::Eval
+                                    | crate::engine::code::exec_opcode::Opcode::ApplyEval
+                            )
+                        )
+                    }),
+                uses_unwind_regions: (0..bytecode.exec.instruction_len()).any(|pc| {
                     matches!(
                         bytecode.exec.opcode_at_source(pc),
                         Some(
-                            crate::engine::code::exec_opcode::Opcode::FClosure
+                            crate::engine::code::exec_opcode::Opcode::Catch
+                                | crate::engine::code::exec_opcode::Opcode::ForOfStart
+                                | crate::engine::code::exec_opcode::Opcode::ForAwaitOfStart
+                        )
+                    )
+                }),
+                observes_arguments: (0..bytecode.exec.instruction_len()).any(|pc| {
+                    matches!(
+                        bytecode.exec.opcode_at_source(pc),
+                        Some(
+                            crate::engine::code::exec_opcode::Opcode::Arguments
+                                | crate::engine::code::exec_opcode::Opcode::Rest
                                 | crate::engine::code::exec_opcode::Opcode::Eval
                                 | crate::engine::code::exec_opcode::Opcode::ApplyEval
                         )
                     )
                 }),
-            observes_arguments: (0..bytecode.exec.instruction_len()).any(|pc| {
-                matches!(
-                    bytecode.exec.opcode_at_source(pc),
-                    Some(
-                        crate::engine::code::exec_opcode::Opcode::Arguments
-                            | crate::engine::code::exec_opcode::Opcode::Rest
-                            | crate::engine::code::exec_opcode::Opcode::Eval
-                            | crate::engine::code::exec_opcode::Opcode::ApplyEval
-                    )
-                )
-            }),
-            plain_local_initializers: bytecode.metadata.function_name_local.is_none()
-                && bytecode
-                    .local_definitions
-                    .iter()
-                    .all(|local| !local.is_lexical),
+                plain_local_initializers: bytecode.metadata.function_name_local.is_none()
+                    && bytecode
+                        .local_definitions
+                        .iter()
+                        .all(|local| !local.is_lexical),
 
-            property_read_ic: crate::engine::object::property_ic::PropertyReadCacheTable::new_exec(
-                &bytecode.exec,
-            ),
-            exec: bytecode.exec.clone(),
-            constants: bytecode.constants.clone(),
-            property_key_atoms: bytecode.property_key_atoms.clone(),
-            argument_definitions: bytecode.argument_definitions.clone(),
-            local_definitions: bytecode.local_definitions.clone(),
-            closure_variables: bytecode.closure_variables.clone(),
-            eval_environments: bytecode.eval_environments.clone(),
-            arg_eval_variable_object_local: bytecode
-                .parameter_environment
-                .as_ref()
-                .and_then(|layout| layout.arg_eval_variable_object_local),
-            metadata: bytecode.metadata,
-            realm: bytecode.realm,
+                property_read_ic:
+                    crate::engine::object::property_ic::PropertyReadCacheTable::new_exec(
+                        &bytecode.exec,
+                    ),
+                property_append_ic:
+                    crate::engine::object::append_ic::PropertyAppendCacheTable::new_exec(
+                        &bytecode.exec,
+                    ),
+                call_ic: CallSiteCacheTable::new_exec(&bytecode.exec),
+                exec: bytecode.exec.clone(),
+                constants: bytecode.constants.clone(),
+                property_key_atoms: bytecode.property_key_atoms.clone(),
+                argument_definitions: bytecode.argument_definitions.clone(),
+                local_definitions: bytecode.local_definitions.clone(),
+                closure_variables: bytecode.closure_variables.clone(),
+                eval_environments: bytecode.eval_environments.clone(),
+                arg_eval_variable_object_local: bytecode
+                    .parameter_environment
+                    .as_ref()
+                    .and_then(|layout| layout.arg_eval_variable_object_local),
+                metadata: bytecode.metadata,
+                realm: bytecode.realm,
+            });
+            #[cfg(feature = "profiling")]
+            crate::engine::api::profiling::record_call_buffer_capacity(
+                "executable.published_data_rc",
+                0,
+                1,
+                size_of::<PublishedFunctionData>(),
+            );
+            data
         });
-        #[cfg(feature = "profiling")]
-        crate::engine::api::profiling::record_call_buffer_capacity(
-            "executable.published_data_rc",
-            0,
-            1,
-            size_of::<PublishedFunctionData>(),
-        );
-        data
-    });
     let data = data.clone();
     #[cfg(feature = "profiling")]
     crate::engine::api::profiling::record_call_buffer_share(

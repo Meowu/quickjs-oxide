@@ -948,7 +948,7 @@ impl<'a> Lexer<'a> {
                             return Err(self.error_from(
                                 comment_start,
                                 LexErrorKind::UnterminatedComment,
-                                "unterminated block comment",
+                                "unexpected end of comment",
                             ));
                         }
                     }
@@ -1040,44 +1040,45 @@ impl<'a> Lexer<'a> {
         loop {
             // ASCII fast path: consume a whole identifier run with a byte table
             // instead of decoding and classifying one scalar per character.
-            if let Some(&byte) = self.source.as_bytes().get(self.offset) {
-                if byte < 0x80 && byte != b'\\' {
-                    let valid = if first {
-                        is_ascii_identifier_start_byte(byte)
-                    } else {
-                        is_ascii_identifier_continue_byte(byte)
-                    };
-                    if valid {
-                        let bytes = self.source.as_bytes();
-                        let mut end = self.offset + 1;
-                        while let Some(&next) = bytes.get(end) {
-                            if next < 0x80 && is_ascii_identifier_continue_byte(next) {
-                                end += 1;
-                            } else {
-                                break;
-                            }
+            if let Some(&byte) = self.source.as_bytes().get(self.offset)
+                && byte < 0x80
+                && byte != b'\\'
+            {
+                let valid = if first {
+                    is_ascii_identifier_start_byte(byte)
+                } else {
+                    is_ascii_identifier_continue_byte(byte)
+                };
+                if valid {
+                    let bytes = self.source.as_bytes();
+                    let mut end = self.offset + 1;
+                    while let Some(&next) = bytes.get(end) {
+                        if next < 0x80 && is_ascii_identifier_continue_byte(next) {
+                            end += 1;
+                        } else {
+                            break;
                         }
-                        let run_len = end - self.offset;
-                        let Some(length) = value_utf16_len
-                            .checked_add(run_len)
-                            .filter(|length| *length <= self.string_limit)
-                        else {
-                            // Mirror the per-character error position: the first
-                            // character that pushes the length past the limit.
-                            let consumed = self.string_limit - value_utf16_len + 1;
-                            self.offset += consumed;
-                            self.column = self.column.saturating_add(consumed as u32);
-                            return Err(self.string_too_long(start));
-                        };
-                        value_utf16_len = length;
-                        if let Some(value) = value.as_mut() {
-                            value.push_str(&self.source[self.offset..end]);
-                        }
-                        self.column = self.column.saturating_add(run_len as u32);
-                        self.offset = end;
-                        first = false;
-                        continue;
                     }
+                    let run_len = end - self.offset;
+                    let Some(length) = value_utf16_len
+                        .checked_add(run_len)
+                        .filter(|length| *length <= self.string_limit)
+                    else {
+                        // Mirror the per-character error position: the first
+                        // character that pushes the length past the limit.
+                        let consumed = self.string_limit - value_utf16_len + 1;
+                        self.offset += consumed;
+                        self.column = self.column.saturating_add(consumed as u32);
+                        return Err(self.string_too_long(start));
+                    };
+                    value_utf16_len = length;
+                    if let Some(value) = value.as_mut() {
+                        value.push_str(&self.source[self.offset..end]);
+                    }
+                    self.column = self.column.saturating_add(run_len as u32);
+                    self.offset = end;
+                    first = false;
+                    continue;
                 }
             }
 
@@ -1399,6 +1400,20 @@ impl<'a> Lexer<'a> {
             had_separator |= run.had_separator;
         } else {
             leading_zero = self.peek_char() == Some('0');
+            // QuickJS rejects any strict-mode digit after a leading zero
+            // before it scans the rest of the literal.
+            if leading_zero
+                && self.options.context.strict
+                && self
+                    .peek_nth_char(1)
+                    .is_some_and(|next| next.is_ascii_digit())
+            {
+                return Err(self.error_from(
+                    start,
+                    LexErrorKind::InvalidNumber,
+                    "octal literals are deprecated in strict mode",
+                ));
+            }
             if leading_zero && self.peek_nth_char(1) == Some('_') {
                 self.bump_char();
                 self.bump_char();
@@ -1452,13 +1467,6 @@ impl<'a> Lexer<'a> {
                 start,
                 LexErrorKind::InvalidNumber,
                 "numeric separators are not allowed in legacy leading-zero literals",
-            ));
-        }
-        if legacy_leading_zero && self.options.context.strict {
-            return Err(self.error_from(
-                start,
-                LexErrorKind::InvalidNumber,
-                "legacy leading-zero numeric literals are not allowed in strict mode",
             ));
         }
 

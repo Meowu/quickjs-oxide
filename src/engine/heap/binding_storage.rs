@@ -7,6 +7,13 @@ impl Heap {
         Ok(&self.var_refs.live(id)?.data)
     }
 
+    /// Trusted read of a cell that a live closure or frame edge keeps alive.
+    /// Identity is checked only in debug and `checked-handles` builds.
+    #[inline]
+    pub(crate) fn var_ref_fast(&self, id: VarRefId) -> &VarRefData {
+        &self.var_refs.live_fast(id).data
+    }
+
     /// Read immutable executable data without promoting any raw cpool edges.
     pub fn function_bytecode(
         &self,
@@ -14,6 +21,20 @@ impl Heap {
     ) -> Result<&FunctionBytecodeData, HeapError> {
         match self.live_node(RawId::FunctionBytecode(id))?.data {
             NodeData::FunctionBytecode(ref bytecode) => Ok(bytecode),
+            NodeData::Object(_) | NodeData::Context(_) => Err(HeapError::Invariant(
+                "typed bytecode lookup reached another node payload",
+            )),
+        }
+    }
+
+    /// Checked bytecode read plus its strong count from the same slot.
+    pub(crate) fn function_bytecode_with_strong(
+        &self,
+        id: FunctionBytecodeId,
+    ) -> Result<(&FunctionBytecodeData, u32), HeapError> {
+        let node = self.live_node(RawId::FunctionBytecode(id))?;
+        match node.data {
+            NodeData::FunctionBytecode(ref bytecode) => Ok((bytecode, node.strong.get())),
             NodeData::Object(_) | NodeData::Context(_) => Err(HeapError::Invariant(
                 "typed bytecode lookup reached another node payload",
             )),

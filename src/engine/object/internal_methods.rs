@@ -11,9 +11,9 @@ use crate::engine::api::error::{Error, ErrorKind, NativeErrorKind};
 use crate::engine::api::runtime::Runtime;
 use crate::engine::api::runtime_error::RuntimeError;
 
-use crate::engine::atom::PropertyKeyKind;
+use crate::engine::atom::{Atom, AtomIdx, PropertyKeyKind};
 use crate::engine::builtins::CanonicalNumericIndex;
-use crate::engine::heap::{ContextId, ObjectPayload, ProxyData};
+use crate::engine::heap::{ContextId, ObjectPayload, ProxyData, runtime::RuntimeState};
 use crate::engine::object::operations::{
     InternalDefineResult, InternalSetResult, PropertyDefineOutcome, PropertySetAction,
 };
@@ -51,21 +51,27 @@ pub(crate) use call::ProxyCallStep;
 pub(crate) use construct::{ProxyConstructResume, ProxyConstructStep};
 mod get;
 mod method;
+#[allow(unused_imports)] // Raw Proxy consumers are integrated in separate B2 commits.
+pub(crate) use method::{
+    StateMethodResume, StateMethodSelection, StateMethodStep, StateMethodTarget, StateRootedProxy,
+};
 mod own_keys;
 mod own_property;
 
 pub(crate) use boolean::ProxyBooleanResume;
 pub(crate) use boolean::{ProxyBooleanKind, ProxyBooleanStep};
 
-pub(crate) use get::ProxyGetResume;
 use get::ProxyGetStep;
+pub(crate) use get::{
+    ProxyGetEffect, ProxyGetResume, resolve_boundary as resolve_read_boundary_in_state,
+};
 
 pub(crate) use get::ProxyGetStep as OwnedProxyGetStep;
 
 pub(crate) use own_keys::{KeysResume, KeysStep};
 
 pub(crate) use own_property::ProxyOwnResume;
-pub(crate) use own_property::ProxyOwnStep;
+pub(crate) use own_property::{ProxyOwnStep, StateOwnPrefix};
 
 struct RootedProxy {
     proxy: ObjectRef,
@@ -834,46 +840,9 @@ impl Runtime {
         key: &PropertyKey,
         receiver: JsValue,
     ) -> Result<Completion, RuntimeError> {
-        let mut step =
+        let step =
             ProxyGetStep::start(self, realm, object.try_clone()?, key.try_clone()?, receiver)?;
-        loop {
-            step = match step {
-                ProxyGetStep::Complete(completion) => return Ok(completion),
-                ProxyGetStep::Read { mut resume } => {
-                    let object = resume.take_read_object();
-                    let key = resume.take_read_key();
-                    let receiver = resume.take_read_receiver();
-                    resume.resume(
-                        self,
-                        self.internal_get_jsvalue(realm, &object, &key, receiver)?,
-                    )?
-                }
-                ProxyGetStep::Call { mut resume } => {
-                    let target = resume.take_call_target();
-                    let receiver = resume.take_call_receiver();
-                    let arguments = resume.take_call_arguments();
-                    {
-                        let completion = match target {
-                            DirectCallTarget::Callable(callable) => {
-                                self.call_internal_jsvalue(realm, &callable, receiver, arguments)?
-                            }
-                            DirectCallTarget::NonCallableProxy(proxy) => {
-                                self.call_proxy_jsvalue(realm, &proxy, receiver, arguments)?
-                            }
-                        };
-                        resume.resume(self, completion)?
-                    }
-                }
-                ProxyGetStep::Descriptor { mut resume } => {
-                    let object = resume.take_descriptor_object();
-                    let key = resume.take_descriptor_key();
-                    resume.descriptor(
-                        self,
-                        self.internal_get_own_property_owned(realm, &object, &key)?,
-                    )?
-                }
-            };
-        }
+        self.finish_proxy_get_step(realm, step)
     }
 
     pub(crate) fn internal_set(
@@ -1052,15 +1021,11 @@ impl Runtime {
         loop {
             step = match step {
                 ProxySetStep::Complete(result) => return Ok(result),
-                ProxySetStep::Read { mut resume } => {
-                    let object = resume.take_read_object();
-                    let key = resume.take_read_key();
-                    let receiver = resume.take_read_receiver();
-                    resume.resume(
-                        self,
-                        self.internal_get_jsvalue(realm, &object, &key, receiver)?,
-                    )?
+                ProxySetStep::StateRead { mut resume } => {
+                    let (effect, atom) = resume.take_state_read();
+                    resume.resume(self, self.finish_selected_method_read(realm, effect, atom)?)?
                 }
+
                 ProxySetStep::Call { mut resume } => {
                     let target = resume.take_call_target();
                     let receiver = resume.take_call_receiver();
@@ -1105,19 +1070,28 @@ impl Runtime {
         NativeConversion<Option<crate::engine::object::OwnedCompletePropertyDescriptor>>,
         RuntimeError,
     > {
-        let mut step = ProxyOwnStep::start(self, realm, object.try_clone()?, key.try_clone()?)?;
+        self.finish_proxy_own_step(
+            realm,
+            ProxyOwnStep::start(self, realm, object.try_clone()?, key.try_clone()?)?,
+        )
+    }
+
+    pub(crate) fn finish_proxy_own_step(
+        &self,
+        realm: ContextId,
+        mut step: ProxyOwnStep,
+    ) -> Result<
+        NativeConversion<Option<crate::engine::object::OwnedCompletePropertyDescriptor>>,
+        RuntimeError,
+    > {
         loop {
             step = match step {
                 ProxyOwnStep::Complete(result) => return Ok(result),
-                ProxyOwnStep::Read { mut resume } => {
-                    let object = resume.take_read_object();
-                    let key = resume.take_read_key();
-                    let receiver = resume.take_read_receiver();
-                    resume.resume(
-                        self,
-                        self.internal_get_jsvalue(realm, &object, &key, receiver)?,
-                    )?
+                ProxyOwnStep::StateRead { mut resume } => {
+                    let (effect, atom) = resume.take_state_read();
+                    resume.resume(self, self.finish_selected_method_read(realm, effect, atom)?)?
                 }
+
                 ProxyOwnStep::Call { mut resume } => {
                     let target = resume.take_call_target();
                     let receiver = resume.take_call_receiver();
@@ -1164,15 +1138,18 @@ impl Runtime {
         key: &PropertyKey,
         descriptor: crate::engine::object::OwnedPropertyDescriptor,
     ) -> Result<NativeConversion<InternalDefineResult>, RuntimeError> {
-        if self.proxy_snapshot_if_any(object)?.is_some() {
-            return self.proxy_define_owned_property(realm, object, key, descriptor);
-        }
-        if let Some(accepted) = self.try_define_owned_property(object, key, &descriptor)? {
+        self.validate_object_and_key(object, key)?;
+        let mut descriptor = Some(descriptor);
+        if let Some(accepted) = self.try_define_owned_request(object, key, &mut descriptor)? {
             return Ok(NativeConversion::Value(if accepted {
                 InternalDefineResult::Defined
             } else {
                 InternalDefineResult::RejectedOrdinary(object.try_clone()?)
             }));
+        }
+        let descriptor = descriptor.expect("exotic Define retains its descriptor");
+        if self.proxy_snapshot_if_any(object)?.is_some() {
+            return self.proxy_define_owned_property(realm, object, key, descriptor);
         }
         Ok(
             match self.define_owned_property_in_realm(Some(realm), object, key, &descriptor)? {
@@ -1194,25 +1171,31 @@ impl Runtime {
         key: &PropertyKey,
         descriptor: crate::engine::object::OwnedPropertyDescriptor,
     ) -> Result<NativeConversion<InternalDefineResult>, RuntimeError> {
-        let mut step = ProxyDefineStep::start(
-            self,
+        self.finish_proxy_define_step(
             realm,
-            object.try_clone()?,
-            key.try_clone()?,
-            descriptor,
-        )?;
+            ProxyDefineStep::start(
+                self,
+                realm,
+                object.try_clone()?,
+                key.try_clone()?,
+                descriptor,
+            )?,
+        )
+    }
+
+    pub(crate) fn finish_proxy_define_step(
+        &self,
+        realm: ContextId,
+        mut step: ProxyDefineStep,
+    ) -> Result<NativeConversion<InternalDefineResult>, RuntimeError> {
         loop {
             step = match step {
                 ProxyDefineStep::Complete(result) => return Ok(result),
-                ProxyDefineStep::Read { mut resume } => {
-                    let object = resume.take_read_object();
-                    let key = resume.take_read_key();
-                    let receiver = resume.take_read_receiver();
-                    resume.resume(
-                        self,
-                        self.internal_get_jsvalue(realm, &object, &key, receiver)?,
-                    )?
+                ProxyDefineStep::StateRead { mut resume } => {
+                    let (effect, atom) = resume.take_state_read();
+                    resume.resume(self, self.finish_selected_method_read(realm, effect, atom)?)?
                 }
+
                 ProxyDefineStep::Call { mut resume } => {
                     let target = resume.take_call_target();
                     let receiver = resume.take_call_receiver();
@@ -1438,4 +1421,26 @@ fn proxy_define_descriptor_is_compatible(
         return false;
     }
     true
+}
+
+impl RuntimeState {
+    pub(in crate::engine::object) fn property_key_argument_in_state(
+        &mut self,
+        key: Atom,
+    ) -> Result<JsValue, RuntimeError> {
+        match self.atoms.property_key_kind(key)? {
+            PropertyKeyKind::String => self
+                .heap
+                .allocate_string(self.atoms.to_js_string(key)?)
+                .map(JsValue::String)
+                .map_err(Into::into),
+            PropertyKeyKind::Symbol => {
+                self.atoms.retain(key)?;
+                Ok(JsValue::Symbol(AtomIdx::from_raw(key.raw())))
+            }
+            PropertyKeyKind::Private => Err(RuntimeError::Invariant(
+                "private key escaped into an ECMAScript internal method",
+            )),
+        }
+    }
 }

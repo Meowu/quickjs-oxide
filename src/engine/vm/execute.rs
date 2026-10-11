@@ -130,7 +130,36 @@ impl<'a> FrameCursor<'a> {
         self.with_slots(|slots| slots.push(value))
     }
 
+    // A shared out-of-line call: inlining it grows the dispatch function.
+    #[inline(never)]
     fn commit_owned(&mut self, state: &mut RuntimeState, value: JsValue) -> Result<(), Error> {
+        match self.transaction.slots().try_push(value) {
+            Ok(()) => Ok(()),
+            Err(value) => self.commit_owned_rejected(state, value),
+        }
+    }
+
+    /// The borrowed-field hit path pays this commit on every iteration; the
+    /// measurement after item 5e-2 shows the dispatch function's size is
+    /// neutral, so the accepted push completes inline at those two sites
+    /// while every other consumer keeps the shared out-of-line call.
+    #[inline(always)]
+    fn commit_owned_hot(&mut self, state: &mut RuntimeState, value: JsValue) -> Result<(), Error> {
+        match self.transaction.slots().try_push(value) {
+            Ok(()) => Ok(()),
+            Err(value) => self.commit_owned_rejected(state, value),
+        }
+    }
+
+    /// A rejected push reports its error and releases the owner it handed
+    /// back. Out of line so the accepted push makes no call.
+    #[cold]
+    #[inline(never)]
+    fn commit_owned_rejected(
+        &mut self,
+        state: &mut RuntimeState,
+        value: JsValue,
+    ) -> Result<(), Error> {
         let mut pending = Some(value);
         let result = self.with_slots(|slots| slots.push_pending(&mut pending));
         if let Some(value) = pending {
@@ -145,6 +174,19 @@ impl<'a> FrameCursor<'a> {
     /// an already materialized frame; an error materializes the virtual frame
     /// only after this segment returns.
     fn strict_comparison(
+        &mut self,
+        state: &mut RuntimeState,
+        token: ActiveFrameToken,
+    ) -> Result<bool, Error> {
+        // Nothing on the fast path can fail or observe the fault PC.
+        if let Some(equal) = self.transaction.slots().strict_equality_fast(state) {
+            return Ok(equal);
+        }
+        self.strict_comparison_general(state, token)
+    }
+
+    #[inline(never)]
+    fn strict_comparison_general(
         &mut self,
         state: &mut RuntimeState,
         token: ActiveFrameToken,
@@ -303,6 +345,8 @@ pub(super) enum VmAction {
     DropCatch,
     NipCatch,
     Throw,
+    /// The execution owns a freshly prepared exception in pending.
+    ThrowPrepared,
     Materialize,
     BindingError {
         index: u32,
@@ -386,6 +430,7 @@ impl VmAction {
             Self::DropCatch => "execute.action.drop_catch",
             Self::NipCatch => "execute.action.nip_catch",
             Self::Throw => "execute.action.throw",
+            Self::ThrowPrepared => "execute.action.throw_prepared",
             Self::Materialize => "execute.action.materialize",
             Self::BindingError { .. } => "execute.action.binding_error",
             Self::PrivateInitialize { .. } => "execute.action.private_initialize",
@@ -412,15 +457,40 @@ pub(super) fn execute_frame(
     execute_frame_in_state(runtime, &mut state, execution, id)
 }
 
+/// Checked entry for tests that drive a frame they built themselves.
+#[cfg(test)]
 pub(super) fn execute_frame_in_state(
     runtime: &Runtime,
     state: &mut RuntimeState,
     execution: &mut RunningExecution,
     id: FrameId,
 ) -> Result<VmAction, Error> {
+    execute_admitted_in_state(runtime, state, FrameExecution::admit(execution, id)?)
+}
+
+/// Re-enter the frame the ready loop just took from the execution itself.
+/// Its window and resume PC were published by this module's own exits and
+/// completions, so they are rechecked only in debug and `checked-handles`.
+pub(super) fn resume_current_in_state(
+    runtime: &Runtime,
+    state: &mut RuntimeState,
+    execution: &mut RunningExecution,
+    id: FrameId,
+) -> Result<VmAction, Error> {
+    execute_admitted_in_state(
+        runtime,
+        state,
+        FrameExecution::admit_trusted(execution, id)?,
+    )
+}
+
+fn execute_admitted_in_state(
+    runtime: &Runtime,
+    state: &mut RuntimeState,
+    mut segment: FrameExecution<'_>,
+) -> Result<VmAction, Error> {
     #[cfg(feature = "profiling")]
     crate::engine::api::profiling::record_owned_execution_event("core.frame_executor_entry");
-    let mut segment = FrameExecution::admit(execution, id)?;
     loop {
         let action = {
             let FrameTurn {
@@ -552,7 +622,7 @@ pub(super) fn execute_frame_in_state(
                                 },
                             );
                             if let Some(value) = selected {
-                                cursor.commit_owned(state, value)?;
+                                cursor.commit_owned_hot(state, value)?;
                                 #[cfg(feature = "profiling")]
                                 crate::engine::api::profiling::record_owned_execution_event(
                                     "local_completion.borrowed_this_read",
@@ -1574,7 +1644,7 @@ pub(super) fn execute_frame_in_state(
                             },
                         );
                         if let Some(value) = selection {
-                            cursor.commit_owned(state, value)?;
+                            cursor.commit_owned_hot(state, value)?;
                             #[cfg(feature = "profiling")]
                             crate::engine::api::profiling::record_owned_execution_event(
                                 "local_completion.borrowed_named_read",
@@ -1674,18 +1744,18 @@ pub(super) fn execute_frame_in_state(
                             });
                             continue;
                         }
-                        if matches!(comparison, Opcode::Eq | Opcode::Neq) {
-                            if let Some(equal) = cursor.with_slots(|slots| {
+                        if matches!(comparison, Opcode::Eq | Opcode::Neq)
+                            && let Some(equal) = cursor.with_slots(|slots| {
                                 slots.nullish_equality_in_state(state, &runtime.0.poisoned)
-                            })? {
-                                let decision = equal != (comparison == Opcode::Neq);
-                                cursor.advance(if decision == (descriptor & 0x400 != 0) {
-                                    decoded.operand(1) as usize
-                                } else {
-                                    next + 2
-                                });
-                                continue;
-                            }
+                            })?
+                        {
+                            let decision = equal != (comparison == Opcode::Neq);
+                            cursor.advance(if decision == (descriptor & 0x400 != 0) {
+                                decoded.operand(1) as usize
+                            } else {
+                                next + 2
+                            });
+                            continue;
                         }
                         let completed = cursor.with_slots(|slots| {
                             slots.binary_number(|left, right| {
@@ -1840,20 +1910,19 @@ pub(super) fn execute_frame_in_state(
                     }
                     Opcode::GetVarRef | Opcode::GetVarRefCheck => {
                         let index = published_u16(operand);
-                        let value = if cursor
-                            .with_slots(|slots| Ok(slots.has_operand_capacity(1)))?
-                        {
-                            let root = owners
-                                .function
-                                .closures()
-                                .get(runtime, usize::from(index))
-                                .ok_or_else(|| {
-                                    Error::internal("closure variable index is out of bounds")
-                                })?;
-                            super::bindings::try_read_captured_immediate_in_state(state, root.id())
-                        } else {
-                            None
-                        };
+                        let value =
+                            if cursor.with_slots(|slots| Ok(slots.has_operand_capacity(1)))? {
+                                let root = owners
+                                    .function
+                                    .closures()
+                                    .get(runtime, usize::from(index))
+                                    .ok_or_else(|| {
+                                        Error::internal("closure variable index is out of bounds")
+                                    })?;
+                                super::bindings::try_read_captured_in_state(state, root.id())
+                            } else {
+                                None
+                            };
                         #[cfg(feature = "profiling")]
                         crate::engine::api::profiling::record_execution_outcome(
                             runtime,
@@ -1863,7 +1932,7 @@ pub(super) fn execute_frame_in_state(
                             if value.is_some() { None } else { Some("guard") },
                         );
                         if let Some(value) = value {
-                            cursor.commit_push(value)?;
+                            cursor.commit_owned(state, value)?;
                         } else {
                             break 'dispatch Ok(VmAction::Binding {
                                 source: BindingSource::Closure,
@@ -2234,16 +2303,16 @@ pub(super) fn execute_frame_in_state(
                             })
                         })?;
                         if !completed {
-                            if matches!(decoded.opcode, Opcode::Eq | Opcode::Neq) {
-                                if let Some(equal) = cursor.with_slots(|slots| {
+                            if matches!(decoded.opcode, Opcode::Eq | Opcode::Neq)
+                                && let Some(equal) = cursor.with_slots(|slots| {
                                     slots.nullish_equality_in_state(state, &runtime.0.poisoned)
-                                })? {
-                                    cursor.commit_push(JsValue::Bool(
-                                        equal != (decoded.opcode == Opcode::Neq),
-                                    ))?;
-                                    cursor.advance(next);
-                                    continue;
-                                }
+                                })?
+                            {
+                                cursor.commit_push(JsValue::Bool(
+                                    equal != (decoded.opcode == Opcode::Neq),
+                                ))?;
+                                cursor.advance(next);
+                                continue;
                             }
                             if matches!(decoded.opcode, Opcode::StrictEq | Opcode::StrictNeq) {
                                 let equal = cursor.strict_comparison(state, active_frame)?;
@@ -2435,21 +2504,41 @@ pub(super) fn execute_frame_in_state(
                             });
                         }
                     }
-                    Opcode::PutField => {
+                    Opcode::PutField | Opcode::DefineField => {
+                        // One arm for both static-key stores keeps the loop's
+                        // live state unchanged; definitions call out of line.
+                        let define = decoded.opcode == Opcode::DefineField;
+                        let declined = || {
+                            if define {
+                                VmAction::DefineProperty {
+                                    key: Some(operand),
+                                    method: None,
+                                }
+                            } else {
+                                VmAction::SetProperty(Some(operand))
+                            }
+                        };
                         let Some(generation) = property_generation.checked_add(1) else {
-                            break 'dispatch Ok(VmAction::SetProperty(Some(operand)));
+                            break 'dispatch Ok(declined());
                         };
                         if !cursor.with_slots(|slots| {
-                            slots.try_owned_field_write_in_state(
-                                state,
-                                &runtime.0.poisoned,
-                                &runtime.0.gc_pressure,
-                                runtime.domain_id(),
-                                executable,
-                                operand,
-                            )
+                            if define {
+                                slots.try_owned_field_define_in_state(
+                                    state, runtime, executable, pc, operand,
+                                )
+                            } else {
+                                slots.try_owned_field_write_in_state(
+                                    state,
+                                    &runtime.0.poisoned,
+                                    &runtime.0.gc_pressure,
+                                    runtime.domain_id(),
+                                    executable,
+                                    pc,
+                                    operand,
+                                )
+                            }
                         })? {
-                            break 'dispatch Ok(VmAction::SetProperty(Some(operand)));
+                            break 'dispatch Ok(declined());
                         }
                         *property_generation = generation;
                     }
@@ -2458,7 +2547,9 @@ pub(super) fn execute_frame_in_state(
                             break 'dispatch Ok(VmAction::SetProperty(None));
                         };
                         if !cursor.with_slots(|slots| {
-                            slots.try_owned_element_write_in_state(state, &runtime.0.poisoned)
+                            Ok(slots
+                                .try_owned_element_write_in_state(state, &runtime.0.poisoned)?
+                                || slots.try_owned_computed_write_in_state(state, runtime)?)
                         })? {
                             break 'dispatch Ok(VmAction::SetProperty(None));
                         }
@@ -2591,10 +2682,36 @@ pub(super) fn execute_frame_in_state(
             }
         }?;
         match action {
+            VmAction::GetField {
+                index,
+                keep_receiver,
+                fallthrough,
+            } => {
+                match named_read::execute(
+                    runtime,
+                    state,
+                    &mut segment,
+                    index,
+                    keep_receiver,
+                    fallthrough,
+                )? {
+                    named_read::Progress::Completed => continue,
+                    named_read::Progress::Boundary => return Ok(action),
+                    named_read::Progress::Throw => return Ok(VmAction::ThrowPrepared),
+                }
+            }
             VmAction::Object { fallthrough } => {
                 // FrameCursor has published the allocation's fault PC. Use
-                // the one suffix protocol before allocation can be observed.
-                segment.materialize_in_state(state)?;
+                // the one suffix protocol before a pressure collection can
+                // observe the frames; an allocation error materializes on
+                // the throw path instead.
+                if runtime
+                    .0
+                    .gc_pressure
+                    .may_request_within(LITERAL_ALLOCATION_NODES)
+                {
+                    segment.materialize_in_state(state)?;
+                }
                 {
                     let FrameTurn {
                         executable,
@@ -2762,6 +2879,9 @@ fn array_index(value: Number) -> Option<u32> {
     (value >= 0.0 && value < f64::from(u32::MAX) && value.trunc() == value).then_some(value as u32)
 }
 
+/// An upper bound on the heap nodes one object or array literal allocates.
+pub(super) const LITERAL_ALLOCATION_NODES: usize = 8;
+
 #[inline(always)]
 fn read_local<const CHECKED: bool>(
     cursor: &mut FrameCursor<'_>,
@@ -2776,7 +2896,7 @@ fn read_local<const CHECKED: bool>(
             copy_value_in_state(state, value).map(|value| (Some(value), false))
         }
         FrameBinding::Captured(id) if slots.has_operand_capacity(1) => Ok((
-            super::bindings::try_read_captured_immediate_in_state(state, *id),
+            super::bindings::try_read_captured_in_state(state, *id),
             false,
         )),
         FrameBinding::Uninitialized => Ok((None, true)),
@@ -2809,9 +2929,9 @@ fn read_arg(
     }
     let copied = cursor.with_slots(|slots| match slots.parameter(index)? {
         FrameBinding::Direct(value) => copy_value_in_state(state, value).map(Some),
-        FrameBinding::Captured(id) if slots.has_operand_capacity(1) => Ok(
-            super::bindings::try_read_captured_immediate_in_state(state, *id),
-        ),
+        FrameBinding::Captured(id) if slots.has_operand_capacity(1) => {
+            Ok(super::bindings::try_read_captured_in_state(state, *id))
+        }
         _ => Ok(None),
     })?;
     if let Some(value) = copied {
@@ -3333,10 +3453,9 @@ fn borrowed_this_read_ready_in_state(state: &RuntimeState, base: &JsValue) -> bo
     let JsValue::Object(id) = base else {
         return false;
     };
-    state
-        .heap
-        .object_strong_count(*id)
-        .is_ok_and(|count| count != 0 && count < u32::MAX - 2)
+    // The frame's call input owns `this` for the whole read.
+    let count = state.heap.object_strong_fast(*id);
+    count != 0 && count < u32::MAX - 2
 }
 
 // Removing the temporary this owner must not remove a checked-retain failure,
@@ -3349,6 +3468,8 @@ mod continuous_call_tests;
 mod dynamic_ret_tests;
 #[cfg(test)]
 mod object_allocation_tests;
+#[cfg(test)]
+mod specialized_tests;
 
 #[cfg(test)]
 mod execution_span_tests {
@@ -3694,3 +3815,5 @@ mod named_native_fact_tests;
 mod array_allocation_tests;
 
 mod array_allocation;
+
+pub(super) mod named_read;

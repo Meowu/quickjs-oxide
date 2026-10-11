@@ -287,19 +287,18 @@ impl Drop for RunningExecution {
             return;
         }
         let _unwind = runtime.unwind_guard();
-        if let Some(pending) = self.pending.take() {
-            if runtime.release_jsvalue(pending).is_err() || runtime.is_poisoned() {
-                runtime.0.poisoned.set(true);
-                return;
-            }
+        if let Some(pending) = self.pending.take()
+            && (runtime.release_jsvalue(pending).is_err() || runtime.is_poisoned())
+        {
+            runtime.0.poisoned.set(true);
+            return;
         }
         if let Some(super::Completion::Return(value) | super::Completion::Throw(value)) =
             self.pending_completion.take()
+            && (runtime.release_jsvalue(value).is_err() || runtime.is_poisoned())
         {
-            if runtime.release_jsvalue(value).is_err() || runtime.is_poisoned() {
-                runtime.0.poisoned.set(true);
-                return;
-            }
+            runtime.0.poisoned.set(true);
+            return;
         }
         if let Some(selected) = self.selected_named_read.take() {
             selected.release(&runtime);
@@ -330,7 +329,9 @@ impl Drop for RunningExecution {
                 return;
             }
         }
-        drop(self.root_query.take());
+        if let Some(pending) = self.root_query.take() {
+            pending.release(&runtime);
+        }
     }
 }
 
@@ -692,8 +693,7 @@ mod cleanup_poison_tests {
                         .unwrap()
                         .into(),
                     reusable_captured_locals: Vec::new(),
-                    input: CallInput::new(&runtime, JsValue::Undefined, JsValue::Undefined, None)
-                        .into(),
+                    input: CallInput::new(JsValue::Undefined, JsValue::Undefined, None).into(),
                 }),
                 storage: FrameStorage {
                     original_arguments: Vec::new(),

@@ -659,6 +659,24 @@ fn global_cell_view<'a>(
     Ok((descriptor, root))
 }
 
+/// The authenticated cell behind a published global closure slot. The slot
+/// owns the cell for as long as the frame's function is live.
+///
+/// A resident environment hands out its cell directly; the published
+/// descriptor checks run when the environment driver handles the binding.
+#[inline]
+pub(super) fn global_cell_id(
+    runtime: &Runtime,
+    executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
+    roots: &super::closure::ClosureSlots,
+    index: u16,
+) -> Result<crate::engine::heap::VarRefId, Error> {
+    if let Some(cell) = roots.resident_cell(usize::from(index)) {
+        return Ok(cell);
+    }
+    Ok(global_cell_view(runtime, executable, roots, index)?.1.id())
+}
+
 /// Consume the initialized cell directly through the current execution access.
 /// The closure owns its raw value until the output edge is installed.
 pub(super) fn try_read_global_cell_in_state(
@@ -668,20 +686,20 @@ pub(super) fn try_read_global_cell_in_state(
     roots: &super::closure::ClosureSlots,
     index: u16,
 ) -> Result<Option<JsValue>, Error> {
-    let (_, root) = global_cell_view(runtime, executable, roots, index)?;
-    let raw = state
-        .heap
-        .var_ref(root.id())
-        .map_err(heap_error_to_vm_error)?
-        .value
-        .clone();
-    if matches!(raw, crate::engine::heap::RawValue::Uninitialized) {
+    let cell = global_cell_id(runtime, executable, roots, index)?;
+    // The closure slot owns the cell, and the cell owns its value's edge.
+    let data = state.heap.var_ref_fast(cell);
+    // A private or uninitialized cell takes the environment driver, which
+    // reports it.
+    if data.kind.is_private() || matches!(data.value, crate::engine::heap::RawValue::Uninitialized)
+    {
         return Ok(None);
     }
+    let raw = data.value.clone();
     let value = JsValue::from_raw(raw)
         .ok_or_else(|| Error::internal("global cell held an internal value sentinel"))?;
     state
-        .dup_jsvalue(&value)
+        .dup_held_jsvalue(&value)
         .map(Some)
         .map_err(runtime_error_to_vm_error)
 }

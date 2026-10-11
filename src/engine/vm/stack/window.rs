@@ -2,6 +2,8 @@
 use super::{Error, FrameBinding, FrameWindow, JsValue, Runtime, SlotStore};
 use crate::engine::value::number::operations::Number;
 
+mod getter;
+
 /// One checked external entry followed by ordinary frame transitions.
 ///
 /// The exclusive execution borrow prevents a caller, legacy helper, or host
@@ -50,6 +52,24 @@ impl<'a> FrameExecution<'a> {
             ));
         }
         Ok(Self { execution })
+    }
+
+    /// Internal re-entry of the actual current frame. The frame identity is
+    /// always compared; window and PC checks run in checked builds only.
+    #[inline]
+    pub(in crate::engine::vm) fn admit_trusted(
+        execution: &'a mut crate::engine::vm::execution::RunningExecution,
+        id: crate::engine::vm::frame::FrameId,
+    ) -> Result<Self, Error> {
+        #[cfg(any(debug_assertions, feature = "checked-handles"))]
+        {
+            Self::admit(execution, id)
+        }
+        #[cfg(not(any(debug_assertions, feature = "checked-handles")))]
+        {
+            execution.frames.current_mut(id)?;
+            Ok(Self { execution })
+        }
     }
 
     #[inline(always)]
@@ -154,7 +174,7 @@ impl<'a> FrameExecution<'a> {
         arguments: u16,
         fallthrough: crate::engine::vm::execute::FallthroughPc,
     ) -> Result<bool, Error> {
-        use crate::engine::{heap::ObjectData, heap::runtime::owned_values::OwnedValueGuard};
+        use crate::engine::heap::runtime::owned_values::OwnedValueGuard;
         if !self.execution.frames.can_push_with_continuations(0)
             || runtime.bytecode_call_would_overflow()
         {
@@ -178,13 +198,7 @@ impl<'a> FrameExecution<'a> {
         // Receiver allocation may request GC, but service remains with the
         // execution consumer after this installer publishes every input owner.
         let receiver = state
-            .allocate_object_with_layout(
-                &runtime.0.poisoned,
-                Some(prototype),
-                &[],
-                Vec::new(),
-                ObjectData::ordinary,
-            )
+            .new_empty_ordinary_object(&runtime.0.poisoned, prototype)
             .map_err(super::runtime_error_to_vm_error)?;
         let mut receiver =
             OwnedValueGuard::new(state, &runtime.0.poisoned, JsValue::Object(receiver));
@@ -229,6 +243,46 @@ impl<'a> FrameExecution<'a> {
         self.install_current_ordinary(runtime, state, call, checked, tail, fallthrough)
     }
 
+    /// Install `f.apply(thisArg, array)` as an ordinary call of `f`. The
+    /// caller selected `f` and read `values` from the array in this lease.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::engine::vm) fn install_apply(
+        &mut self,
+        runtime: &Runtime,
+        state: &mut crate::engine::heap::runtime::RuntimeState,
+        call: crate::engine::vm::call::ordinary::OrdinaryCall,
+        operands: usize,
+        values: &[JsValue],
+        tail: bool,
+        fallthrough: crate::engine::vm::execute::FallthroughPc,
+    ) -> Result<(), Error> {
+        let [apply, array] = self.install_current_child(
+            runtime,
+            state,
+            call,
+            fallthrough,
+            |transaction, state, layout, function, observes_arguments| {
+                let (installed, retired) = transaction.install_apply_window(
+                    runtime,
+                    state,
+                    layout,
+                    operands,
+                    values,
+                    function,
+                    observes_arguments,
+                )?;
+                Ok((installed, tail, None, retired))
+            },
+        )?;
+        // The child owns its copies; the caller's apply function and array go.
+        for value in [apply, array] {
+            state
+                .release_owned_jsvalue(&runtime.0.poisoned, value)
+                .map_err(super::runtime_error_to_vm_error)?;
+        }
+        Ok(())
+    }
+
     /// Sole ordinary slot installer. This method cannot be called through a
     /// raw RunningExecution or a caller-supplied current-frame identity.
     #[allow(clippy::too_many_arguments)]
@@ -244,7 +298,6 @@ impl<'a> FrameExecution<'a> {
         #[cfg(feature = "profiling")]
         let _timer =
             crate::engine::api::profiling::PhaseTimer::start_vm_sampled("ordinary.install.sampled");
-        use crate::engine::vm::frame::{Frame, ReturnOwner, ReturnTarget, ReturnValue};
         #[cfg(feature = "profiling")]
         {
             let count = checked.count();
@@ -263,81 +316,27 @@ impl<'a> FrameExecution<'a> {
                 _ => "ordinary_install.args4plus",
             });
         }
-        let execution = &mut *self.execution;
-        let (function, executable, closure) = call.into_slot_parts();
-        let depth = execution.frames.depth() + 1;
-        execution.call_storage.reserve_depth(depth)?;
-        let (parent, frame) = execution
-            .frames
-            .current_frame_mut()
-            .expect("an admitted ordinary call has a caller");
-        let caller_realm = frame.executable.realm;
-        // The private continuation comes from the instruction that produced
-        // this Call. No caller instruction or slot changed during preflight.
-        let resume = fallthrough.index();
-        let (flags, flag_bytes) = if executable.has_captured_locals {
-            execution
-                .call_storage
-                .capture_flags(executable.local_definitions.len())?
-        } else {
-            (Vec::new(), 0)
-        };
-        let prepared = execution.frames.prepare_push()?;
-        let mut prepared = prepared;
-        let (_, frame) = prepared
-            .current_frame_mut()
-            .expect("ordinary publication retains its caller");
-        let installed = {
-            #[cfg(feature = "profiling")]
-            let _timer = crate::engine::api::profiling::PhaseTimer::start_vm_sampled(
-                "ordinary.install.slots.sampled",
-            );
-            FrameTransaction {
-                store: &mut execution.slots,
-                window: &mut frame.cold.window,
-            }
-            .install_ordinary_window(
-                runtime,
-                state,
-                &executable.frame_layout(),
-                checked,
-                function,
-                executable.observes_arguments,
-            )?
-        };
-        frame.resume_pc = resume;
-        let (mut cold, frame_bytes) = execution.call_storage.vacant(caller_realm);
-        cold.return_to = Some(ReturnTarget {
-            value_use: ReturnValue::Push,
-            owner: ReturnOwner::Frame(parent),
-            tail,
-            operation: None,
-        });
-        cold.entry_guard = None;
-        cold.function =
-            crate::engine::vm::closure::FrameFunction::shared(runtime, installed.function, closure)
-                .into();
-        cold.reusable_captured_locals = flags;
-        cold.input = installed.input.into();
-        cold.executable = executable.into();
-        cold.window = installed.window.into();
-        prepared.install(Frame {
-            property_generation: 0,
-            iterator_generation: 0,
-            caller_realm,
-            active_frame: crate::engine::vm::frames::ActiveFrameToken::unmaterialized(),
-
-            fault_pc: 0,
-            resume_pc: 0,
-            cold,
-        });
-        #[cfg(feature = "profiling")]
-        {
-            crate::engine::api::profiling::record_owned_call_storage(frame_bytes, flag_bytes, 0);
-        }
-        #[cfg(not(feature = "profiling"))]
-        let _ = (frame_bytes, flag_bytes);
-        Ok(())
+        self.install_current_child(
+            runtime,
+            state,
+            call,
+            fallthrough,
+            |transaction, state, layout, function, observes_arguments| {
+                #[cfg(feature = "profiling")]
+                let _timer = crate::engine::api::profiling::PhaseTimer::start_vm_sampled(
+                    "ordinary.install.slots.sampled",
+                );
+                let installed = transaction.install_ordinary_window(
+                    runtime,
+                    state,
+                    layout,
+                    checked,
+                    function,
+                    observes_arguments,
+                )?;
+                Ok((installed, tail, None, ()))
+            },
+        )
     }
 
     /// Sole Base constructor installer under the same exclusive lease that
@@ -353,23 +352,75 @@ impl<'a> FrameExecution<'a> {
         fallthrough: crate::engine::vm::execute::FallthroughPc,
         receiver: &mut Option<JsValue>,
     ) -> Result<(), Error> {
-        use crate::engine::{
-            heap::runtime::owned_values::OwnedValueGuard,
-            vm::frame::{ConstructorReturn, Frame, ReturnOwner, ReturnTarget, ReturnValue},
-        };
-        let execution = &mut *self.execution;
-        let (function, executable, closure) = call.into_slot_parts();
+        use crate::engine::heap::runtime::owned_values::OwnedValueGuard;
+        // The guard owns the receiver edge, so its copy takes the trusted retain.
         let this_value = state
-            .dup_jsvalue(receiver.as_ref().expect("guarded constructor receiver"))
+            .dup_owned_jsvalue(receiver.as_ref().expect("guarded constructor receiver"))
             .map_err(super::runtime_error_to_vm_error)?;
         let mut this_value = OwnedValueGuard::new(state, &runtime.0.poisoned, this_value);
         let (state, this_value) = this_value.parts();
+        self.install_current_child(
+            runtime,
+            state,
+            call,
+            fallthrough,
+            |transaction, state, layout, function, observes_arguments| {
+                let installed = transaction.install_constructor_window(
+                    runtime,
+                    state,
+                    layout,
+                    count,
+                    function,
+                    observes_arguments,
+                    this_value,
+                )?;
+                // Every step after the window is infallible: the frame takes
+                // the guarded receiver as its Base constructor result.
+                let receiver = receiver
+                    .take()
+                    .expect("guarded constructor return receiver");
+                Ok((installed, false, Some(receiver), ()))
+            },
+        )
+    }
+
+    /// The one frame publication shared by ordinary calls, Base constructors
+    /// and `apply`. `install_window` fills the child window; each installer
+    /// passes its own, so every caller gets a specialized body.
+    #[inline(always)]
+    fn install_current_child<R>(
+        &mut self,
+        runtime: &Runtime,
+        state: &mut crate::engine::heap::runtime::RuntimeState,
+        call: crate::engine::vm::call::ordinary::OrdinaryCall,
+        fallthrough: crate::engine::vm::execute::FallthroughPc,
+        install_window: impl FnOnce(
+            FrameTransaction<'_>,
+            &mut crate::engine::heap::runtime::RuntimeState,
+            &crate::engine::code::function::layout::FrameLayout<'_>,
+            crate::engine::heap::ObjectId,
+            bool,
+        ) -> Result<
+            (
+                super::call::InstalledOrdinaryFrame,
+                bool,
+                Option<JsValue>,
+                R,
+            ),
+            Error,
+        >,
+    ) -> Result<R, Error> {
+        use crate::engine::vm::frame::{
+            ConstructorReturn, Frame, ReturnOwner, ReturnTarget, ReturnValue,
+        };
+        let execution = &mut *self.execution;
+        let (function, executable, closure) = call.into_slot_parts();
         let depth = execution.frames.depth() + 1;
         execution.call_storage.reserve_depth(depth)?;
         let (parent, frame) = execution
             .frames
             .current_frame_mut()
-            .expect("an admitted constructor has a caller");
+            .expect("an admitted call has a caller");
         let caller_realm = frame.executable.realm;
         let (flags, flag_bytes) = if executable.has_captured_locals {
             execution
@@ -381,41 +432,50 @@ impl<'a> FrameExecution<'a> {
         let mut prepared = execution.frames.prepare_push()?;
         let (_, frame) = prepared
             .current_frame_mut()
-            .expect("constructor publication retains its caller");
-        let installed = FrameTransaction {
+            .expect("frame publication retains its caller");
+        let transaction = FrameTransaction {
             store: &mut execution.slots,
             window: &mut frame.cold.window,
-        }
-        .install_constructor_window(
-            runtime,
+        };
+        let layout = executable.frame_layout();
+        // The private continuation comes from the instruction that produced
+        // this call. No caller instruction or slot changed during preflight.
+        let (installed, tail, base_receiver, result) = install_window(
+            transaction,
             state,
-            &executable.frame_layout(),
-            count,
+            &layout,
             function,
             executable.observes_arguments,
-            this_value,
         )?;
         frame.resume_pc = fallthrough.index();
-        let (mut cold, frame_bytes) = execution.call_storage.vacant(caller_realm);
-        cold.return_to = Some(ReturnTarget {
-            value_use: ReturnValue::Push,
-            owner: ReturnOwner::Frame(parent),
-            tail: false,
-            operation: None,
-        });
-        cold.entry_guard = None;
-        cold.function =
-            crate::engine::vm::closure::FrameFunction::shared(runtime, installed.function, closure)
-                .into();
-        cold.reusable_captured_locals = flags;
-        cold.input = installed.input.into();
-        cold.constructor_return = Some(ConstructorReturn::Base(
-            receiver
-                .take()
-                .expect("guarded constructor return receiver"),
-        ));
-        cold.executable = executable.into();
-        cold.window = installed.window.into();
+        // Constructors always carry a rare shell; so does a body that pushes
+        // unwind regions. Both prefer a pooled shell (and its region buffer),
+        // while every other ordinary frame stays rare-free.
+        let (mut cold, frame_bytes) = if base_receiver.is_some() || executable.uses_unwind_regions {
+            execution.call_storage.vacant_rare()
+        } else {
+            execution.call_storage.vacant(caller_realm)
+        };
+        cold.occupy(
+            ReturnTarget {
+                value_use: ReturnValue::Push,
+                owner: ReturnOwner::Frame(parent),
+                tail,
+                operation: None,
+            },
+            crate::engine::vm::closure::FrameFunction::shared(
+                runtime.domain_id(),
+                installed.function,
+                closure,
+            ),
+            installed.input,
+            flags,
+            executable,
+            installed.window,
+        );
+        if let Some(receiver) = base_receiver {
+            cold.constructor_return = Some(ConstructorReturn::Base(receiver));
+        }
         prepared.install(Frame {
             property_generation: 0,
             iterator_generation: 0,
@@ -429,7 +489,7 @@ impl<'a> FrameExecution<'a> {
         crate::engine::api::profiling::record_owned_call_storage(frame_bytes, flag_bytes, 0);
         #[cfg(not(feature = "profiling"))]
         let _ = (frame_bytes, flag_bytes);
-        Ok(())
+        Ok(result)
     }
 
     /// Retire actual current frames, preserving a registered result through
@@ -463,18 +523,6 @@ impl<'a> FrameExecution<'a> {
                 #[cfg(feature = "profiling")]
                 crate::engine::api::profiling::record_owned_execution_event(
                     "core.return_decline.public_root",
-                );
-                return Ok(ReturnProgress::Declined);
-            }
-            if frame
-                .cold
-                .rare
-                .get()
-                .is_some_and(|rare| !rare.property_keys.is_empty())
-            {
-                #[cfg(feature = "profiling")]
-                crate::engine::api::profiling::record_owned_execution_event(
-                    "core.return_decline.live_wait",
                 );
                 return Ok(ReturnProgress::Declined);
             }
@@ -557,13 +605,6 @@ pub(in crate::engine::vm) enum DirectSlot {
     Argument(u16),
 }
 
-pub(in crate::engine::vm) enum LinkedReadCompletion {
-    Completed,
-    Declined,
-    LookupError(Error),
-    Pending(crate::engine::object::OrdinaryRead),
-}
-
 /// Exclusive ownership of one authenticated frame window across short execution
 /// borrows. The store and window cannot be pushed, popped or replaced while this
 /// transaction exists. Allocation or observable release may happen between
@@ -631,6 +672,28 @@ impl FrameTransaction<'_> {
             receiver,
         )
     }
+    #[allow(clippy::too_many_arguments)]
+    fn install_apply_window(
+        self,
+        runtime: &Runtime,
+        state: &mut crate::engine::heap::runtime::RuntimeState,
+        layout: &crate::engine::code::function::layout::FrameLayout<'_>,
+        operands: usize,
+        values: &[JsValue],
+        function: crate::engine::heap::ObjectId,
+        observes_arguments: bool,
+    ) -> Result<(super::call::InstalledOrdinaryFrame, [JsValue; 2]), Error> {
+        self.store.push_current_apply_frame_in_state(
+            runtime,
+            state,
+            layout,
+            self.window,
+            operands,
+            values,
+            function,
+            observes_arguments,
+        )
+    }
     /// Consume the actual caller window before publishing its child. Only the
     /// private execution producer combines this lease with preflighted operands.
     #[allow(clippy::too_many_arguments)]
@@ -691,6 +754,23 @@ impl FrameTransaction<'_> {
             self.peek(offset)?;
         }
         self.peek(count)?;
+        Ok(CheckedOrdinaryCallOperands {
+            window_id: self.window.id,
+            depth: self.window.depth,
+            count,
+            method,
+        })
+    }
+    /// A call-site hit. The caller has already read the deepest operand
+    /// (receiver or callee) as a direct value; operand slots above it always
+    /// hold direct values, so the per-argument reads are skipped.
+    #[inline]
+    pub(in crate::engine::vm) fn check_ordinary_call_depth(
+        &self,
+        count: usize,
+        method: bool,
+    ) -> Result<CheckedOrdinaryCallOperands, Error> {
+        debug_assert!((0..=count + usize::from(method)).all(|offset| self.peek(offset).is_ok()));
         Ok(CheckedOrdinaryCallOperands {
             window_id: self.window.id,
             depth: self.window.depth,
@@ -768,146 +848,6 @@ impl SlotStore {
             store: self,
             window,
         })
-    }
-
-    /// A single-use owning-read transaction at a published driver boundary.
-    /// The canonical lookup may retain roots/allocate, so no FrameSlots exists
-    /// during lookup. It can only select a getter, never execute one. Exclusive
-    /// store/window borrows prove that no slot or identity can change between
-    /// authentication and the subsequent short output window.
-    #[cfg(test)]
-    pub(in crate::engine::vm) fn with_linked_own_read(
-        &mut self,
-        window: &mut FrameWindow,
-        runtime: &Runtime,
-        executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
-        index: u32,
-        complete: impl FnOnce(&mut FrameSlots<'_>, &mut Option<JsValue>) -> Result<(), Error>,
-    ) -> Result<LinkedReadCompletion, Error> {
-        self.with_linked_own_read_selected(window, runtime, executable, index, None, complete)
-    }
-    pub(in crate::engine::vm) fn with_linked_own_read_selected(
-        &mut self,
-        window: &mut FrameWindow,
-        runtime: &Runtime,
-        executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
-        index: u32,
-        native: Option<&mut Option<crate::engine::object::LinkedNativeSelection>>,
-        complete: impl FnOnce(&mut FrameSlots<'_>, &mut Option<JsValue>) -> Result<(), Error>,
-    ) -> Result<LinkedReadCompletion, Error> {
-        use crate::engine::object::OrdinaryRead;
-        self.check_current(window)?;
-        let base = self.peek_current(window, 0)?;
-        if executable
-            .property_key_atoms
-            .as_ref()
-            .and_then(|atoms| atoms.get(index as usize))
-            .is_none_or(|atom| atom.is_null())
-        {
-            return Err(Error::internal("property read has no linked key"));
-        }
-        #[cfg(feature = "profiling")]
-        crate::engine::api::profiling::record_owned_execution_event("linked_read_lookup_attempt");
-        let selected =
-            match runtime.prepare_linked_own_read_selected(base, executable, index, native) {
-                Ok(selected) => selected,
-                Err(error) => {
-                    return Ok(LinkedReadCompletion::LookupError(
-                        crate::engine::vm::exception::runtime_error_to_vm_error(error),
-                    ));
-                }
-            };
-        match selected {
-            Some(OrdinaryRead::Complete(value)) => {
-                #[cfg(feature = "profiling")]
-                {
-                    use crate::engine::heap::ObjectKind;
-                    use crate::engine::heap::SlotReleaseReadiness;
-                    if let JsValue::Object(id) = base
-                        && let Ok(state) = runtime.0.state.try_borrow()
-                        && let Ok(object) = state.heap.object(*id)
-                    {
-                        let kind = match object.kind {
-                            ObjectKind::Array => "linked_read_completed.kind_array",
-                            ObjectKind::NativeFunction
-                            | ObjectKind::BoundFunction
-                            | ObjectKind::BytecodeFunction => "linked_read_completed.kind_function",
-                            ObjectKind::Map
-                            | ObjectKind::Set
-                            | ObjectKind::WeakMap
-                            | ObjectKind::WeakSet
-                            | ObjectKind::MapIterator
-                            | ObjectKind::SetIterator => "linked_read_completed.kind_collection",
-                            ObjectKind::Ordinary => "linked_read_completed.kind_ordinary",
-                            _ => "linked_read_completed.kind_other",
-                        };
-                        crate::engine::api::profiling::record_owned_execution_event(kind);
-                    }
-                    let reason = if matches!(base, JsValue::Object(_)) {
-                        match runtime.slot_value_release_readiness_jsvalue(base) {
-                            Ok(SlotReleaseReadiness::Ready) => {
-                                "linked_read_completed.receiver_ready"
-                            }
-                            Ok(SlotReleaseReadiness::QueueCapacity) => {
-                                "linked_read_completed.receiver_queue_capacity"
-                            }
-                            Ok(SlotReleaseReadiness::Drain) => {
-                                "linked_read_completed.receiver_drain"
-                            }
-                            Ok(SlotReleaseReadiness::Deferred) => {
-                                "linked_read_completed.receiver_deferred"
-                            }
-                            Ok(SlotReleaseReadiness::Borrowed) => {
-                                "linked_read_completed.receiver_borrowed"
-                            }
-                            Ok(SlotReleaseReadiness::PrimitiveStorage) => {
-                                "linked_read_completed.receiver_primitive_storage"
-                            }
-                            Err(_) => "linked_read_completed.receiver_error",
-                        }
-                    } else {
-                        "linked_read_completed.non_object_receiver"
-                    };
-                    crate::engine::api::profiling::record_owned_execution_event(reason);
-                }
-                // This owner stays outside the output window even on failure.
-                let mut value = Some(value.unwrap_or(JsValue::Undefined));
-                let result = {
-                    let mut slots = FrameSlots {
-                        store: self,
-                        window,
-                    };
-                    #[cfg(feature = "profiling")]
-                    crate::engine::api::profiling::record_owned_execution_event(
-                        "linked_read_output_attempt",
-                    );
-                    complete(&mut slots, &mut value)
-                };
-                if let Some(value) = value {
-                    runtime
-                        .release_jsvalue(value)
-                        .map_err(crate::engine::vm::exception::runtime_error_to_vm_error)?;
-                }
-                result?;
-                #[cfg(feature = "profiling")]
-                crate::engine::api::profiling::record_owned_execution_event(
-                    "linked_read_output_completed",
-                );
-                Ok(LinkedReadCompletion::Completed)
-            }
-            Some(read) => {
-                #[cfg(feature = "profiling")]
-                crate::engine::api::profiling::record_owned_execution_event(
-                    "linked_read_selected_pending",
-                );
-                Ok(LinkedReadCompletion::Pending(read))
-            }
-            None => {
-                #[cfg(feature = "profiling")]
-                crate::engine::api::profiling::record_owned_execution_event("linked_read_declined");
-                Ok(LinkedReadCompletion::Declined)
-            }
-        }
     }
 }
 
@@ -1155,6 +1095,13 @@ impl FrameSlots<'_> {
         self.store.push_current(self.window, value)
     }
 
+    /// A push that hands the owner back on any rejection, for callers that
+    /// report it out of line through [`Self::push_pending`].
+    #[inline(always)]
+    pub(in crate::engine::vm) fn try_push(&mut self, value: JsValue) -> Result<(), JsValue> {
+        self.store.try_push_current(self.window, value)
+    }
+
     /// On failure the caller keeps its owner until this borrow has ended.
     pub(in crate::engine::vm) fn push_pending(
         &mut self,
@@ -1339,8 +1286,7 @@ mod primitive_transaction_tests {
                         .unwrap()
                         .into(),
                     reusable_captured_locals: Vec::new(),
-                    input: CallInput::new(runtime, JsValue::Undefined, JsValue::Undefined, None)
-                        .into(),
+                    input: CallInput::new(JsValue::Undefined, JsValue::Undefined, None).into(),
                 }),
                 storage: FrameStorage {
                     original_arguments: Vec::new(),
@@ -1656,30 +1602,6 @@ mod primitive_transaction_tests {
         assert!(runtime.0.state.borrow().heap.object(child_id).is_err());
     }
 
-    fn linked_executable(
-        runtime: &Runtime,
-        context: &mut crate::engine::api::Context,
-    ) -> (PublishedFunctionSnapshot, u32) {
-        let function = context.eval("(function(o){return o.x})").unwrap();
-        let callable = runtime.callable_from_value(function).unwrap();
-        let crate::engine::vm::call::CallableExecution::Bytecode { bytecode, .. } =
-            runtime.bytecode_for_callable(&callable).unwrap()
-        else {
-            panic!("bytecode");
-        };
-        let executable = runtime.snapshot_function_bytecode(&bytecode).unwrap();
-        let index = executable
-            .exec
-            .test_ir()
-            .iter()
-            .find_map(|op| match op {
-                crate::engine::code::bytecode::Instruction::GetField(index) => Some(*index),
-                _ => None,
-            })
-            .unwrap();
-        (executable, index)
-    }
-
     #[test]
     fn frame_transaction_keeps_owners_across_gc_and_partial_output_failure() {
         let runtime = Runtime::new();
@@ -1735,174 +1657,6 @@ mod primitive_transaction_tests {
                 .unwrap(),
             Value::Int(42)
         );
-    }
-
-    #[test]
-    fn linked_owning_read_authenticates_once_and_keeps_result_after_last_base_release() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
-        let (executable, index) = linked_executable(&runtime, &mut context);
-        let mut store = SlotStore::new(8);
-        let mut layout = PublishedFunctionSnapshot::empty_for_test(context.realm);
-        layout.metadata.max_stack = 1;
-        let mut window = store
-            .push_frame(
-                &runtime,
-                &layout.frame_layout(),
-                FrameStorage {
-                    original_arguments: vec![],
-                    parameters: vec![],
-                    locals: vec![],
-                    operands: vec![],
-                },
-            )
-            .unwrap();
-        let base = context.eval("({x:{tag:42}})").unwrap();
-        store
-            .push(&mut window, runtime.into_jsvalue(base).unwrap())
-            .unwrap();
-        let mut old_base = None;
-        #[cfg(feature = "profiling")]
-        let profile = crate::engine::api::profiling::CostProfile::start();
-        assert!(matches!(
-            store
-                .with_linked_own_read(&mut window, &runtime, &executable, index, |slots, value| {
-                    old_base = Some(slots.pop()?);
-                    slots.push_pending(value)
-                })
-                .unwrap(),
-            LinkedReadCompletion::Completed
-        ));
-        #[cfg(feature = "profiling")]
-        {
-            assert_eq!(
-                profile
-                    .snapshot()
-                    .owned_execution_events
-                    .get("slot_authentication")
-                    .copied(),
-                Some(1)
-            );
-            drop(profile);
-        }
-        if let Some(value) = old_base.take() {
-            runtime.release_jsvalue(value).unwrap();
-        }
-        runtime.run_gc().unwrap();
-        let popped = store.pop(&mut window).unwrap();
-        let Value::Object(result) = runtime.root_value(&popped).unwrap() else {
-            panic!("result");
-        };
-        runtime.release_jsvalue(popped).unwrap();
-        assert_eq!(
-            context
-                .get_property(&result, &runtime.intern_property_key("tag").unwrap())
-                .unwrap(),
-            Value::Int(42)
-        );
-    }
-
-    #[test]
-    fn linked_owning_read_separates_slot_errors_from_lookup_errors_without_consumption() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
-        let (executable, index) = linked_executable(&runtime, &mut context);
-        let mut layout = PublishedFunctionSnapshot::empty_for_test(context.realm);
-        layout.metadata.max_stack = 1;
-        let mut store = SlotStore::new(8);
-        let mut window = store
-            .push_frame(
-                &runtime,
-                &layout.frame_layout(),
-                FrameStorage {
-                    original_arguments: vec![],
-                    parameters: vec![],
-                    locals: vec![],
-                    operands: vec![],
-                },
-            )
-            .unwrap();
-        let result =
-            store.with_linked_own_read(&mut window, &runtime, &executable, u32::MAX, |_, _| {
-                panic!("invalid input committed")
-            });
-        assert!(
-            matches!(result, Err(ref error) if error.message()=="owned operand stack underflow")
-        );
-        // A reclaimed base handle forces the lookup path to report a lookup
-        // error instead of committing the operand.
-        let blocked = runtime.new_object(None).unwrap();
-        let stale_handle = blocked.into_handle();
-        runtime
-            .release_jsvalue(JsValue::Object(stale_handle))
-            .unwrap();
-        runtime.run_gc().unwrap();
-        store
-            .push(&mut window, JsValue::Object(stale_handle))
-            .unwrap();
-        assert!(matches!(
-            store
-                .with_linked_own_read(&mut window, &runtime, &executable, index, |_, _| panic!(
-                    "stale input committed"
-                ))
-                .unwrap(),
-            LinkedReadCompletion::LookupError(_)
-        ));
-        assert_eq!(store.depth(&window), 1);
-    }
-
-    #[test]
-    fn linked_owning_read_pending_getter_is_selected_once_without_consuming_base() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
-        let (executable, index) = linked_executable(&runtime, &mut context);
-        let mut layout = PublishedFunctionSnapshot::empty_for_test(context.realm);
-        layout.metadata.max_stack = 1;
-        let mut store = SlotStore::new(8);
-        let mut window = store
-            .push_frame(
-                &runtime,
-                &layout.frame_layout(),
-                FrameStorage {
-                    original_arguments: vec![],
-                    parameters: vec![],
-                    locals: vec![],
-                    operands: vec![],
-                },
-            )
-            .unwrap();
-        let base = context.eval("globalThis.linkedCalls=0;globalThis.linkedBase={get x(){linkedCalls++;return 42}};linkedBase").unwrap();
-        store
-            .push(&mut window, runtime.into_jsvalue(base).unwrap())
-            .unwrap();
-        let LinkedReadCompletion::Pending(read) = store
-            .with_linked_own_read(&mut window, &runtime, &executable, index, |_, _| {
-                panic!("pending getter committed operands")
-            })
-            .unwrap()
-        else {
-            panic!("pending getter");
-        };
-        assert_eq!(store.depth(&window), 1);
-        drop(
-            context
-                .eval("Object.defineProperty(linkedBase,'x',{get(){throw 99}})")
-                .unwrap(),
-        );
-        let result = runtime
-            .finish_prepared_read(
-                context.realm,
-                &runtime.intern_property_key("x").unwrap(),
-                read,
-            )
-            .unwrap();
-        assert!(matches!(
-            result,
-            crate::engine::value::conversion::NativeConversion::Value(Some(Value::Int(42)))
-        ));
-        assert_eq!(context.eval("linkedCalls").unwrap(), Value::Int(1));
-        let base = store.pop(&mut window).unwrap();
-        runtime.release_jsvalue(base).unwrap();
     }
 
     #[test]

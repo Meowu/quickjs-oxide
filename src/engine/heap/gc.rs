@@ -261,6 +261,12 @@ impl Heap {
         self.retain_raw(RawId::Object(id), 1)
     }
 
+    /// Trusted strong-count read for a live object handle.
+    #[inline]
+    pub(crate) fn object_strong_fast(&self, id: ObjectId) -> u32 {
+        self.live_node_fast(RawId::Object(id)).strong.get()
+    }
+
     /// Trusted hot-path retain for a live object handle.
     #[inline]
     pub(crate) fn retain_object_fast(&self, id: ObjectId) {
@@ -966,12 +972,11 @@ impl Heap {
                                             "ordered weak-map record disappeared during pruning",
                                         ))?
                                     };
-                                    if let Some(index) = raw_value_atom(&value) {
-                                        if !hook(WeakSymbolGcEvent::Release(index))
+                                    if let Some(index) = raw_value_atom(&value)
+                                        && !hook(WeakSymbolGcEvent::Release(index))
                                             .inspect_err(|_| poisoned.set(true))?
-                                        {
-                                            cleanup.atoms.push(index);
-                                        }
+                                    {
+                                        cleanup.atoms.push(index);
                                     }
                                     for edge in raw_value_edges(&value) {
                                         self.release_raw_no_drain(edge)
@@ -1362,15 +1367,42 @@ impl Heap {
             if let Some(&first) = edges.first() {
                 let duplicate = edges.get(1) == Some(&first);
                 self.preflight_edge_retain(first, if duplicate { 2 } else { 1 })?;
-                if let Some(&second) = edges.get(1) {
-                    if !duplicate {
-                        self.preflight_edge_retain(second, 1)?;
-                    }
+                if let Some(&second) = edges.get(1)
+                    && !duplicate
+                {
+                    self.preflight_edge_retain(second, 1)?;
                 }
                 for &edge in edges {
                     self.retain_raw(edge, 1)
                         .expect("preflighted small edge retain failed before publication");
                 }
+            }
+            return Ok(());
+        }
+        // Object allocations carry a handful of edges; count them on the stack.
+        const INLINE_EDGES: usize = 16;
+        if edges.len() <= INLINE_EDGES {
+            let mut counts = [None::<(RawId, u32)>; INLINE_EDGES];
+            let mut unique = 0;
+            for &edge in edges {
+                match counts[..unique]
+                    .iter_mut()
+                    .flatten()
+                    .find(|(seen, _)| *seen == edge)
+                {
+                    Some((_, count)) => *count += 1,
+                    None => {
+                        counts[unique] = Some((edge, 1));
+                        unique += 1;
+                    }
+                }
+            }
+            for &(edge, additional) in counts[..unique].iter().flatten() {
+                self.preflight_edge_retain(edge, additional)?;
+            }
+            for &(edge, additional) in counts[..unique].iter().flatten() {
+                self.retain_raw(edge, additional)
+                    .expect("preflighted heap edge retain failed before publication");
             }
             return Ok(());
         }
@@ -1841,6 +1873,86 @@ impl Heap {
         false
     }
 
+    /// Whether a handle may take a trusted fast path. Its holder owns a strong
+    /// edge, so plain release builds admit it without checks. Debug builds and
+    /// the `checked-handles` feature validate identity and liveness instead;
+    /// a failing handle then takes the checked path, which reports the error
+    /// and keeps the poison contract, so an ownership error is not masked.
+    #[inline(always)]
+    pub(crate) fn admits_trusted(&self, id: RawId) -> bool {
+        #[cfg(any(debug_assertions, feature = "checked-handles"))]
+        {
+            if id.is_leaf() {
+                self.live_leaf_slot(id).is_ok()
+            } else {
+                self.live_node(id).is_ok()
+            }
+        }
+        #[cfg(not(any(debug_assertions, feature = "checked-handles")))]
+        {
+            let _ = id;
+            true
+        }
+    }
+
+    /// Trusted nonfinal release of an object handle whose holder owns one
+    /// strong edge, so the handle is live by ownership: only the bounds check
+    /// remains (see [`Heap::admits_trusted`]). Saturation keeps
+    /// `IMMORTAL_STRONG` unchanged. A last reference, pending zero-queue work
+    /// or a traced node declines to [`Heap::release_reference`] unchanged.
+    #[inline(always)]
+    pub(crate) fn release_object_nonfinal_trusted(&self, id: ObjectId) -> bool {
+        if !self.zero_queue.is_empty() {
+            return false;
+        }
+        #[cfg(debug_assertions)]
+        if super::ownership::trace_object_matches(id) {
+            return false;
+        }
+        if !self.admits_trusted(RawId::Object(id)) {
+            return false;
+        }
+        let SlotState::Resident(node) = &self.slots[RawId::Object(id).index() as usize].state
+        else {
+            return false;
+        };
+        let strong = node.strong.get();
+        if strong <= 1 {
+            return false;
+        }
+        if strong != IMMORTAL_STRONG {
+            node.strong.set(strong - 1);
+        }
+        true
+    }
+
+    /// Leaf counterpart of [`Heap::release_object_nonfinal_trusted`] for a
+    /// string or BigInt handle.
+    #[inline(always)]
+    pub(crate) fn release_leaf_nonfinal_trusted(&self, id: RawId) -> bool {
+        if !self.zero_queue.is_empty() {
+            return false;
+        }
+        #[cfg(debug_assertions)]
+        if let RawId::String(string) = id
+            && super::ownership::trace_string_matches(string)
+        {
+            return false;
+        }
+        if !self.admits_trusted(id) {
+            return false;
+        }
+        let strong = &self.leaf_slots[id.index() as usize].strong;
+        let count = strong.get();
+        if count <= 1 {
+            return false;
+        }
+        if count != IMMORTAL_STRONG {
+            strong.set(count - 1);
+        }
+        true
+    }
+
     /// Release one reference, returning cleanup when a node is finalized.
     /// Inspect the whole queue: an earlier no-drain release may have queued a
     /// different node even when this reference remains nonzero.
@@ -2086,6 +2198,9 @@ impl Heap {
         cleanup: &mut HeapCleanup,
     ) -> Result<(), HeapError> {
         let index = self.validate_slot_identity(id)?;
+        if !cycle && self.finish_ordinary_object(index, cleanup)? {
+            return Ok(());
+        }
         let (strong, weak, edges) = {
             let SlotState::Resident(node) = &self.slots[index].state else {
                 return Err(HeapError::Invariant(
@@ -2145,6 +2260,59 @@ impl Heap {
             self.release_raw_no_drain(edge)?;
         }
         Ok(())
+    }
+
+    /// Zero-queue finalization of an ordinary- or Arguments-payload object,
+    /// in one pass.
+    /// Its slots move out of the record, the slot becomes Vacant (dropping
+    /// the rest in place), and each moved slot then reports its atom and
+    /// releases its edge, followed by the shape: the same atom and edge order
+    /// as the general path, without building separate snapshots. Returns
+    /// false, changing nothing, for every other payload or state.
+    #[inline]
+    fn finish_ordinary_object(
+        &mut self,
+        index: usize,
+        cleanup: &mut HeapCleanup,
+    ) -> Result<bool, HeapError> {
+        let (slots, shape, brand) = {
+            let SlotState::Resident(Node {
+                strong,
+                data: NodeData::Object(object),
+            }) = &mut self.slots[index].state
+            else {
+                return Ok(false);
+            };
+            // Arguments objects own no payload edges or atoms either.
+            if !matches!(
+                object.payload,
+                ObjectPayload::Ordinary | ObjectPayload::Arguments { .. }
+            ) {
+                return Ok(false);
+            }
+            if strong.get() != 0 {
+                return Err(HeapError::Invariant(
+                    "finalization count disagrees with its queue/cycle state",
+                ));
+            }
+            (
+                std::mem::take(&mut object.slots),
+                object.shape,
+                object.private_brand_home,
+            )
+        };
+        cleanup.finalized_objects = cleanup.finalized_objects.saturating_add(1);
+        // Self-edges observe Vacant before any decrement.
+        self.slots[index].state = SlotState::Vacant;
+        for slot in &slots {
+            cleanup.atoms.extend(property_slot_atoms(slot));
+            visit_property_slot_edges(slot, &mut |edge| self.release_raw_no_drain(edge))?;
+        }
+        cleanup
+            .atoms
+            .extend(brand.map(|atom| AtomIdx::from_raw(atom.raw())));
+        self.release_raw_no_drain(RawId::Shape(shape))?;
+        Ok(true)
     }
 
     fn finish_var_ref(
@@ -2867,7 +3035,8 @@ pub(super) fn context_edges(context: &ContextData) -> Vec<RawId> {
             .saturating_add(context.iterator.map_or(0, |_| 4))
             .saturating_add(context.global_objects.len())
             .saturating_add(context.intrinsics.len())
-            .saturating_add(context.initial_shapes.len()),
+            .saturating_add(context.initial_shapes.len())
+            .saturating_add(2 * super::realm_records::ARGUMENTS_SHAPE_COUNTS),
     );
     visit_context_edges(context, &mut |edge| {
         edges.push(edge);
@@ -3002,6 +3171,16 @@ pub(super) fn visit_context_edges<E>(
             visit(edge)?;
         }
     }
+    for edge in context
+        .arguments_shapes
+        .iter()
+        .flatten()
+        .flatten()
+        .copied()
+        .map(RawId::Shape)
+    {
+        visit(edge)?;
+    }
     for edge in context.initial_shapes.iter().copied().map(RawId::Shape) {
         visit(edge)?;
     }
@@ -3063,10 +3242,10 @@ fn visit_raw_module_record_edges<E>(
         RawModuleNamespaceState::Building(namespace)
         | RawModuleNamespaceState::Ready(namespace) => visit(RawId::Object(namespace))?,
     }
-    if let RawModuleEvaluationState::Errored(exception) = &record.evaluation {
-        if let Some(edge) = raw_value_edge(exception) {
-            visit(edge)?;
-        }
+    if let RawModuleEvaluationState::Errored(exception) = &record.evaluation
+        && let Some(edge) = raw_value_edge(exception)
+    {
+        visit(edge)?;
     }
     if let Some(edge) = record.evaluation_promise.map(RawId::Object) {
         visit(edge)?;
@@ -3612,16 +3791,15 @@ impl Heap {
         for (index, slot) in self.slots.iter().enumerate() {
             if let SlotState::Resident(node) = &slot.state
                 && node.strong.get() != 0
+                && let NodeData::FunctionBytecode(data) = &node.data
             {
-                if let NodeData::FunctionBytecode(data) = &node.data {
-                    bytecode_names.insert(
-                        index,
-                        match &data.func_name {
-                            Some(name) => name.to_utf8_lossy(),
-                            None => "<anon>".to_string(),
-                        },
-                    );
-                }
+                bytecode_names.insert(
+                    index,
+                    match &data.func_name {
+                        Some(name) => name.to_utf8_lossy(),
+                        None => "<anon>".to_string(),
+                    },
+                );
             }
         }
         let mut roots = Vec::new();

@@ -8,14 +8,17 @@ use crate::engine::api::{runtime::Runtime, runtime_error::RuntimeError};
 use crate::engine::heap::ContextId;
 use crate::engine::object::property::validate_and_apply_property_descriptor;
 use crate::engine::object::{ObjectRef, OwnedCompletePropertyDescriptor, PropertyKey};
-use crate::engine::value::{JsValue, Value, conversion::NativeConversion};
+use crate::engine::value::{JsValue, conversion::NativeConversion};
 use crate::engine::vm::{Completion, call::DirectCallTarget};
+
+mod prefix;
+pub(crate) use prefix::StateOwnPrefix;
 
 type Descriptor = Option<OwnedCompletePropertyDescriptor>;
 
 pub(crate) enum ProxyOwnStep {
+    StateRead { resume: ProxyOwnResume },
     Complete(NativeConversion<Descriptor>),
-    Read { resume: ProxyOwnResume },
     Call { resume: ProxyOwnResume },
     Descriptor { resume: ProxyOwnResume },
     Extensible { resume: ProxyOwnResume },
@@ -76,8 +79,52 @@ impl ProxyOwnStep {
         key: PropertyKey,
     ) -> Result<Self, RuntimeError> {
         runtime.validate_object_and_key(&object, &key)?;
-        let step = MethodStep::start(runtime, realm, object, "getOwnPropertyDescriptor")?;
-        method(runtime, realm, key, step)
+        let mut state = runtime.0.state.borrow_mut();
+        let selected =
+            super::StateOwnPrefix::select(runtime, &mut state, realm, object.object_id())?;
+        match selected {
+            StateOwnPrefix::Direct(object) => {
+                let descriptor =
+                    match prefix::own_descriptor_in_state(runtime, &mut state, object, key.atom())?
+                    {
+                        prefix::StateOwnDescriptor::Complete(descriptor) => descriptor,
+                        prefix::StateOwnDescriptor::Shared(token) => {
+                            drop(state);
+                            let (element, bytes) = token.read()?;
+                            let mut state = runtime.0.state.borrow_mut();
+                            let value = state.decode_typed_index(element, bytes)?;
+                            Some(
+                            crate::engine::object::StateOwnedCompleteDescriptor::from_owned_data(
+                                value, true, true, true,
+                            ),
+                        )
+                        }
+                    };
+                Ok(Self::Complete(NativeConversion::Value(
+                    descriptor.map(|value| value.into_legacy(runtime)),
+                )))
+            }
+            StateOwnPrefix::Throw(value) => Ok(Self::Complete(NativeConversion::Throw(value))),
+            StateOwnPrefix::Effect(selected) => {
+                drop(state);
+                Self::start_selected_method(runtime, realm, key, selected)
+            }
+        }
+    }
+    /// This is a cold compatibility boundary for an actual selected Own effect.
+    /// It consumes the exact method choice after State access has ended.
+    pub(crate) fn start_selected_method(
+        runtime: &Runtime,
+        realm: ContextId,
+        key: PropertyKey,
+        selected: super::StateMethodStep,
+    ) -> Result<Self, RuntimeError> {
+        method(
+            runtime,
+            realm,
+            key,
+            MethodStep::from_state(runtime, selected)?,
+        )
     }
 }
 
@@ -104,13 +151,27 @@ fn method(
                     })),
                 ),
                 Some(target) => {
-                    let key_value = runtime.property_key_value(&key)?;
-                    let receiver =
-                        runtime.into_jsvalue(Value::Object(rooted.handler.try_clone()?))?;
-                    let arguments = [Value::Object(rooted.target.try_clone()?), key_value]
-                        .into_iter()
-                        .map(|value| runtime.into_jsvalue(value))
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let (receiver, arguments) = {
+                        use crate::engine::heap::runtime::owned_values::{
+                            OwnedValueGuard, OwnedValuesGuard,
+                        };
+                        let mut state = runtime.0.state.borrow_mut();
+                        let receiver =
+                            state.dup_jsvalue(&JsValue::Object(rooted.handler.object_id()))?;
+                        let mut receiver =
+                            OwnedValueGuard::new(&mut state, &runtime.0.poisoned, receiver);
+                        let (state, receiver) = receiver.parts();
+                        let mut arguments =
+                            OwnedValuesGuard::new(state, &runtime.0.poisoned, Vec::new());
+                        let (state, arguments) = arguments.parts();
+                        arguments.try_reserve(2).map_err(|_| {
+                            RuntimeError::Invariant("Own trap argument allocation failed")
+                        })?;
+                        arguments
+                            .push(state.dup_jsvalue(&JsValue::Object(rooted.target.object_id()))?);
+                        arguments.push(state.property_key_argument_in_state(key.atom())?);
+                        (receiver.take().unwrap(), std::mem::take(arguments))
+                    };
                     ProxyOwnStep::request_call(
                         target,
                         receiver,
@@ -124,25 +185,28 @@ fn method(
                 }
             }
         }
-        MethodStep::Read { mut resume } => {
-            let object = resume.take_read_object();
-            let method_key = resume.take_read_key();
-            let receiver = resume.take_read_receiver();
-            ProxyOwnStep::request_read(
-                object,
-                method_key,
-                receiver,
-                ProxyOwnResume(Box::new(ProxyOwnResumeState {
-                    pending_effect: ProxyOwnStepPending::new(runtime.clone()),
-                    realm,
-                    phase: Phase::Method { resume, key },
-                })),
-            )
-        }
+        MethodStep::Read { resume } => ProxyOwnStep::StateRead {
+            resume: ProxyOwnResume(Box::new(ProxyOwnResumeState {
+                pending_effect: ProxyOwnStepPending::new(runtime.clone()),
+                realm,
+                phase: Phase::Method { resume, key },
+            })),
+        },
     })
 }
 
 impl ProxyOwnResume {
+    pub(crate) fn take_state_read(
+        &mut self,
+    ) -> (
+        crate::engine::object::StateReadEffect,
+        crate::engine::atom::Atom,
+    ) {
+        let Phase::Method { resume, .. } = &mut self.0.phase else {
+            unreachable!("selected method read phase")
+        };
+        resume.take_state_read()
+    }
     pub(crate) fn resume(
         self,
         runtime: &Runtime,
@@ -338,9 +402,6 @@ impl ProxyOwnResume {
 
 struct ProxyOwnStepPending {
     runtime: Runtime,
-    read_object: Option<ObjectRef>,
-    read_key: Option<PropertyKey>,
-    read_receiver: Option<JsValue>,
     call_target: Option<DirectCallTarget>,
     call_receiver: Option<JsValue>,
     call_arguments: Option<Vec<JsValue>>,
@@ -354,9 +415,6 @@ impl ProxyOwnStepPending {
     fn new(runtime: Runtime) -> Self {
         Self {
             runtime,
-            read_object: None,
-            read_key: None,
-            read_receiver: None,
             call_target: None,
             call_receiver: None,
             call_arguments: None,
@@ -373,9 +431,6 @@ impl Drop for ProxyOwnStepPending {
     /// Consumption goes through `Option::take`; releases are defer-safe and
     /// nothrow, and never run JavaScript.
     fn drop(&mut self) {
-        if let Some(value) = self.read_receiver.take() {
-            let _ = self.runtime.release_jsvalue(value);
-        }
         if let Some(value) = self.call_receiver.take() {
             let _ = self.runtime.release_jsvalue(value);
         }
@@ -393,17 +448,6 @@ impl Drop for ProxyOwnStepPending {
     }
 }
 impl ProxyOwnStep {
-    pub(crate) fn request_read(
-        object: ObjectRef,
-        key: PropertyKey,
-        receiver: JsValue,
-        mut resume: ProxyOwnResume,
-    ) -> Self {
-        resume.0.pending_effect.read_object = Some(object);
-        resume.0.pending_effect.read_key = Some(key);
-        resume.0.pending_effect.read_receiver = Some(receiver);
-        Self::Read { resume }
-    }
     pub(crate) fn request_call(
         target: DirectCallTarget,
         receiver: JsValue,
@@ -434,27 +478,6 @@ impl ProxyOwnStep {
     }
 }
 impl ProxyOwnResume {
-    pub(crate) fn take_read_object(&mut self) -> ObjectRef {
-        self.0
-            .pending_effect
-            .read_object
-            .take()
-            .expect("ProxyOwnStep Read object")
-    }
-    pub(crate) fn take_read_key(&mut self) -> PropertyKey {
-        self.0
-            .pending_effect
-            .read_key
-            .take()
-            .expect("ProxyOwnStep Read key")
-    }
-    pub(crate) fn take_read_receiver(&mut self) -> JsValue {
-        self.0
-            .pending_effect
-            .read_receiver
-            .take()
-            .expect("ProxyOwnStep Read receiver")
-    }
     pub(crate) fn take_call_target(&mut self) -> DirectCallTarget {
         self.0
             .pending_effect

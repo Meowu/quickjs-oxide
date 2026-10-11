@@ -11,7 +11,9 @@ pub(crate) struct SlotReplacementError {
 
 /// Common numeric stores exchange their payloads directly. Other public value
 /// pairs keep one cold conversion boundary; neither path changes edge counts.
-#[inline]
+/// Every slot-exchange consumer inlines this fast path; only the cold half
+/// is a call.
+#[inline(always)]
 fn exchange_public_owner(previous: &mut RawValue, input: &mut JsValue) -> bool {
     if let (RawValue::Int(previous), JsValue::Int(input)) = (&mut *previous, &mut *input) {
         std::mem::swap(previous, input);
@@ -38,6 +40,9 @@ fn exchange_public_owner_cold(previous: &mut RawValue, input: &mut JsValue) -> b
 impl Heap {
     /// Exchange two existing public owners. This leaf changes no layout,
     /// reference count or Atom count; permissions are selected by ordinary Set.
+    /// Both the field store and field definition consumers inline it; as an
+    /// outlined call it costs the hot existing-slot write a call frame.
+    #[inline(always)]
     pub(crate) fn exchange_owned_data_slot(
         &mut self,
         id: ObjectId,
@@ -55,15 +60,37 @@ impl Heap {
         Ok(exchange_public_owner(previous, input))
     }
 
+    /// [`Self::exchange_owned_data_slot`] for a receiver its caller keeps
+    /// alive; identity is checked only in debug and `checked-handles` builds.
+    #[inline]
+    pub(crate) fn exchange_owned_data_slot_fast(
+        &mut self,
+        id: ObjectId,
+        index: usize,
+        input: &mut JsValue,
+    ) -> Result<bool, HeapError> {
+        let slot = self
+            .object_mut_fast(id)
+            .slots
+            .get_mut(index)
+            .ok_or(HeapError::Invariant("selected data slot disappeared"))?;
+        let PropertySlot::Data(previous) = slot else {
+            return Ok(false);
+        };
+        Ok(exchange_public_owner(previous, input))
+    }
+
     /// Dense entries have default writable data attributes. Descriptor changes
     /// materialize them before this leaf can exchange their existing owners.
+    /// The caller keeps the receiver alive; identity is checked only in debug
+    /// and `checked-handles` builds.
     pub(crate) fn exchange_owned_dense_value(
         &mut self,
         id: ObjectId,
         index: u32,
         input: &mut JsValue,
     ) -> Result<bool, HeapError> {
-        let data = self.object_mut(id)?;
+        let data = self.object_mut_fast(id);
         if !matches!(data.kind, ObjectKind::Array) {
             return Ok(false);
         }
@@ -91,8 +118,9 @@ impl Heap {
         self.try_update_array_own_number(id, index, atom, value, |_, new| new)
     }
 
-    /// The receiver has a frame owner. An existing Number-to-Number update
-    /// changes neither graph edges nor the Array layout.
+    /// The receiver has a frame owner, so the object is read through trusted
+    /// access. An existing Number-to-Number update changes neither graph edges
+    /// nor the Array layout.
     pub(crate) fn try_add_array_own_number(
         &mut self,
         id: ObjectId,
@@ -130,7 +158,7 @@ impl Heap {
         // The dense branch authenticates the object once. Materialized data
         // needs a separate shape read before the final mutable slot access.
         let shape_id = {
-            let data = self.object_mut(id).map_err(|_| Miss::ReceiverUnavailable)?;
+            let data = self.object_mut_fast(id);
             if !matches!(data.kind, ObjectKind::Array) {
                 return Err(Miss::ReceiverNotArray);
             }
@@ -160,7 +188,7 @@ impl Heap {
         {
             return Err(Miss::OwnElementNotWritable);
         }
-        let data = self.object_mut(id).map_err(|_| Miss::ReceiverUnavailable)?;
+        let data = self.object_mut_fast(id);
         let cell = match data.slots.get_mut(slot) {
             Some(PropertySlot::Data(raw)) => raw,
             _ => return Err(Miss::UnsupportedOwnElement),
@@ -194,13 +222,41 @@ impl Heap {
         }
     }
 
+    /// Checked object read that also reports its strong count from the same
+    /// slot, for admission checks that must leave saturation to the general path.
+    pub(crate) fn object_with_strong(&self, id: ObjectId) -> Result<(&ObjectData, u32), HeapError> {
+        let node = self.live_node(RawId::Object(id))?;
+        match node.data {
+            NodeData::Object(ref object) => Ok((object, node.strong.get())),
+            NodeData::Context(_) | NodeData::FunctionBytecode(_) => Err(HeapError::Invariant(
+                "typed object lookup reached another node payload",
+            )),
+        }
+    }
+
+    /// Trusted read of a live object and its strong count from one slot, for
+    /// callers holding an edge that keeps the object alive.
+    #[inline]
+    pub(crate) fn object_and_strong_fast(&self, id: ObjectId) -> (&ObjectData, u32) {
+        let node = self.live_node_fast(RawId::Object(id));
+        match node.data {
+            NodeData::Object(ref object) => (object, node.strong.get()),
+            NodeData::Context(_) | NodeData::FunctionBytecode(_) => {
+                unreachable!("trusted object handle reached another node payload")
+            }
+        }
+    }
+
+    /// Trusted strong-count read for a live string or BigInt leaf.
+    #[inline]
+    pub(crate) fn leaf_strong_fast(&self, id: RawId) -> u32 {
+        self.live_leaf_fast(id).strong.get()
+    }
+
     /// Trusted shared read for a live `ObjectId` held by an owning root.
     #[inline]
     pub(crate) fn object_fast(&self, id: ObjectId) -> &ObjectData {
-        match &self.live_node_fast(RawId::Object(id)).data {
-            NodeData::Object(object) => object,
-            _ => unreachable!("trusted object handle reached another node payload"),
-        }
+        self.object_node_fast(id)
     }
 
     /// Set QuickJS's identity-local Annex B `is_HTMLDDA` bit.
@@ -581,6 +637,11 @@ impl Heap {
     }
 
     fn fresh_array_next_length(&self, id: ObjectId) -> Result<u32, HeapError> {
+        self.fresh_array_length_after(id, 1)
+    }
+
+    /// The length of a fresh dense Array after appending `added` elements.
+    fn fresh_array_length_after(&self, id: ObjectId, added: u32) -> Result<u32, HeapError> {
         Ok({
             let object = self.object(id)?;
             let ObjectPayload::Array { dense: Some(dense) } = &object.payload else {
@@ -615,10 +676,44 @@ impl Heap {
                     "fresh Array length diverged from its dense count",
                 ));
             }
-            dense_len.checked_add(1).ok_or(HeapError::Overflow {
+            dense_len.checked_add(added).ok_or(HeapError::Overflow {
                 operation: "growing fresh Array length",
             })?
         })
+    }
+
+    /// Adopt every owned element of a literal at once: one validation, one
+    /// reservation and one length update. The caller passes only storable
+    /// values. On error nothing is published and every input owner stays in
+    /// `values` for the caller's cleanup.
+    pub(crate) fn append_fresh_array_dense_values_owned(
+        &mut self,
+        id: ObjectId,
+        values: &mut [crate::engine::value::JsValue],
+    ) -> Result<(), HeapError> {
+        let added = u32::try_from(values.len()).map_err(|_| HeapError::Overflow {
+            operation: "growing fresh Array length",
+        })?;
+        let next_len = self.fresh_array_length_after(id, added)?;
+        let object = self.object_mut(id)?;
+        let ObjectPayload::Array { dense: Some(dense) } = &mut object.payload else {
+            unreachable!("validated dense Array changed before reservation")
+        };
+        dense
+            .try_reserve(values.len())
+            .map_err(|_| HeapError::Allocation {
+                operation: "growing fast Array storage",
+            })?;
+        dense.extend(values.iter_mut().map(|value| {
+            std::mem::replace(value, crate::engine::value::JsValue::Undefined).into_raw()
+        }));
+        let Some(PropertySlot::Data(length)) = object.slots.first_mut() else {
+            unreachable!("validated fresh Array length slot")
+        };
+        *length = i32::try_from(next_len)
+            .map(RawValue::Int)
+            .unwrap_or_else(|_| RawValue::Float(f64::from(next_len)));
+        Ok(())
     }
 
     /// Adopt an owned element, including its atom edge, with no retain/release
@@ -635,7 +730,7 @@ impl Heap {
                 ));
             }
             let next_len = self.fresh_array_next_length(id)?;
-            let ObjectPayload::Array { dense: Some(dense) } = &mut self.object_mut(id)?.payload
+            let ObjectPayload::Array { dense: Some(dense) } = &mut self.object_mut_fast(id).payload
             else {
                 unreachable!("validated dense Array changed before reservation")
             };
@@ -648,7 +743,7 @@ impl Heap {
             Ok(length) => length,
             Err(error) => return Err((error, value)),
         };
-        let object = self.object_mut(id).expect("validated fresh Array");
+        let object = self.object_mut_fast(id);
         let ObjectPayload::Array { dense: Some(dense) } = &mut object.payload else {
             unreachable!("validated dense Array changed before publication")
         };
@@ -659,6 +754,64 @@ impl Heap {
         *length = i32::try_from(next_len)
             .map(RawValue::Int)
             .unwrap_or_else(|_| RawValue::Float(f64::from(next_len)));
+        Ok(())
+    }
+
+    /// Move an owned value into the first hole of a fast Array whose length
+    /// already covers it (`new Array(n)` filled in order). The length is
+    /// unchanged; the caller proved the hole is not shadowed by a prototype
+    /// and keeps the receiver alive.
+    pub(crate) fn fill_array_dense_hole_owned(
+        &mut self,
+        id: ObjectId,
+        value: RawValue,
+    ) -> Result<(), (HeapError, RawValue)> {
+        let prepared = (|| {
+            if !is_map_storable_value(&value) {
+                return Err(HeapError::Invariant(
+                    "fast Array contains an internal value sentinel",
+                ));
+            }
+            let object = self.object_mut_fast(id);
+            let stored_len = match object.slots.first() {
+                Some(PropertySlot::Data(RawValue::Int(length))) if *length >= 0 => *length as u32,
+                Some(PropertySlot::Data(RawValue::Float(length)))
+                    if length.is_finite()
+                        && *length >= 0.0
+                        && *length <= f64::from(u32::MAX)
+                        && length.fract() == 0.0 =>
+                {
+                    *length as u32
+                }
+                _ => {
+                    return Err(HeapError::Invariant(
+                        "fast Array length is not an exact Uint32 data value",
+                    ));
+                }
+            };
+            let ObjectPayload::Array { dense: Some(dense) } = &mut object.payload else {
+                return Err(HeapError::Invariant(
+                    "dense hole fill reached a slow Array or wrong object class",
+                ));
+            };
+            if dense.len() >= stored_len as usize {
+                return Err(HeapError::Invariant(
+                    "dense hole fill reached an element at or past the length",
+                ));
+            }
+            dense.try_reserve(1).map_err(|_| HeapError::Allocation {
+                operation: "growing fast Array storage",
+            })
+        })();
+        if let Err(error) = prepared {
+            return Err((error, value));
+        }
+        let ObjectPayload::Array { dense: Some(dense) } =
+            &mut self.object_mut(id).expect("validated fast Array").payload
+        else {
+            unreachable!("validated dense Array changed before publication")
+        };
+        dense.push(value);
         Ok(())
     }
 
@@ -927,27 +1080,27 @@ impl Heap {
         // every replacement enforce it) and the replacement is a scalar, so
         // the storage validation is redundant here. The transactional
         // retain/release machinery is a no-op for the same reason.
-        if let PropertySlot::Data(new) = &replacement {
-            if raw_value_is_immediate(new) {
-                let object = self.object_mut(id).map_err(|error| SlotReplacementError {
+        if let PropertySlot::Data(new) = &replacement
+            && raw_value_is_immediate(new)
+        {
+            let object = self.object_mut(id).map_err(|error| SlotReplacementError {
+                error,
+                published: false,
+            })?;
+            let old_is_immediate = matches!(
+                object.slots.get(slot_index),
+                Some(PropertySlot::Data(old)) if raw_value_is_immediate(old)
+            );
+            if old_is_immediate {
+                let slot = object.slots.get_mut(slot_index).ok_or(HeapError::Invariant(
+                    "immediate property slot disappeared before replacement",
+                ));
+                let slot = slot.map_err(|error| SlotReplacementError {
                     error,
                     published: false,
                 })?;
-                let old_is_immediate = matches!(
-                    object.slots.get(slot_index),
-                    Some(PropertySlot::Data(old)) if raw_value_is_immediate(old)
-                );
-                if old_is_immediate {
-                    let slot = object.slots.get_mut(slot_index).ok_or(HeapError::Invariant(
-                        "immediate property slot disappeared before replacement",
-                    ));
-                    let slot = slot.map_err(|error| SlotReplacementError {
-                        error,
-                        published: false,
-                    })?;
-                    *slot = replacement;
-                    return Ok(HeapCleanup::default());
-                }
+                *slot = replacement;
+                return Ok(HeapCleanup::default());
             }
         }
         self.validate_replacement_slot(id, slot_index, &replacement)
@@ -1329,6 +1482,7 @@ impl Heap {
 
     /// The enclosing state transaction transfers an existing value owner only
     /// when this result reports publication. Shape ownership remains retained.
+    #[cfg(test)]
     pub(crate) fn append_object_slot_with_shape_input(
         &mut self,
         id: ObjectId,
@@ -1336,18 +1490,62 @@ impl Heap {
         replacement: PropertySlot,
         retain_value: bool,
     ) -> Result<HeapCleanup, SlotReplacementError> {
-        let prepare = (|| {
+        let extends = (|| {
             let object = self.object(id)?;
             let previous = self.shape(object.shape)?;
             let successor = self.shape(shape)?;
             let count = object.slots.len();
-            if previous.is_dictionary()
-                || successor.is_dictionary()
-                || previous.entries().len() != count
-                || successor.entries().len() != count.saturating_add(1)
-                || successor.prototype() != previous.prototype()
-                || successor.entries().get(..count) != Some(previous.entries())
-            {
+            Ok::<_, HeapError>(
+                !previous.is_dictionary()
+                    && previous.entries().len() == count
+                    && successor.prototype() == previous.prototype()
+                    && successor.entries().get(..count) == Some(previous.entries()),
+            )
+        })()
+        .map_err(|error| SlotReplacementError {
+            error,
+            published: false,
+        })?;
+        if !extends {
+            return Err(SlotReplacementError {
+                error: HeapError::Invariant(
+                    "property append shape does not extend the existing layout",
+                ),
+                published: false,
+            });
+        }
+        self.append_successor_slot(id, shape, replacement, retain_value, false)
+            .map(Option::unwrap_or_default)
+    }
+
+    /// Publish one slot under a successor already selected for the object's
+    /// current shared layout: a live transition edge, a verified canonical
+    /// successor, or a site fact guarded by both shape revisions. Selection
+    /// established the prefix and prototype; only O(1) facts are checked here.
+    ///
+    /// With `owned_shape` the caller's successor reference moves into the
+    /// object on publication; otherwise the object acquires its own. The old
+    /// shape reference is released, and cleanup is returned only when that
+    /// release drained nodes.
+    pub(crate) fn append_successor_slot(
+        &mut self,
+        id: ObjectId,
+        shape: ShapeId,
+        replacement: PropertySlot,
+        retain_value: bool,
+        owned_shape: bool,
+    ) -> Result<Option<HeapCleanup>, SlotReplacementError> {
+        let prepare = (|| {
+            let object = self.object(id)?;
+            let count = object.slots.len();
+            let successor = self.shape(shape)?;
+            debug_assert!(self.shape(object.shape).is_ok_and(|previous| {
+                !previous.is_dictionary()
+                    && previous.entries().len() == count
+                    && successor.prototype() == previous.prototype()
+                    && successor.entries().get(..count) == Some(previous.entries())
+            }));
+            if successor.is_dictionary() || successor.entries().len() != count.saturating_add(1) {
                 return Err(HeapError::Invariant(
                     "property append shape does not extend the existing layout",
                 ));
@@ -1368,7 +1566,9 @@ impl Heap {
             } else {
                 super::edges::Edges::new()
             };
-            edges.push(RawId::Shape(shape));
+            if !owned_shape {
+                edges.push(RawId::Shape(shape));
+            }
             self.retain_edges_transactionally(&edges)
         })();
         prepare.map_err(|error| SlotReplacementError {
@@ -1388,11 +1588,81 @@ impl Heap {
         crate::engine::api::profiling::record_owned_execution_event(
             "shape_append_existing_owners_preserved",
         );
-        self.release_and_drain(RawId::Shape(previous_shape))
+        self.release_reference(RawId::Shape(previous_shape))
             .map_err(|error| SlotReplacementError {
                 error,
                 published: true,
             })
+    }
+
+    /// Site-cache hit: move an owned data value into a new slot under the
+    /// recorded successor. The caller proved under this borrow that the
+    /// object's shape is the recorded shared parent and validated the
+    /// successor's generation and revision; the value owner and its atom
+    /// edge move with the input, so only the two shape counts change.
+    #[inline(always)]
+    pub(crate) fn append_cached_owned_slot(
+        &mut self,
+        id: ObjectId,
+        successor: ShapeId,
+        value: RawValue,
+    ) -> Result<Option<HeapCleanup>, SlotReplacementError> {
+        let unpublished = |error| SlotReplacementError {
+            error,
+            published: false,
+        };
+        // The site validated the successor's generation under this borrow;
+        // retaining it is the only fallible step before the slot is written.
+        let strong = &self.shapes.live_fast_mut(successor).strong;
+        strong.set(
+            strong
+                .get()
+                .checked_add(1)
+                .ok_or(unpublished(HeapError::Overflow {
+                    operation: "retaining a heap reference",
+                }))?,
+        );
+        // The caller's frame owns the receiver; its handle needs no check.
+        let object = self.object_mut_fast(id);
+        if let Err(slot) = object.slots.push_inline(PropertySlot::Data(value)) {
+            if object.slots.try_reserve(1).is_err() {
+                let strong = &self.shapes.live_fast_mut(successor).strong;
+                strong.set(strong.get() - 1);
+                return Err(unpublished(HeapError::Allocation {
+                    operation: "appending a cached shape property",
+                }));
+            }
+            object.slots.push(slot);
+        }
+        let prototype = object.used_as_prototype;
+        let previous_shape = std::mem::replace(&mut object.shape, successor);
+        if prototype {
+            self.property_layout_epoch = self.property_layout_epoch.saturating_add(1);
+        }
+        // The object owned its previous shape: a nonfinal decrement needs no
+        // handle check. A shape is never a leaf node; a possibly final release
+        // goes through its own arena's checked path.
+        // Pending zero-queue work is still drained below, as before.
+        if self.zero_queue.is_empty() && self.shapes.release_nonfinal_fast(previous_shape) {
+            return Ok(None);
+        }
+        let drained = self
+            .shapes
+            .release_no_drain(previous_shape)
+            .and_then(|zero| {
+                if zero {
+                    self.zero_queue.push_back(RawId::Shape(previous_shape));
+                }
+                if self.zero_queue.is_empty() {
+                    Ok(None)
+                } else {
+                    self.drain_zero_queue().map(Some)
+                }
+            });
+        drained.map_err(|error| SlotReplacementError {
+            error,
+            published: true,
+        })
     }
 
     /// Transactionally replace an object's complete shape/slot layout.
@@ -2081,8 +2351,8 @@ impl Heap {
                 (_, None) => {}
             }
         }
-        if let ObjectPayload::Promise(data) = &object.payload {
-            if !is_promise_storable_value(&data.result)
+        if let ObjectPayload::Promise(data) = &object.payload
+            && (!is_promise_storable_value(&data.result)
                 || (data.state == PromiseState::Pending
                     && !matches!(data.result, RawValue::Undefined))
                 || (data.state != PromiseState::Pending
@@ -2094,12 +2364,11 @@ impl Heap {
                 || data
                     .reject_reactions
                     .iter()
-                    .any(|reaction| reaction.kind != PromiseReactionKind::Reject)
-            {
-                return Err(HeapError::Invariant(
-                    "Promise payload has invalid hidden state",
-                ));
-            }
+                    .any(|reaction| reaction.kind != PromiseReactionKind::Reject))
+        {
+            return Err(HeapError::Invariant(
+                "Promise payload has invalid hidden state",
+            ));
         }
         if let ObjectPayload::BytecodeFunction {
             bytecode,
@@ -2469,10 +2738,10 @@ impl Heap {
         if let ObjectPayload::WeakSet { records } = &object.payload {
             records.validate_order()?;
             for key in records.keys() {
-                if let WeakCollectionKey::Object(key) = key {
-                    if self.is_live(RawId::Object(*key)) {
-                        self.object(*key)?;
-                    }
+                if let WeakCollectionKey::Object(key) = key
+                    && self.is_live(RawId::Object(*key))
+                {
+                    self.object(*key)?;
                 }
             }
         }

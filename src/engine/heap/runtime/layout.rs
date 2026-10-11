@@ -37,11 +37,11 @@ impl RuntimeState {
             }
             result => result,
         };
-        if let Err(failure) = &result {
-            if !failure.published {
-                self.release_atoms(atoms)
-                    .inspect_err(|_| poisoned.set(true))?;
-            }
+        if let Err(failure) = &result
+            && !failure.published
+        {
+            self.release_atoms(atoms)
+                .inspect_err(|_| poisoned.set(true))?;
         }
         let cleanup = self
             .heap
@@ -153,9 +153,11 @@ mod tests {
                 .is_err()
         );
         assert!(runtime.is_poisoned());
+        // Allocation holds no temporary prototype owner (plan item 1c), so
+        // quarantine abandons none: the realm and the shape keep their edges.
         assert_eq!(
             state.heap.object_strong_count(prototype),
-            Ok(prototype_count + 1)
+            Ok(prototype_count)
         );
         assert_eq!(state.heap.object_strong_count(later), Ok(0));
         assert!(state.heap.has_pending_zero_cleanup());

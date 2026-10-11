@@ -4,6 +4,7 @@ use super::{
     Error, FrameBinding, FrameSlots, JsValue, NamedReadOperation, PropertyReadProgress,
     runtime_error_to_vm_error,
 };
+use crate::engine::heap::RawId;
 use crate::engine::heap::runtime::RuntimeState;
 
 #[inline(always)]
@@ -11,6 +12,7 @@ pub(in crate::engine::vm) fn copy_value_in_state(
     state: &mut RuntimeState,
     value: &JsValue,
 ) -> Result<JsValue, Error> {
+    // The source slot owns its edge, so heap handles take the trusted retain.
     let copied = match value {
         JsValue::Undefined => JsValue::Undefined,
         JsValue::Null => JsValue::Null,
@@ -18,29 +20,32 @@ pub(in crate::engine::vm) fn copy_value_in_state(
         JsValue::Int(value) => JsValue::Int(*value),
         JsValue::Float(value) => JsValue::Float(*value),
         JsValue::ShortBigInt(value) => JsValue::ShortBigInt(*value),
-        _ => return copy_reference_in_state(state, value),
+        JsValue::Object(id) if state.heap.admits_trusted(RawId::Object(*id)) => {
+            state.heap.retain_object_fast(*id);
+            JsValue::Object(*id)
+        }
+        JsValue::String(id) if state.heap.admits_trusted(RawId::String(*id)) => {
+            state.heap.retain_string_fast(*id);
+            JsValue::String(*id)
+        }
+        JsValue::BigInt(id) if state.heap.admits_trusted(RawId::BigInt(*id)) => {
+            state.heap.retain_bigint_fast(*id);
+            JsValue::BigInt(*id)
+        }
+        _ => return copy_checked_in_state(state, value),
     };
     #[cfg(feature = "profiling")]
     super::record_copy(value);
     Ok(copied)
 }
 
+/// Symbols, and handles that fail the checks enabled by
+/// [`crate::engine::heap::Heap::admits_trusted`], keep the checked duplicate.
 #[inline(never)]
-fn copy_reference_in_state(state: &mut RuntimeState, value: &JsValue) -> Result<JsValue, Error> {
-    let copied = match value {
-        // Keep the stack's existing trusted leaf-retain/saturation behavior.
-        JsValue::String(id) => {
-            state.heap.retain_string_fast(*id);
-            JsValue::String(*id)
-        }
-        JsValue::BigInt(id) => {
-            state.heap.retain_bigint_fast(*id);
-            JsValue::BigInt(*id)
-        }
-        _ => state
-            .dup_jsvalue(value)
-            .map_err(runtime_error_to_vm_error)?,
-    };
+fn copy_checked_in_state(state: &mut RuntimeState, value: &JsValue) -> Result<JsValue, Error> {
+    let copied = state
+        .dup_jsvalue(value)
+        .map_err(runtime_error_to_vm_error)?;
     #[cfg(feature = "profiling")]
     super::record_copy(value);
     Ok(copied)
@@ -48,6 +53,106 @@ fn copy_reference_in_state(state: &mut RuntimeState, value: &JsValue) -> Result<
 
 impl FrameSlots<'_> {
     pub(in crate::engine::vm) fn nullish_equality_in_state(
+        &mut self,
+        state: &mut RuntimeState,
+        poisoned: &std::cell::Cell<bool>,
+    ) -> Result<Option<bool>, Error> {
+        if let Some(equal) = self.nullish_equality_fast(state) {
+            return Ok(Some(equal));
+        }
+        self.nullish_equality_general(state, poisoned)
+    }
+
+    /// `===` between immediates or objects whose operand edges are not their
+    /// last: identity and number comparison read no heap payload and the
+    /// releases cannot clean up, so both owners are settled in place. A
+    /// string, BigInt or Symbol operand, or a possibly final edge, declines
+    /// with both operands untouched.
+    #[inline(always)]
+    pub(in crate::engine::vm) fn strict_equality_fast(
+        &mut self,
+        state: &mut RuntimeState,
+    ) -> Option<bool> {
+        fn edge(value: &JsValue) -> Option<Option<crate::engine::heap::ObjectId>> {
+            match value {
+                JsValue::Undefined
+                | JsValue::Null
+                | JsValue::Bool(_)
+                | JsValue::Int(_)
+                | JsValue::Float(_)
+                | JsValue::ShortBigInt(_) => Some(None),
+                JsValue::Object(id) => Some(Some(*id)),
+                _ => None,
+            }
+        }
+        let (left, right) = self.store.top_pair_current(self.window)?;
+        let equal = match (edge(left)?, edge(right)?) {
+            (None, None) => crate::engine::object::storage::strict_equal_immediate(left, right),
+            // An object never equals an immediate.
+            (Some(id), None) | (None, Some(id)) => {
+                if !state.heap.release_object_nonfinal_trusted(id) {
+                    return None;
+                }
+                false
+            }
+            (Some(left), Some(right)) => {
+                // Check both counts before either decrement; one object on
+                // both sides gives up two edges.
+                let needed = if left == right { 3 } else { 2 };
+                if state.heap.object_strong_fast(right) < needed
+                    || !state.heap.release_object_nonfinal_trusted(left)
+                {
+                    return None;
+                }
+                if !state.heap.release_object_nonfinal_trusted(right) {
+                    // Only a traced debug handle declines here; undo the left.
+                    state.heap.retain_object_fast(left);
+                    return None;
+                }
+                left == right
+            }
+        };
+        self.store.discard_top_pair_current(self.window);
+        Some(equal)
+    }
+
+    /// `x == null` against a nullish value or an object whose operand edge is
+    /// not the last one: no error, cleanup or call is possible, so the owners
+    /// are settled in place. Everything else, unchanged, takes the general path.
+    #[inline(always)]
+    fn nullish_equality_fast(&mut self, state: &mut RuntimeState) -> Option<bool> {
+        let (left, right) = self.store.top_pair_current(self.window)?;
+        let other = if matches!(left, JsValue::Null | JsValue::Undefined) {
+            right
+        } else if matches!(right, JsValue::Null | JsValue::Undefined) {
+            left
+        } else {
+            return None;
+        };
+        let equal = match other {
+            JsValue::Null | JsValue::Undefined => true,
+            JsValue::Object(id) => {
+                // The operand slot owns an edge to the object.
+                let (object, count) = state.heap.object_and_strong_fast(*id);
+                if count >= u32::MAX - 1 {
+                    return None;
+                }
+                let html_dda = object.is_html_dda;
+                if !state.heap.release_object_nonfinal_trusted(*id) {
+                    return None;
+                }
+                html_dda
+            }
+            _ => return None,
+        };
+        self.store.discard_top_pair_current(self.window);
+        #[cfg(feature = "profiling")]
+        crate::engine::api::profiling::record_owned_execution_event("nullish_comparison.local");
+        Some(equal)
+    }
+
+    #[inline(never)]
+    fn nullish_equality_general(
         &mut self,
         state: &mut RuntimeState,
         poisoned: &std::cell::Cell<bool>,
@@ -65,18 +170,13 @@ impl FrameSlots<'_> {
         let equal = match other {
             JsValue::Null | JsValue::Undefined => true,
             JsValue::Object(id) => {
-                let count = state
-                    .heap
-                    .object_strong_count(*id)
-                    .map_err(|error| Error::internal(error.to_string()))?;
+                // The operand slot owns an edge to the object, so trusted
+                // access is sound; checked builds still verify the handle.
+                let (object, count) = state.heap.object_and_strong_fast(*id);
                 if count == 0 || count >= u32::MAX - 1 {
                     return Ok(None);
                 }
-                state
-                    .heap
-                    .object(*id)
-                    .map_err(|error| Error::internal(error.to_string()))?
-                    .is_html_dda
+                object.is_html_dda
             }
             _ => return Ok(None),
         };
@@ -360,6 +460,7 @@ impl FrameSlots<'_> {
         Ok(true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::engine::vm) fn try_owned_field_write_in_state(
         &mut self,
         state: &mut RuntimeState,
@@ -367,6 +468,7 @@ impl FrameSlots<'_> {
         pressure: &crate::engine::heap::gc_pressure::GcPressure,
         domain: u64,
         executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
+        site: usize,
         key: u32,
     ) -> Result<bool, Error> {
         let JsValue::Object(object) = self.peek(1)? else {
@@ -375,7 +477,15 @@ impl FrameSlots<'_> {
         let object = *object;
         let input = self.top_direct_mut()?;
         let stored = state
-            .try_store_owned_linked_field(poisoned, domain, object, input, executable, key)
+            .try_store_owned_linked_field(
+                poisoned,
+                domain,
+                object,
+                input,
+                executable,
+                key,
+                Some((&executable.property_append_ic, site)),
+            )
             .map_err(runtime_error_to_vm_error)?;
         match stored {
             crate::engine::object::FieldStore::Miss => return Ok(false),
@@ -386,6 +496,53 @@ impl FrameSlots<'_> {
             crate::engine::object::FieldStore::Existing => {}
         }
         self.retire_field_write(state, poisoned)?;
+        Ok(true)
+    }
+
+    /// DefineField keeps the literal or instance target on the stack and
+    /// consumes only the value. A declined definition leaves both owners and
+    /// the stack depth unchanged for the definition driver. Kept out of line:
+    /// the dispatch loop holds only the call, not the definition kernel.
+    #[inline(never)]
+    pub(in crate::engine::vm) fn try_owned_field_define_in_state(
+        &mut self,
+        state: &mut RuntimeState,
+        runtime: &crate::engine::api::runtime::Runtime,
+        executable: &crate::engine::code::runtime::PublishedFunctionSnapshot,
+        site: usize,
+        key: u32,
+    ) -> Result<bool, Error> {
+        let poisoned = &runtime.0.poisoned;
+        let pressure = &runtime.0.gc_pressure;
+        let domain = runtime.domain_id();
+        let JsValue::Object(object) = self.peek(1)? else {
+            return Ok(false);
+        };
+        let object = *object;
+        let input = self.top_direct_mut()?;
+        let stored = state
+            .try_define_owned_linked_field(
+                poisoned,
+                domain,
+                object,
+                input,
+                executable,
+                key,
+                Some((&executable.property_append_ic, site)),
+            )
+            .map_err(runtime_error_to_vm_error)?;
+        if stored == crate::engine::object::FieldStore::Miss {
+            return Ok(false);
+        }
+        // The input now owns the replaced value or nothing; the target stays.
+        state
+            .release_owned_jsvalue(poisoned, self.pop()?)
+            .map_err(runtime_error_to_vm_error)?;
+        if stored == crate::engine::object::FieldStore::LayoutPublished {
+            state
+                .collect_if_requested(pressure, poisoned)
+                .map_err(runtime_error_to_vm_error)?;
+        }
         Ok(true)
     }
 
@@ -407,6 +564,71 @@ impl FrameSlots<'_> {
 
     #[inline]
     fn retire_field_write(
+        &mut self,
+        state: &mut RuntimeState,
+        poisoned: &std::cell::Cell<bool>,
+    ) -> Result<(), Error> {
+        if self.discard_top_pair_nonfinal(state) {
+            #[cfg(feature = "profiling")]
+            crate::engine::api::profiling::record_owned_execution_event(
+                "ordinary_owned_field_write_in_execute",
+            );
+            return Ok(());
+        }
+        self.retire_field_write_general(state, poisoned)
+    }
+
+    /// Drop the top two direct operands when each is an immediate or an
+    /// object whose edge is not its last: the releases can neither fail nor
+    /// clean up. Both counts are checked before either decrement; otherwise
+    /// nothing changes and the caller takes its general release.
+    #[inline(always)]
+    fn discard_top_pair_nonfinal(&mut self, state: &mut RuntimeState) -> bool {
+        fn edge(value: &JsValue) -> Option<Option<crate::engine::heap::ObjectId>> {
+            match value {
+                JsValue::Undefined
+                | JsValue::Null
+                | JsValue::Bool(_)
+                | JsValue::Int(_)
+                | JsValue::Float(_)
+                | JsValue::ShortBigInt(_) => Some(None),
+                JsValue::Object(id) => Some(Some(*id)),
+                _ => None,
+            }
+        }
+        let Some((below, top)) = self.store.top_pair_current(self.window) else {
+            return false;
+        };
+        let (Some(below), Some(top)) = (edge(below), edge(top)) else {
+            return false;
+        };
+        match (below, top) {
+            (None, None) => {}
+            (Some(id), None) | (None, Some(id)) => {
+                if !state.heap.release_object_nonfinal_trusted(id) {
+                    return false;
+                }
+            }
+            (Some(below), Some(top)) => {
+                let needed = if below == top { 3 } else { 2 };
+                if state.heap.object_strong_fast(top) < needed
+                    || !state.heap.release_object_nonfinal_trusted(below)
+                {
+                    return false;
+                }
+                if !state.heap.release_object_nonfinal_trusted(top) {
+                    // Only a traced debug handle declines here; undo below.
+                    state.heap.retain_object_fast(below);
+                    return false;
+                }
+            }
+        }
+        self.store.discard_top_pair_current(self.window);
+        true
+    }
+
+    #[inline(never)]
+    fn retire_field_write_general(
         &mut self,
         state: &mut RuntimeState,
         poisoned: &std::cell::Cell<bool>,
@@ -435,6 +657,53 @@ impl FrameSlots<'_> {
             Some(FrameBinding::Direct(value)) => Ok(value),
             _ => Err(Error::internal("admitted operand is not direct")),
         }
+    }
+
+    /// A computed-key store that the dense/typed element path declined. A key
+    /// that needs no user conversion is resolved and stored under this state
+    /// borrow; a declined store leaves all three owners for the general Set.
+    /// Kept out of line: the dispatch loop holds only the call.
+    #[inline(never)]
+    pub(in crate::engine::vm) fn try_owned_computed_write_in_state(
+        &mut self,
+        state: &mut RuntimeState,
+        runtime: &crate::engine::api::runtime::Runtime,
+    ) -> Result<bool, Error> {
+        let poisoned = &runtime.0.poisoned;
+        let JsValue::Object(object) = self.peek(2)? else {
+            return Ok(false);
+        };
+        let object = *object;
+        let Some((atom, interned)) = state
+            .primitive_key_atom(self.peek(1)?)
+            .map_err(runtime_error_to_vm_error)?
+        else {
+            return Ok(false);
+        };
+        let input = self.top_direct_mut()?;
+        let stored =
+            state.try_store_owned_atom_key(poisoned, runtime.domain_id(), object, atom, input);
+        if interned {
+            state
+                .release_atom_index(crate::engine::atom::AtomIdx::from_raw(atom.raw()))
+                .map_err(runtime_error_to_vm_error)?;
+        }
+        let stored = stored.map_err(runtime_error_to_vm_error)?;
+        if stored == crate::engine::object::FieldStore::Miss {
+            return Ok(false);
+        }
+        // The input now owns the replaced value or nothing.
+        for _ in 0..3 {
+            state
+                .release_owned_jsvalue(poisoned, self.pop()?)
+                .map_err(runtime_error_to_vm_error)?;
+        }
+        if stored == crate::engine::object::FieldStore::LayoutPublished {
+            state
+                .collect_if_requested(&runtime.0.gc_pressure, poisoned)
+                .map_err(runtime_error_to_vm_error)?;
+        }
+        Ok(true)
     }
 
     pub(in crate::engine::vm) fn try_owned_element_write_in_state(
@@ -627,15 +896,19 @@ mod tests {
 
     #[test]
     fn dense_read_failure_preserves_inputs_before_any_owner_transfer() {
+        // Heap handles copy through the trusted saturating retain, so the
+        // retain failure is injected on a symbol element's checked atom count.
         for capacity_failure in [false, true] {
             let runtime = Runtime::new();
             let mut context = runtime.new_context().unwrap();
-            let base = runtime.into_jsvalue(context.eval("[{}]").unwrap()).unwrap();
+            let base = runtime
+                .into_jsvalue(context.eval("[Symbol('element')]").unwrap())
+                .unwrap();
             let JsValue::Object(array) = &base else {
                 panic!("array")
             };
             let array = *array;
-            let crate::engine::heap::RawValue::Object(target) = runtime
+            let crate::engine::heap::RawValue::Symbol(symbol) = runtime
                 .0
                 .state
                 .borrow()
@@ -646,8 +919,17 @@ mod tests {
                 .unwrap()
                 .clone()
             else {
-                panic!("object element")
+                panic!("symbol element")
             };
+            let count = |state: &RuntimeState| {
+                state
+                    .atoms
+                    .resolve(state.atoms.brand(symbol).unwrap())
+                    .unwrap()
+                    .ref_count
+                    .unwrap()
+            };
+            let previous = count(&runtime.0.state.borrow());
             let mut layout = PublishedFunctionSnapshot::empty_for_test(context.realm);
             layout.metadata.max_stack = 2;
             let mut store = SlotStore::new(4);
@@ -666,10 +948,7 @@ mod tests {
             {
                 let mut state = runtime.0.state.borrow_mut();
                 if !capacity_failure {
-                    state.heap.set_strong_count_for_test(
-                        crate::engine::heap::RawId::Object(target),
-                        u32::MAX,
-                    );
+                    state.atoms.set_ref_count_for_test(symbol, u32::MAX);
                 }
                 let mut slots = store.borrow_frame_slots(&mut window).unwrap();
                 let result = if capacity_failure {
@@ -682,15 +961,13 @@ mod tests {
                 assert_eq!(slots.peek(0).unwrap(), &JsValue::Int(0));
                 assert_eq!(slots.peek(1).unwrap(), &JsValue::Object(array));
                 assert_eq!(
-                    state.heap.object_strong_count(target),
-                    Ok(if capacity_failure { 1 } else { u32::MAX })
+                    count(&state),
+                    if capacity_failure { previous } else { u32::MAX }
                 );
-                state
-                    .heap
-                    .set_strong_count_for_test(crate::engine::heap::RawId::Object(target), 1);
+                state.atoms.set_ref_count_for_test(symbol, previous);
             }
             store.clear_frame(&runtime, window).unwrap();
-            assert!(runtime.0.state.borrow().heap.object(target).is_err());
+            assert!(runtime.0.state.borrow().heap.object(array).is_err());
             assert!(!runtime.is_poisoned());
         }
     }
@@ -760,11 +1037,17 @@ mod tests {
     #[test]
     fn duplicate_failure_leaves_every_committed_prefix_owner_in_slots() {
         let runtime = Runtime::new();
-        let context = runtime.new_context().unwrap();
+        let mut context = runtime.new_context().unwrap();
         let mut layout = PublishedFunctionSnapshot::empty_for_test(context.realm);
         layout.metadata.max_stack = 4;
-        let overflowing = runtime.new_object(None).unwrap();
-        let overflow_id = overflowing.object_id();
+        // Objects copy through the trusted saturating retain; the symbol's
+        // checked atom retain is the failure after the committed prefix.
+        let overflowing = runtime
+            .into_jsvalue(context.eval("Symbol('overflow')").unwrap())
+            .unwrap();
+        let JsValue::Symbol(symbol) = overflowing else {
+            panic!("symbol")
+        };
         let first = runtime.new_object(None).unwrap();
         let first_id = first.object_id();
         let mut store = SlotStore::new(4);
@@ -776,31 +1059,66 @@ mod tests {
                     original_arguments: vec![],
                     parameters: vec![],
                     locals: vec![],
-                    operands: vec![
-                        JsValue::Object(first.into_handle()),
-                        JsValue::Object(overflowing.into_handle()),
-                    ],
+                    operands: vec![JsValue::Object(first.into_handle()), overflowing],
                 },
             )
             .unwrap();
         {
             let mut state = runtime.0.state.borrow_mut();
-            state.heap.set_strong_count_for_test(
-                crate::engine::heap::RawId::Object(overflow_id),
-                u32::MAX,
-            );
+            state.atoms.set_ref_count_for_test(symbol, u32::MAX);
             let mut slots = store.borrow_frame_slots(&mut window).unwrap();
             assert!(slots.duplicate_operands_in_state(&mut state, 2).is_err());
             assert_eq!(slots.window.depth, 3);
             assert_eq!(state.heap.object_strong_count(first_id).unwrap(), 2);
             // Restore the injected count so the ordinary teardown checks all edges.
-            state
-                .heap
-                .set_strong_count_for_test(crate::engine::heap::RawId::Object(overflow_id), 1);
+            state.atoms.set_ref_count_for_test(symbol, 1);
         }
         store.clear_frame(&runtime, window).unwrap();
         let state = runtime.0.state.borrow();
         assert!(state.heap.object(first_id).is_err());
-        assert!(state.heap.object(overflow_id).is_err());
+        assert!(state.atoms.brand(symbol).is_err());
+    }
+
+    #[test]
+    fn duplicate_of_an_immortal_object_saturates() {
+        let runtime = Runtime::new();
+        let context = runtime.new_context().unwrap();
+        let mut layout = PublishedFunctionSnapshot::empty_for_test(context.realm);
+        layout.metadata.max_stack = 2;
+        let object = runtime.new_object(None).unwrap();
+        let id = object.object_id();
+        let mut store = SlotStore::new(4);
+        let mut window = store
+            .push_frame(
+                &runtime,
+                &layout.frame_layout(),
+                FrameStorage {
+                    original_arguments: vec![],
+                    parameters: vec![],
+                    locals: vec![],
+                    operands: vec![JsValue::Object(object.into_handle())],
+                },
+            )
+            .unwrap();
+        {
+            let mut state = runtime.0.state.borrow_mut();
+            state
+                .heap
+                .set_strong_count_for_test(crate::engine::heap::RawId::Object(id), u32::MAX);
+            let mut slots = store.borrow_frame_slots(&mut window).unwrap();
+            slots.duplicate_operands_in_state(&mut state, 1).unwrap();
+            assert_eq!(state.heap.object_strong_count(id), Ok(u32::MAX));
+            let copy = slots.pop().unwrap();
+            state
+                .release_owned_jsvalue(&runtime.0.poisoned, copy)
+                .unwrap();
+            assert_eq!(state.heap.object_strong_count(id), Ok(u32::MAX));
+            state
+                .heap
+                .set_strong_count_for_test(crate::engine::heap::RawId::Object(id), 1);
+        }
+        store.clear_frame(&runtime, window).unwrap();
+        assert!(runtime.0.state.borrow().heap.object(id).is_err());
+        assert!(!runtime.is_poisoned());
     }
 }

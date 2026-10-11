@@ -118,13 +118,24 @@ pub(in crate::engine::vm) fn prepare_ordinary_in_state(
     let callable = transaction.peek(count)?;
     #[cfg(feature = "profiling")]
     crate::engine::api::profiling::record_callsite_callee(runtime, executable, fault_pc, callable);
-    #[cfg(not(feature = "profiling"))]
-    let _ = (executable, fault_pc);
     let crate::engine::value::JsValue::Object(function) = callable else {
         #[cfg(feature = "profiling")]
         crate::engine::api::profiling::record_owned_execution_event("core.call_decline.general");
         return Ok(None);
     };
+    // A site hit is an ordinary callee authenticated here before; the
+    // native hint can only name a native function, so it cannot match.
+    let site = executable.call_ic.site(fault_pc);
+    if let Some((callee, closure)) = site.and_then(|site| site.hit(runtime.domain_id(), *function))
+    {
+        #[cfg(feature = "profiling")]
+        crate::engine::api::profiling::record_owned_execution_event("call_site_cache.hit");
+        let checked = transaction.check_ordinary_call_depth(count, method)?;
+        return Ok(Some((
+            crate::engine::vm::call::ordinary::OrdinaryCall::from_site(*function, callee, closure),
+            checked,
+        )));
+    }
     if native_hint
         .as_ref()
         .is_some_and(|hint| hint.matches_in_domain(runtime.domain_id(), *function))
@@ -170,6 +181,11 @@ pub(in crate::engine::vm) fn prepare_ordinary_in_state(
             );
             runtime_error_to_vm_error(error)
         })?;
+    if let Some(site) = site {
+        #[cfg(feature = "profiling")]
+        crate::engine::api::profiling::record_owned_execution_event("call_site_cache.fill");
+        call.fill_site(site);
+    }
     Ok(Some((call, checked)))
 }
 
@@ -198,6 +214,78 @@ pub(in crate::engine::vm) fn enter_selected_in_state(
         tail,
         fallthrough,
     )
+}
+
+/// `f.apply(thisArg, array)` with the intrinsic `apply` on an ordinary `f`
+/// whose array reads run no code: install `f` directly instead of entering
+/// the native continuation. `false` leaves every operand untouched.
+pub(super) fn enter_apply(
+    runtime: &Runtime,
+    execution: &mut RunningExecution,
+    id: FrameId,
+    count: u16,
+    selected: &crate::engine::object::LinkedNativeSelection,
+    tail: bool,
+    fallthrough: crate::engine::vm::execute::FallthroughPc,
+) -> Result<bool, Error> {
+    use crate::engine::value::JsValue;
+    let count = usize::from(count);
+    if count > 2
+        || !selected.is_function_apply()
+        || !execution.frames.can_push()
+        || runtime.bytecode_call_would_overflow()
+    {
+        return Ok(false);
+    }
+    let mut state = runtime.0.state.borrow_mut();
+    let mut values = Vec::new();
+    let call = {
+        let frame = execution.frames.current_mut(id)?;
+        let window = &frame.window;
+        let JsValue::Object(apply) = execution.slots.peek(window, count)? else {
+            return Ok(false);
+        };
+        if !selected.matches_in_domain(runtime.domain_id(), *apply) {
+            return Ok(false);
+        }
+        let JsValue::Object(target) = execution.slots.peek(window, count + 1)? else {
+            return Ok(false);
+        };
+        if count == 2 {
+            match execution.slots.peek(window, 0)? {
+                JsValue::Undefined | JsValue::Null => {}
+                JsValue::Object(array) => {
+                    if !state
+                        .apply_list_in_state(*array, &mut values)
+                        .map_err(runtime_error_to_vm_error)?
+                    {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        let Ok(DirectSelection::Ordinary(selected)) =
+            DirectSelection::select_in_state(runtime, &state, *target)
+        else {
+            return Ok(false);
+        };
+        selected
+            .authenticate_slot_in_state(runtime, &state)
+            .map_err(runtime_error_to_vm_error)?
+    };
+    crate::engine::vm::stack::FrameExecution::admit(execution, id)?.install_apply(
+        runtime,
+        &mut state,
+        call,
+        count + 2,
+        &values,
+        tail,
+        fallthrough,
+    )?;
+    #[cfg(feature = "profiling")]
+    crate::engine::api::profiling::record_owned_execution_event("apply.entered_ordinary");
+    Ok(true)
 }
 
 // These explicit drops end the authenticated slot lease before installing a

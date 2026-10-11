@@ -29,6 +29,21 @@ use crate::engine::code::function::metadata::{
 #[cfg(test)]
 use crate::engine::code::function::metadata::{EvalBinding, EvalScope, ParameterArgumentCell};
 
+/// Identity check for a trusted handle: the holder owns a strong edge, so
+/// plain release builds skip the generation and kind comparison. Debug builds
+/// and the `checked-handles` feature restore it as a hard assertion, so an
+/// ownership error cannot hide behind a fast path in tests.
+macro_rules! assert_trusted_handle {
+    ($check:expr, $message:literal) => {
+        #[cfg(any(debug_assertions, feature = "checked-handles"))]
+        assert!($check, $message);
+        // Unchecked builds type-check the condition without evaluating it, so
+        // bindings that exist only for the check stay used.
+        #[cfg(not(any(debug_assertions, feature = "checked-handles")))]
+        let _ = || $check;
+    };
+}
+
 mod auxiliary_arena;
 mod buffers;
 use auxiliary_arena::{AuxiliaryArena, AuxiliaryState};
@@ -37,6 +52,7 @@ mod gc;
 use edges::Edges;
 
 #[cfg(any(test, feature = "profiling"))]
+#[cfg(test)]
 mod slot_ownership;
 #[cfg(test)]
 use gc::object_atoms;
@@ -51,6 +67,7 @@ use gc::{
 };
 
 #[cfg(any(test, feature = "profiling"))]
+#[cfg(test)]
 pub(crate) use slot_ownership::SlotReleaseReadiness;
 mod collection_index;
 mod collection_records;
@@ -383,7 +400,7 @@ where
     }
     Ok(difference)
 }
-const fn is_map_storable_value(value: &RawValue) -> bool {
+pub(crate) const fn is_map_storable_value(value: &RawValue) -> bool {
     !matches!(
         value,
         RawValue::Private(_) | RawValue::Uninitialized | RawValue::Exception

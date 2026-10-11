@@ -102,7 +102,7 @@ impl Runtime {
             .expect("fixed typeof atom set fits the atom table");
         let pinned_atoms = crate::engine::atom::pinned::PinnedAtoms::new(&mut atoms)
             .expect("static property atoms fit");
-        let mut well_known_symbols = HashMap::new();
+        let mut well_known_symbols = HashMap::default();
         for symbol in WellKnownSymbol::ALL {
             let atom = atoms
                 .new_static_symbol(Some(symbol.description()))
@@ -133,6 +133,7 @@ impl Runtime {
                 pending_jobs: VecDeque::new(),
                 debug_info_mode: DebugInfoMode::Full,
                 retained_shapes: Default::default(),
+                empty_shapes: Default::default(),
                 shape_cache: HashMap::default(),
                 shape_hashes: HashMap::default(),
                 shape_transitions: HashMap::default(),

@@ -1125,11 +1125,101 @@ fn emit_dynamic_identifier_reference(
     Ok(())
 }
 
-fn lower_ops(operations: Vec<SpannedIrOp>, scopes: &[ScopeLifecycle]) -> Result<LoweredOps, Error> {
+/// QuickJS `resolve_labels` rewrites discarded assignments so the store
+/// consumes its value instead of keeping a copy that a `drop` then releases.
+/// Mark the IR operations to elide and rewrite the surviving store in place:
+///
+/// - `insert2; put_field; drop` becomes `put_field`. A jump into the old
+///   `insert2` lands on `put_field` with the same `[target value]` stack.
+/// - `set_loc; drop` becomes `put_loc`, and likewise for the checked local,
+///   argument and closure-variable forms. The keeping and consuming opcodes
+///   share one handler that differs only in the kept copy, so TDZ checks,
+///   captured cells, mapped `arguments` and old-value release order are
+///   unchanged. A jump into the old `set_loc` lands on `put_loc` with the same
+///   `[value]` stack.
+///
+/// Each rewrite is skipped when anything jumps to an elided `drop` (or to the
+/// `put_field`). A local store fed by `add`, `mul` or `put_array_el` keeps its
+/// `set_loc; drop` form: the numeric regions (`flow.rs`) and the accumulator
+/// superinstructions (`code/exec.rs`) select exactly that shape, and those
+/// results are Numbers or Strings rather than shared object owners.
+fn elide_discarded_assignment_ops(operations: &mut [SpannedIrOp]) -> Vec<bool> {
+    let mut elided = vec![false; operations.len()];
+    let targets = operations
+        .iter()
+        .filter_map(|operation| match &operation.op {
+            IrOp::Bytecode(instruction) => super::relocation::instruction_target(instruction),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let targeted = |index: usize| u32::try_from(index).is_ok_and(|index| targets.contains(&index));
+    let mut index = 0;
+    while index + 1 < operations.len() {
+        if index + 2 < operations.len()
+            && matches!(
+                (
+                    &operations[index].op,
+                    &operations[index + 1].op,
+                    &operations[index + 2].op
+                ),
+                (
+                    IrOp::Bytecode(Instruction::Insert2),
+                    IrOp::Bytecode(Instruction::PutField(_)),
+                    IrOp::Bytecode(Instruction::Drop)
+                )
+            )
+            && !targeted(index + 1)
+            && !targeted(index + 2)
+        {
+            elided[index] = true;
+            elided[index + 2] = true;
+            index += 3;
+            continue;
+        }
+        let numeric_producer = index > 0
+            && matches!(
+                operations[index - 1].op,
+                IrOp::Bytecode(Instruction::Add | Instruction::Mul | Instruction::PutArrayEl)
+            );
+        let put = match (&operations[index].op, &operations[index + 1].op) {
+            (IrOp::Bytecode(store), IrOp::Bytecode(Instruction::Drop)) if !targeted(index + 1) => {
+                match *store {
+                    Instruction::SetLocal(local) if !numeric_producer => {
+                        Some(Instruction::PutLocal(local))
+                    }
+                    Instruction::SetLocalCheck(local) if !numeric_producer => {
+                        Some(Instruction::PutLocalCheck(local))
+                    }
+                    Instruction::SetArg(argument) => Some(Instruction::PutArg(argument)),
+                    Instruction::SetVarRef(closure) => Some(Instruction::PutVarRef(closure)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(put) = put {
+            operations[index].op = IrOp::Bytecode(put);
+            elided[index + 1] = true;
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    elided
+}
+
+fn lower_ops(
+    mut operations: Vec<SpannedIrOp>,
+    scopes: &[ScopeLifecycle],
+) -> Result<LoweredOps, Error> {
+    let elided = elide_discarded_assignment_ops(&mut operations);
     let mut offsets = Vec::with_capacity(operations.len() + 1);
     let mut code_len = 0_usize;
-    for operation in &operations {
+    for (operation, elided) in operations.iter().zip(&elided) {
         offsets.push(code_len);
+        if *elided {
+            continue;
+        }
         let emitted = match &operation.op {
             IrOp::EnterScope(scope) => scopes
                 .get(scope.0)
@@ -1199,7 +1289,10 @@ fn lower_ops(operations: Vec<SpannedIrOp>, scopes: &[ScopeLifecycle]) -> Result<
     let mut code = Vec::with_capacity(code_len);
     let mut pc_sites = Vec::with_capacity(code_len);
     let mut parameter_initialization_end = None;
-    for operation in operations {
+    for (operation, elided) in operations.into_iter().zip(elided) {
+        if elided {
+            continue;
+        }
         let SpannedIrOp { op, pc_site } = operation;
         match op {
             IrOp::EnterScope(scope) => {

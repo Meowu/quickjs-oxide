@@ -64,6 +64,53 @@ impl Heap {
         self.allocate_object_inner_with_status(object)
     }
 
+    /// Publish an empty ordinary object under a selected empty shared shape.
+    /// With no slots and an ordinary payload, the shape is its only edge, so
+    /// no layout validation or edge list is needed. With `owned_shape` the
+    /// caller's shape reference moves into the object; otherwise the object
+    /// acquires its own. Nothing is published or retained on error.
+    pub(crate) fn allocate_empty_ordinary_object(
+        &mut self,
+        shape: ShapeId,
+        owned_shape: bool,
+    ) -> Result<ObjectId, HeapError> {
+        debug_assert!(
+            self.shape(shape)
+                .is_ok_and(|shape| shape.entries().is_empty() && !shape.is_dictionary())
+        );
+        let (index, generation) = self.reserve(HeapNodeKind::Object)?;
+        if !owned_shape {
+            let retained = self.shapes.live_mut(shape).and_then(|node| {
+                let count = node
+                    .strong
+                    .get()
+                    .checked_add(1)
+                    .ok_or(HeapError::Overflow {
+                        operation: "retaining a heap reference",
+                    })?;
+                node.strong.set(count);
+                Ok(())
+            });
+            if let Err(error) = retained {
+                self.abort_initializing(index)?;
+                return Err(error);
+            }
+        }
+        self.publish(
+            index,
+            NodeData::Object(ObjectData::ordinary(shape, Vec::new())),
+        )?;
+        let id = ObjectId { index, generation };
+        #[cfg(debug_assertions)]
+        if super::ownership::trace_object_matches(id) {
+            eprintln!(
+                "[o-alloc] {id:?}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        Ok(id)
+    }
+
     /// Allocate a genuine WeakRef behind the runtime intrinsic surface. The
     /// target remains a non-owning generational identity.
     pub(crate) fn allocate_weak_ref_object(
@@ -129,7 +176,32 @@ impl Heap {
             .map_err(|failure| failure.error)
     }
 
+    /// Allocate an Arguments object whose builder laid out `slots` against a
+    /// shape it owns through the realm's arguments-shape cache. The layout is
+    /// validated only in debug and `checked-handles` builds; every edge is
+    /// still retained with its overflow check.
+    pub(crate) fn allocate_arguments_object_with_status(
+        &mut self,
+        object: ObjectData,
+    ) -> Result<ObjectId, ObjectAllocationError> {
+        if !matches!(object.payload, ObjectPayload::Arguments { .. }) {
+            return Err(ObjectAllocationError {
+                error: HeapError::Invariant("arguments allocation received another payload"),
+                published: false,
+            });
+        }
+        self.allocate_object_inner_validated::<{ cfg!(any(debug_assertions, feature = "checked-handles")) }>(object)
+    }
+
     fn allocate_object_inner_with_status(
+        &mut self,
+        object: ObjectData,
+    ) -> Result<ObjectId, ObjectAllocationError> {
+        self.allocate_object_inner_validated::<true>(object)
+    }
+
+    #[inline(always)]
+    fn allocate_object_inner_validated<const VALIDATE: bool>(
         &mut self,
         object: ObjectData,
     ) -> Result<ObjectId, ObjectAllocationError> {
@@ -141,7 +213,9 @@ impl Heap {
                 | ObjectPayload::FinalizationRegistry(_)
         );
         let prepared = (|| {
-            self.validate_object_layout(&object)?;
+            if VALIDATE {
+                self.validate_object_layout(&object)?;
+            }
             let (index, generation) = self.reserve(HeapNodeKind::Object)?;
             let edges = object_edges(&object);
             if let Err(error) = self.retain_edges_transactionally(&edges) {

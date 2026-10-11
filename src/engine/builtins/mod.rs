@@ -32,8 +32,10 @@ use crate::engine::vm::frames::ExplicitBacktraceLocation;
 mod array;
 mod array_buffer;
 mod atomics;
-pub(crate) use array_buffer::typed_array::CanonicalNumericIndex;
 pub(crate) use array_buffer::typed_array::write::TypedWriteStep;
+pub(crate) use array_buffer::typed_array::{
+    CanonicalNumericIndex, SharedTypedRead, TypedIndexRead,
+};
 
 pub(crate) use array_buffer::typed_array::{
     element::{ElementResume, ElementStep},
@@ -257,7 +259,9 @@ pub(crate) use object::string::ObjectStringKind;
 
 pub(crate) use array::build::{BuildResume as ArrayBuildResume, BuildStep as ArrayBuildStep};
 
-pub(crate) use function::instance::{InstanceResume, InstanceStep};
+pub(crate) use function::instance::{
+    InstanceResume, InstanceStep, try_ordinary_instanceof_in_state,
+};
 
 pub(crate) use iterator::concat::{
     ConcatResume as IteratorConcatResume, ConcatStep as IteratorConcatStep,

@@ -1,16 +1,15 @@
 # Browser playground
 
 The public playground at
-<https://pocket-stack.github.io/quickjs-oxide/> runs quickjs-oxide itself. The
+<https://pocket-nexus.github.io/quickjs-oxide/> runs quickjs-oxide itself. The
 Rust crate is compiled to WebAssembly, loaded in the browser, and given each
 editor submission through the public `Runtime` and `Context` APIs. It does not
 delegate JavaScript execution to the browser's `eval` or `Function`
 implementations.
 
-The editor currently evaluates Script-goal source through the public
-`eval_with_filename` path. The Rust engine's static-module and core
-`import.meta` support is real but is not exposed through this browser UI until
-it has a module-loader interface of its own.
+The editor evaluates Script-goal source through the public
+`eval_with_filename` path. Modules and `import.meta` run through the Rust API
+and CLI; the browser UI has no module loader.
 
 Each run gets a fresh runtime and realm. The WebAssembly boundary returns a
 small record:
@@ -38,10 +37,11 @@ identity boundary is the repository-owned Pages workflow.
 
 ## Build and test locally
 
-Install the WebAssembly target and the exact CLI release used by the wrapper:
+Install the WebAssembly target for the toolchain pinned in
+`rust-toolchain.toml` and the exact CLI release used by the wrapper:
 
 ```bash
-rustup target add --toolchain stable wasm32-unknown-unknown
+rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.126 --locked
 ```
 
@@ -66,8 +66,8 @@ Atomics` example that stores 40, atomically adds 2, and loads 42 from the shared
 backing. The engine implements synchronous `Atomics.wait`, but the browser
 runtime intentionally keeps QuickJS's default `can_block=false`. The
 `Atomics.wait host policy` example returns 42 only after observing the exact
-TypeError boundary, without blocking the worker event loop. The Test262 agent
-host remains outside R3dj, and pinned QuickJS has no `waitAsync` parity target.
+TypeError boundary, without blocking the worker event loop. Pinned QuickJS has
+no `waitAsync` parity target.
 
 For the same acceptance used by Pages, install the pinned browser dependency
 and run Chromium against the final `target/pages` artifact:
@@ -84,12 +84,11 @@ dedicated worker and WASM resources loaded, and rejects console, page, worker,
 request, or HTTP errors. Set `QUICKJS_OXIDE_COMMIT` when testing an artifact
 built with an explicit commit identity.
 
-The page footer keeps the frozen global Test262 vector visibly marked
-pre-parity. Its full-pass, eligible-coverage, runnable-quality, and focused
-figures are rendered from the authenticated
-[`current.conf`](../dev-support/test262/current.conf) rather than copied into
-the page. The footer links the parity contract and Test262 ledger to the exact
-commit reported by the loaded WASM package. A local build labelled `local`
+The page footer shows the Test262 pass rate within QuickJS 2026-06-04's scope,
+the full-corpus rate and the focused vector, rendered from the authenticated
+[`current.conf`](../dev-support/test262/current.conf) at build time. The footer
+links the compatibility page and Test262 ledger to the exact commit reported
+by the loaded WASM package. A local build labelled `local`
 falls back to the repository's `main` documentation links.
 
 ## Deployment

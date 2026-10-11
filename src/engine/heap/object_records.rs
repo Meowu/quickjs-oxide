@@ -601,6 +601,7 @@ impl Slots {
     }
 
     #[must_use]
+    #[inline(always)]
     pub fn get(&self, index: usize) -> Option<&PropertySlot> {
         match self {
             Self::Inline { len, slots } => (index < usize::from(*len)).then(|| &slots[index]),
@@ -613,6 +614,20 @@ impl Slots {
         match self {
             Self::Inline { len, slots } => (index < usize::from(*len)).then(|| &mut slots[index]),
             Self::Spilled(slots) => slots.get_mut(index),
+        }
+    }
+
+    /// Append into a free inline slot without a call or allocation; a full
+    /// inline pair or a spilled vector hands the slot back.
+    #[inline(always)]
+    pub(crate) fn push_inline(&mut self, slot: PropertySlot) -> Result<(), PropertySlot> {
+        match self {
+            Self::Inline { len, slots } if usize::from(*len) < Self::INLINE_CAPACITY => {
+                slots[usize::from(*len)] = slot;
+                *len += 1;
+                Ok(())
+            }
+            _ => Err(slot),
         }
     }
 

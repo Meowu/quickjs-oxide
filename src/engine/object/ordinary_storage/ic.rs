@@ -5,7 +5,7 @@ use crate::engine::api::runtime::Runtime;
 use crate::engine::builtins::native::PrimitiveKind;
 use crate::engine::code::runtime::PublishedFunctionSnapshot;
 use crate::engine::heap::runtime::RuntimeState;
-use crate::engine::heap::{ObjectId, ObjectPayload, RawValue};
+use crate::engine::heap::{ObjectId, ObjectPayload, RawId, RawValue};
 use crate::engine::object::property_ic::{CacheSelection, PropertyReadCache};
 use crate::engine::value::JsValue;
 use crate::engine::value::number::operations::Number;
@@ -35,7 +35,14 @@ impl RuntimeState {
     /// pins the executable's bytecode through the frame's callee owner. This
     /// operation does not consume the base; its owner must remain live until
     /// selection completes, and the returned value owns its retained edge.
-    #[inline]
+    /// `native` is published only when a native selection is made; every
+    /// caller passes a fresh `None`.
+    ///
+    /// The hit of an object receiver is a small out-of-line function: it needs
+    /// no key atom (a hit means this site already learned the key in this
+    /// domain) and immediates leave without the general promotion. Every other
+    /// case continues in the cold selection, which does not probe again.
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn select_linked_data_into(
         &self,
@@ -47,6 +54,59 @@ impl RuntimeState {
         keep_receiver: bool,
         native: &mut Option<LinkedNativeSelection>,
         miss: &mut NamedSelectionMiss,
+    ) -> Option<JsValue> {
+        let probed = if let JsValue::Object(receiver) = base
+            && executable.belongs_to_domain(domain_id)
+            && let Some(cache) = executable.property_read_ic.site(pc)
+        {
+            if let Some(raw) = cache.read_inline(&self.heap, *receiver) {
+                #[cfg(feature = "profiling")]
+                crate::engine::api::profiling::record_owned_execution_event(
+                    "property_selection.cache",
+                );
+                return match raw {
+                    RawValue::Int(value) => Some(JsValue::Int(*value)),
+                    RawValue::Float(value) => Some(JsValue::Float(*value)),
+                    RawValue::Bool(value) => Some(JsValue::Bool(*value)),
+                    RawValue::Undefined => Some(JsValue::Undefined),
+                    RawValue::Null => Some(JsValue::Null),
+                    raw => self.promote_field_in_state(domain_id, raw, keep_receiver, native),
+                };
+            }
+            true
+        } else {
+            false
+        };
+        self.select_linked_data_cold(
+            domain_id,
+            base,
+            executable,
+            pc,
+            key_index,
+            keep_receiver,
+            native,
+            miss,
+            probed,
+        )
+    }
+
+    /// Everything but an object receiver's cache hit. `probed` says the hit
+    /// path already read this object receiver's site; reading again would
+    /// count a cooldown step twice.
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn select_linked_data_cold(
+        &self,
+        domain_id: u64,
+        base: &JsValue,
+        executable: &PublishedFunctionSnapshot,
+        pc: usize,
+        key_index: u32,
+        keep_receiver: bool,
+        native: &mut Option<LinkedNativeSelection>,
+        miss: &mut NamedSelectionMiss,
+        probed: bool,
     ) -> Option<JsValue> {
         // Only object storage and the primitive string length projection can
         // complete under this borrow. Other primitive reads use the existing
@@ -105,7 +165,7 @@ impl RuntimeState {
                 self.uncached_field_in_state(domain_id, base, atom, keep_receiver, native)
             };
         };
-        if let Some(raw) = cache.read(&self.heap, domain_id, executable.realm, receiver) {
+        if !probed && let Some(raw) = cache.read(&self.heap, receiver) {
             #[cfg(feature = "profiling")]
             crate::engine::api::profiling::record_owned_execution_event("property_selection.cache");
             let result = self.promote_field_in_state(domain_id, raw, keep_receiver, native);
@@ -117,15 +177,8 @@ impl RuntimeState {
             });
             return result;
         }
-        let result = self.select_linked_miss(
-            domain_id,
-            cache,
-            atom,
-            executable.realm,
-            receiver,
-            keep_receiver,
-            native,
-        );
+        let result =
+            self.select_linked_miss(domain_id, cache, atom, receiver, keep_receiver, native);
         record_selection(&result);
         match result {
             NamedDataSelection::Data(value) => Some(value),
@@ -152,19 +205,11 @@ impl RuntimeState {
         domain_id: u64,
         cache: &PropertyReadCache,
         atom: crate::engine::atom::Atom,
-        realm: crate::engine::heap::ContextId,
         receiver: crate::engine::heap::ObjectId,
         keep_receiver: bool,
         native: &mut Option<LinkedNativeSelection>,
     ) -> NamedDataSelection {
-        let selected = cache.miss_selected(
-            &self.heap,
-            &self.atoms,
-            domain_id,
-            realm,
-            Some(receiver),
-            atom,
-        );
+        let selected = cache.miss_selected(&self.heap, &self.atoms, Some(receiver), atom);
         #[cfg(feature = "profiling")]
         crate::engine::api::profiling::record_owned_execution_event(
             "property_selection.cache_miss",
@@ -238,18 +283,32 @@ impl RuntimeState {
                     None
                 };
                 self.heap.retain_object_fast(*function);
-                *native = selected.map(|(function, data)| LinkedNativeSelection {
-                    domain_id,
-                    function,
-                    data,
-                });
+                // Publish the native selection only when one was made. Every
+                // caller passes a fresh `None`, so skipping the dead store on
+                // the dominant ordinary-object hit is unobservable.
+                if let Some((function, data)) = selected {
+                    *native = Some(LinkedNativeSelection {
+                        domain_id,
+                        function,
+                        data,
+                    });
+                }
                 Some(JsValue::Object(*function))
+            }
+            // The holder's live slot owns these edges.
+            RawValue::String(id) if self.heap.admits_trusted(RawId::String(*id)) => {
+                self.heap.retain_string_fast(*id);
+                Some(JsValue::String(*id))
             }
             RawValue::String(id) => {
                 self.heap.retain_string_shared(*id).ok()?;
                 Some(JsValue::String(*id))
             }
             RawValue::ShortBigInt(value) => Some(JsValue::ShortBigInt(*value)),
+            RawValue::BigInt(id) if self.heap.admits_trusted(RawId::BigInt(*id)) => {
+                self.heap.retain_bigint_fast(*id);
+                Some(JsValue::BigInt(*id))
+            }
             RawValue::BigInt(id) => {
                 self.heap.retain_bigint_shared(*id).ok()?;
                 Some(JsValue::BigInt(*id))
@@ -284,7 +343,7 @@ impl RuntimeState {
     ) -> Option<Number> {
         super::linked_field_atom_in_domain(domain_id, executable, key_index)?;
         let cache = executable.property_read_ic.site(pc)?;
-        let raw = cache.read(&self.heap, domain_id, executable.realm, receiver)?;
+        let raw = cache.read(&self.heap, receiver)?;
         match raw {
             RawValue::Int(value) => Some(Number::Int(*value)),
             RawValue::Float(value) => Some(Number::Float(*value)),
@@ -412,6 +471,53 @@ mod tests {
     }
 
     #[test]
+    fn field_read_counts_one_cooldown_step_per_read() {
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context().expect("create context");
+        let (code, pc, key) = site(&runtime);
+        let cache = code.property_read_ic.site(pc).unwrap();
+        let receivers = (0..6)
+            .map(|index| {
+                let source = format!("({{p{index}:0, x:{index}}})");
+                runtime
+                    .into_jsvalue(context.eval(&source).unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let read_once = |receiver: &JsValue| {
+            let state = runtime.0.state.borrow();
+            let mut native = None;
+            let selected = select(
+                &state,
+                runtime.domain_id(),
+                receiver,
+                &code,
+                pc,
+                key,
+                false,
+                &mut native,
+            );
+            if let NamedDataSelection::Data(value) = selected {
+                drop(state);
+                runtime.release_jsvalue(value).unwrap();
+            }
+        };
+        // Five layouts overflow the four entries and start a cooldown.
+        for receiver in &receivers[..5] {
+            read_once(receiver);
+        }
+        let start = cache.cooldown_left().expect("site cooled down");
+        for step in 1..start {
+            read_once(&receivers[5]);
+            assert_eq!(cache.cooldown_left(), Some(start - step));
+        }
+        for receiver in receivers {
+            runtime.release_jsvalue(receiver).unwrap();
+        }
+        assert!(!runtime.is_poisoned());
+    }
+
+    #[test]
     fn direct_state_read_keeps_result_after_final_receiver_release() {
         let runtime = Runtime::new();
         let mut context = runtime.new_context().expect("create context");
@@ -518,6 +624,61 @@ mod tests {
 
     #[test]
     fn direct_state_failed_promotion_keeps_receiver_and_slot_owner() {
+        // Heap handles promote through the trusted saturating retain; a
+        // symbol keeps the checked atom retain, so its overflow is the
+        // promotion failure that must leave both owners in place.
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context().expect("create context");
+        let (code, pc, key) = site(&runtime);
+        let base = runtime
+            .into_jsvalue(context.eval("({x:Symbol('promotion ownership')})").unwrap())
+            .unwrap();
+        let mut state = runtime.0.state.borrow_mut();
+        let atom = code.property_key_atoms.as_ref().unwrap()[key as usize];
+        let slot = super::super::locate(&state, object(&base), atom)
+            .unwrap()
+            .unwrap();
+        let crate::engine::heap::PropertySlot::Data(RawValue::Symbol(symbol)) = state
+            .heap
+            .object(object(&base))
+            .unwrap()
+            .slots
+            .get(slot.index)
+            .unwrap()
+        else {
+            panic!("symbol slot")
+        };
+        let symbol = *symbol;
+        let count = |state: &RuntimeState| {
+            state
+                .atoms
+                .resolve(state.atoms.brand(symbol).unwrap())
+                .unwrap()
+                .ref_count
+        };
+        let previous = count(&state).unwrap();
+        state.atoms.set_ref_count_for_test(symbol, u32::MAX);
+        let result = state.select_linked_data_into(
+            runtime.domain_id(),
+            &base,
+            &code,
+            pc,
+            key,
+            false,
+            &mut None,
+            &mut NamedSelectionMiss::ContinueLookup,
+        );
+        let overflowed = count(&state);
+        state.atoms.set_ref_count_for_test(symbol, previous);
+        assert!(result.is_none());
+        assert_eq!(overflowed, Some(u32::MAX));
+        assert_eq!(state.heap.object_strong_count(object(&base)), Ok(1));
+        state.release_jsvalue(base).unwrap();
+        assert!(!runtime.0.deferred_references.has_pending());
+    }
+
+    #[test]
+    fn direct_state_promotion_saturates_an_immortal_string() {
         use crate::engine::heap::RawId;
         let runtime = Runtime::new();
         let mut context = runtime.new_context().expect("create context");
@@ -555,13 +716,14 @@ mod tests {
             &mut None,
             &mut NamedSelectionMiss::ContinueLookup,
         );
-        let count = state.heap.strong_count(RawId::String(string)).unwrap();
+        assert!(matches!(result, Some(JsValue::String(id)) if id == string));
+        // The saturated count is immortal: the promoted owner's release
+        // leaves it unchanged.
+        state.release_jsvalue(result.unwrap()).unwrap();
+        assert_eq!(state.heap.strong_count(RawId::String(string)), Ok(u32::MAX));
         state
             .heap
             .set_strong_count_for_test(RawId::String(string), previous);
-        assert!(result.is_none());
-        assert_eq!(count, u32::MAX);
-        assert_eq!(state.heap.object_strong_count(object(&base)), Ok(1));
         state.release_jsvalue(base).unwrap();
         assert!(!runtime.0.deferred_references.has_pending());
     }
@@ -645,7 +807,8 @@ mod tests {
                     object(&base),
                     &mut JsValue::Int(42),
                     &code,
-                    key
+                    key,
+                    None
                 )
                 .unwrap()
                 .committed()
@@ -658,7 +821,8 @@ mod tests {
                     object(&frozen),
                     &mut JsValue::Int(42),
                     &code,
-                    key
+                    key,
+                    None
                 )
                 .unwrap()
                 .committed()
@@ -752,7 +916,8 @@ mod tests {
                     object(&base),
                     &mut JsValue::Int(42),
                     &code,
-                    key
+                    key,
+                    None
                 )
                 .unwrap()
                 .committed()
@@ -795,7 +960,8 @@ mod tests {
                         object(&base),
                         &mut JsValue::Int(42),
                         &code,
-                        key
+                        key,
+                        None
                     )
                     .unwrap()
                     .committed(),
@@ -819,6 +985,7 @@ mod tests {
                     &mut JsValue::Int(42),
                     &code,
                     key,
+                    None,
                 )
                 .unwrap()
                 .committed()
@@ -1378,5 +1545,372 @@ mod tests {
         runtime.release_jsvalue(first).unwrap();
         runtime.release_jsvalue(second).unwrap();
         runtime.release_jsvalue(base).unwrap();
+    }
+
+    fn store_site_for(runtime: &Runtime) -> (PublishedFunctionSnapshot, usize, u32) {
+        let mut context = runtime.new_context().expect("create context");
+        let callable = runtime
+            .callable_from_value(context.eval("(function(o){o.x = 1})").unwrap())
+            .unwrap();
+        let crate::engine::vm::call::CallableExecution::Bytecode { bytecode, .. } =
+            runtime.bytecode_for_callable(&callable).unwrap()
+        else {
+            panic!("bytecode")
+        };
+        let executable = runtime.snapshot_function_bytecode(&bytecode).unwrap();
+        let (pc, key) = executable
+            .exec
+            .test_ir()
+            .iter()
+            .enumerate()
+            .find_map(|(pc, op)| match op {
+                Instruction::PutField(key) => Some((pc, *key)),
+                _ => None,
+            })
+            .unwrap();
+        let pc = executable.exec.exec_pc(pc as u32).unwrap() as usize;
+        assert!(executable.property_append_ic.site(pc).is_some());
+        (executable, pc, key)
+    }
+
+    fn store(
+        runtime: &Runtime,
+        code: &PublishedFunctionSnapshot,
+        key: u32,
+        receiver: &JsValue,
+        input: &mut JsValue,
+        pc: usize,
+    ) -> Result<crate::engine::object::FieldStore, crate::engine::api::runtime_error::RuntimeError>
+    {
+        runtime.0.state.borrow_mut().try_store_owned_linked_field(
+            &runtime.0.poisoned,
+            runtime.domain_id(),
+            object(receiver),
+            input,
+            code,
+            key,
+            Some((&code.property_append_ic, pc)),
+        )
+    }
+
+    fn site_hits(
+        runtime: &Runtime,
+        site: &crate::engine::object::append_ic::PropertyAppendCache,
+        receiver: &JsValue,
+    ) -> bool {
+        let state = runtime.0.state.borrow();
+        site.successor(
+            &state.heap,
+            runtime.domain_id(),
+            state.heap.object(object(receiver)).unwrap(),
+        )
+        .is_some()
+    }
+
+    #[test]
+    fn append_site_learns_then_moves_owners_into_the_shared_successor() {
+        use crate::engine::object::FieldStore;
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context().expect("create context");
+        let (code, pc, key) = store_site_for(&runtime);
+        let site = code.property_append_ic.site(pc).unwrap();
+        let value = runtime
+            .into_jsvalue(context.eval("({marker:1})").unwrap())
+            .unwrap();
+        let receivers = (0..3)
+            .map(|_| runtime.into_jsvalue(context.eval("({})").unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(!site_hits(&runtime, site, &receivers[0]));
+        let value_count = |runtime: &Runtime| {
+            runtime
+                .0
+                .state
+                .borrow()
+                .heap
+                .object_strong_count(object(&value))
+                .unwrap()
+        };
+        let before = value_count(&runtime);
+        for (index, receiver) in receivers.iter().enumerate() {
+            assert_eq!(site_hits(&runtime, site, receiver), index != 0);
+            let mut input = runtime.dup_jsvalue(&value).unwrap();
+            assert!(
+                store(&runtime, &code, key, receiver, &mut input, pc).unwrap()
+                    == FieldStore::LayoutPublished
+            );
+            // The frame's owner moved into the slot; nothing was duplicated.
+            assert!(matches!(input, JsValue::Undefined));
+            assert_eq!(value_count(&runtime), before + index as u32 + 1);
+        }
+        let state = runtime.0.state.borrow();
+        let parent_count = |state: &RuntimeState| {
+            state
+                .heap
+                .shape_strong_count(state.heap.object(object(&receivers[0])).unwrap().shape)
+                .unwrap()
+        };
+        let shape = state.heap.object(object(&receivers[0])).unwrap().shape;
+        assert!(
+            receivers
+                .iter()
+                .all(|receiver| state.heap.object(object(receiver)).unwrap().shape == shape)
+        );
+        // Three objects plus at most the bounded construction-prefix pool.
+        assert!((3..=4).contains(&parent_count(&state)));
+        drop(state);
+        assert_eq!(
+            context.eval("1").unwrap(),
+            crate::engine::value::Value::Int(1)
+        );
+        for receiver in receivers {
+            runtime.release_jsvalue(receiver).unwrap();
+        }
+        assert_eq!(value_count(&runtime), before);
+        runtime.release_jsvalue(value).unwrap();
+        runtime.run_gc().unwrap();
+        assert!(!runtime.is_poisoned());
+    }
+
+    fn existing_hits(
+        runtime: &Runtime,
+        site: &crate::engine::object::append_ic::PropertyAppendCache,
+        receiver: &JsValue,
+    ) -> bool {
+        let state = runtime.0.state.borrow();
+        site.existing_slot(
+            &state.heap,
+            runtime.domain_id(),
+            state.heap.object(object(receiver)).unwrap(),
+        )
+        .is_some()
+    }
+
+    #[test]
+    fn existing_slot_site_learns_and_declines_reconfigured_layouts() {
+        use crate::engine::object::FieldStore;
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context().expect("create context");
+        let (code, pc, key) = store_site_for(&runtime);
+        let site = code.property_append_ic.site(pc).unwrap();
+        let mut make = |source: &str| runtime.into_jsvalue(context.eval(source).unwrap()).unwrap();
+        let first = make("globalThis.Make = function(){ this.x = 0; this.y = 0 }; new Make()");
+        let second = make("new Make()");
+        assert!(!existing_hits(&runtime, site, &first));
+        assert!(
+            store(&runtime, &code, key, &first, &mut JsValue::Int(1), pc).unwrap()
+                == FieldStore::Existing
+        );
+        // A sibling with the same layout hits and stores through the fact.
+        assert!(existing_hits(&runtime, site, &second));
+        assert!(
+            store(&runtime, &code, key, &second, &mut JsValue::Int(2), pc).unwrap()
+                == FieldStore::Existing
+        );
+
+        let read_only =
+            make("var r = new Make(); Object.defineProperty(r, 'x', {writable: false}); r");
+        let frozen = make("Object.freeze(new Make())");
+        let accessor =
+            make("var a = new Make(); Object.defineProperty(a, 'x', {set(v){ this.seen = v }}); a");
+        let readded = make("var d = new Make(); delete d.x; d.x = 0; d");
+        let array = make("var arr = []; arr.x = 0; arr");
+        for declined in [&read_only, &frozen, &accessor, &readded, &array] {
+            assert!(!existing_hits(&runtime, site, declined));
+        }
+        assert!(
+            store(&runtime, &code, key, &read_only, &mut JsValue::Int(3), pc).unwrap()
+                == FieldStore::Miss
+        );
+        assert!(
+            store(&runtime, &code, key, &frozen, &mut JsValue::Int(4), pc).unwrap()
+                == FieldStore::Miss
+        );
+        assert!(
+            store(&runtime, &code, key, &accessor, &mut JsValue::Int(5), pc).unwrap()
+                == FieldStore::Miss
+        );
+        // Reconfiguring other objects leaves the learned layout valid.
+        assert!(existing_hits(&runtime, site, &first));
+        // An Array's named property stores through the selector and is not learned.
+        assert!(
+            store(&runtime, &code, key, &array, &mut JsValue::Int(6), pc).unwrap()
+                == FieldStore::Existing
+        );
+        assert!(!existing_hits(&runtime, site, &array));
+        assert!(existing_hits(&runtime, site, &first));
+        // Making a sibling's other property read-only changes only its layout.
+        let reconfigured =
+            make("var q = new Make(); Object.defineProperty(q, 'y', {writable: false}); q");
+        assert!(!existing_hits(&runtime, site, &reconfigured));
+        assert!(existing_hits(&runtime, site, &second));
+        for owner in [
+            first,
+            second,
+            read_only,
+            frozen,
+            accessor,
+            readded,
+            array,
+            reconfigured,
+        ] {
+            runtime.release_jsvalue(owner).unwrap();
+        }
+        assert!(!runtime.is_poisoned());
+    }
+
+    #[test]
+    fn append_site_declines_changed_prototypes_and_receiver_capabilities() {
+        use crate::engine::object::FieldStore;
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context().expect("create context");
+        let (code, pc, key) = store_site_for(&runtime);
+        let site = code.property_append_ic.site(pc).unwrap();
+        drop(
+            context
+                .eval("globalThis.proto = {}; globalThis.make = () => Object.create(proto);")
+                .unwrap(),
+        );
+        let fresh = |context: &mut crate::engine::api::Context| {
+            runtime
+                .into_jsvalue(context.eval("make()").unwrap())
+                .unwrap()
+        };
+        let learned = fresh(&mut context);
+        assert!(
+            store(&runtime, &code, key, &learned, &mut JsValue::Int(1), pc).unwrap()
+                == FieldStore::LayoutPublished
+        );
+        let probe = fresh(&mut context);
+        assert!(site_hits(&runtime, site, &probe));
+
+        // A receiver capability is per object, not part of the shape.
+        let sealed = runtime
+            .into_jsvalue(context.eval("Object.preventExtensions(make())").unwrap())
+            .unwrap();
+        assert!(!site_hits(&runtime, site, &sealed));
+        assert!(
+            store(&runtime, &code, key, &sealed, &mut JsValue::Int(2), pc).unwrap()
+                == FieldStore::Miss
+        );
+        let frozen = runtime
+            .into_jsvalue(context.eval("Object.freeze(make())").unwrap())
+            .unwrap();
+        assert!(!site_hits(&runtime, site, &frozen));
+
+        // A dictionary receiver has its own layout; it is never learned.
+        let dictionary = runtime
+            .into_jsvalue(
+                context
+                    .eval("var d = make(); d.a = 1; d.b = 2; delete d.a; d")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!site_hits(&runtime, site, &dictionary));
+        assert!(
+            store(&runtime, &code, key, &dictionary, &mut JsValue::Int(3), pc).unwrap()
+                == FieldStore::LayoutPublished
+        );
+        assert!(site_hits(&runtime, site, &probe));
+
+        // Prototype setters and read-only properties invalidate by epoch.
+        drop(context
+            .eval(
+                "Object.defineProperty(proto, 'x', {set(v){ this.seen = v }, configurable: true})",
+            )
+            .unwrap());
+        assert!(!site_hits(&runtime, site, &probe));
+        assert!(
+            store(&runtime, &code, key, &probe, &mut JsValue::Int(4), pc).unwrap()
+                == FieldStore::Miss
+        );
+        drop(context
+            .eval("delete proto.x; Object.defineProperty(Object.prototype, 'x', {value: 0, writable: false, configurable: true})")
+            .unwrap());
+        assert!(
+            store(&runtime, &code, key, &probe, &mut JsValue::Int(5), pc).unwrap()
+                == FieldStore::Miss
+        );
+        drop(context.eval("delete Object.prototype.x").unwrap());
+        assert!(
+            store(&runtime, &code, key, &probe, &mut JsValue::Int(6), pc).unwrap()
+                == FieldStore::LayoutPublished
+        );
+        for owner in [learned, probe, sealed, frozen, dictionary] {
+            runtime.release_jsvalue(owner).unwrap();
+        }
+        assert!(!runtime.is_poisoned());
+    }
+
+    #[test]
+    fn rejected_append_site_hit_restores_input_and_both_shapes() {
+        use crate::engine::heap::RawId;
+        use crate::engine::object::FieldStore;
+        let runtime = Runtime::new();
+        let mut context = runtime.new_context().expect("create context");
+        let (code, pc, key) = store_site_for(&runtime);
+        let site = code.property_append_ic.site(pc).unwrap();
+        let learned = runtime.into_jsvalue(context.eval("({})").unwrap()).unwrap();
+        assert!(
+            store(&runtime, &code, key, &learned, &mut JsValue::Int(1), pc).unwrap()
+                == FieldStore::LayoutPublished
+        );
+        let receiver = runtime.into_jsvalue(context.eval("({})").unwrap()).unwrap();
+        let mut input = runtime
+            .into_jsvalue(context.eval("Symbol('kept')").unwrap())
+            .unwrap();
+        let raw = input.as_raw();
+        let (parent, successor) = {
+            let state = runtime.0.state.borrow();
+            (
+                state.heap.object(object(&receiver)).unwrap().shape,
+                state.heap.object(object(&learned)).unwrap().shape,
+            )
+        };
+        assert!(site_hits(&runtime, site, &receiver));
+        let counts = |runtime: &Runtime| {
+            let state = runtime.0.state.borrow();
+            (
+                state.heap.shape_strong_count(parent).unwrap(),
+                state.heap.shape_strong_count(successor).unwrap(),
+            )
+        };
+        let (parent_count, successor_count) = counts(&runtime);
+        // The successor cannot take another owner: preparation rejects
+        // before publication and the hit consumes nothing.
+        runtime
+            .0
+            .state
+            .borrow_mut()
+            .heap
+            .set_strong_count_for_test(RawId::Shape(successor), u32::MAX);
+        assert!(store(&runtime, &code, key, &receiver, &mut input, pc).is_err());
+        runtime
+            .0
+            .state
+            .borrow_mut()
+            .heap
+            .set_strong_count_for_test(RawId::Shape(successor), successor_count);
+        assert_eq!(JsValue::from_raw(input.as_raw()), JsValue::from_raw(raw));
+        assert_eq!(counts(&runtime), (parent_count, successor_count));
+        assert!(
+            runtime
+                .0
+                .state
+                .borrow()
+                .heap
+                .object(object(&receiver))
+                .unwrap()
+                .slots
+                .is_empty()
+        );
+        assert!(!runtime.is_poisoned());
+        assert!(
+            store(&runtime, &code, key, &receiver, &mut input, pc).unwrap()
+                == FieldStore::LayoutPublished
+        );
+        for owner in [learned, receiver] {
+            runtime.release_jsvalue(owner).unwrap();
+        }
+        runtime.run_gc().unwrap();
     }
 }
