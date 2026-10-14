@@ -1,4 +1,5 @@
-use quickjs_oxide::engine::api::{Runtime, Value};
+use crate::runtime_observation::host_runtime_context;
+use quickjs_oxide::engine::api::Value;
 use std::ffi::OsStr;
 use std::process::Command;
 
@@ -193,10 +194,7 @@ fn derived_class_observation_is_stable() {
 
 #[test]
 fn derived_class_observation_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP derived-class differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("derived-class differential");
     let rust = rust_observation();
     let quickjs = oracle_observation(&oracle);
     assert_eq!(quickjs, EXPECTED, "pinned QuickJS observation drifted");
@@ -204,9 +202,7 @@ fn derived_class_observation_matches_pinned_quickjs() {
 }
 
 fn rust_observation() -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     let diagnostic_probe = [
         "try { ",
         PROBE,

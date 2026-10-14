@@ -1,15 +1,16 @@
+use crate::object_graph_observation::{PresenceProbe, object_statics_after_delete};
 use crate::object_graph_observation::{
     data_bits, data_descriptor, global_callable, int_property, intrinsic_prototype, oracle_lines,
     own_key_names,
 };
 use crate::quickjs_oracle::observe_completion as observe_oracle;
 use crate::runtime_completion_oracle::compare_eval_completion_cases as compare_cases;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
 use crate::runtime_observation::{
     property_callable, string_property, take_pending_exception_object as take_exception_object,
 };
-use crate::runtime_oracle::value_type;
-use quickjs_oxide::engine::api::{Runtime, RuntimeError, Value};
+use quickjs_oxide::engine::api::{RuntimeError, Value};
 use std::ffi::OsStr;
 
 // Pins QuickJS 2026-06-04 `js_object_isExtensible` and
@@ -214,10 +215,7 @@ print([a,b,'isExtensible' in Object,'preventExtensions' in Object,
 
 #[test]
 fn object_extensibility_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Object extensibility oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Object extensibility oracle self-check");
     for &(group, cases) in &[
         ("primitive", PRIMITIVE_CASES),
         ("object", OBJECT_CASES),
@@ -257,10 +255,7 @@ fn object_extensibility_exotic_surfaces_match_pinned_quickjs() {
 
 #[test]
 fn object_extensibility_graph_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Object extensibility graph: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Object extensibility graph");
     assert_eq!(
         rust_graph_observations(),
         oracle_graph_observations(&oracle)
@@ -269,51 +264,24 @@ fn object_extensibility_graph_matches_pinned_quickjs() {
 
 #[test]
 fn object_extensibility_autoinit_can_be_deleted_before_materialization() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Object extensibility AutoInit delete: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Object extensibility AutoInit delete");
     let expected = oracle_lines(
         &oracle,
         FRESH_DELETE_ORACLE,
         "Object extensibility fresh delete",
     );
-
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
-    let object = global_callable(&runtime, &mut context, "Object");
-    let mut values = Vec::new();
-    for name in ["isExtensible", "preventExtensions"] {
-        let key = runtime.intern_property_key(name).unwrap();
-        values.push(
-            runtime
-                .delete_property(object.as_object(), &key)
-                .unwrap()
-                .to_string(),
-        );
-    }
-    for name in ["isExtensible", "preventExtensions"] {
-        let key = runtime.intern_property_key(name).unwrap();
-        values.push(
-            runtime
-                .has_own_property(object.as_object(), &key)
-                .unwrap()
-                .to_string(),
-        );
-    }
-    for name in ["isExtensible", "preventExtensions"] {
-        let key = runtime.intern_property_key(name).unwrap();
-        let value = context.get_property(object.as_object(), &key).unwrap();
-        values.push(value_type(&runtime, &value).to_owned());
-    }
-    assert_eq!(vec![values.join("|")], expected);
+    assert_eq!(
+        vec![object_statics_after_delete(
+            &["isExtensible", "preventExtensions"],
+            PresenceProbe::Own
+        )],
+        expected,
+    );
 }
 
 #[test]
 fn object_extensibility_cross_realm_calls_and_constructor_error_realm_are_exact() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_object = global_callable(&runtime, &mut defining, "Object");
@@ -374,8 +342,7 @@ fn object_extensibility_cross_realm_calls_and_constructor_error_realm_are_exact(
 
 #[test]
 fn object_extensibility_methods_are_per_realm_and_retain_then_release_their_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let (is_extensible, prevent_extensions) = {
         let mut first = runtime.new_context().expect("create context");
         let mut second = runtime.new_context().expect("create context");
@@ -433,9 +400,7 @@ fn object_extensibility_methods_are_per_realm_and_retain_then_release_their_real
 }
 
 fn rust_graph_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let function_prototype = context.function_prototype().unwrap();
     let object = global_callable(&runtime, &mut context, "Object");
     let selected = [

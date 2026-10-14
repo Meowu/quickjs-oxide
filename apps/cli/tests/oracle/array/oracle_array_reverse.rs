@@ -1,6 +1,8 @@
 use super::support::*;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
-use quickjs_oxide::engine::api::{Context, ObjectRef, Runtime, RuntimeError, Value};
+use crate::object_graph_observation::int_property;
+use quickjs_oxide::engine::api::{RuntimeError, Value};
 use std::ffi::OsStr;
 
 // This target pins QuickJS 2026-06-04 `Array.prototype.reverse` and
@@ -267,10 +269,7 @@ print('meta='+metadata('toReversed'));
 
 #[test]
 fn array_reverse_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array reverse oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array reverse oracle self-check");
     for &(group, cases) in &[
         ("values", VALUE_CASES),
         ("reverse order", REVERSE_ORDER_CASES),
@@ -316,10 +315,7 @@ fn array_reverse_errors_match_pinned_quickjs() {
 
 #[test]
 fn array_reverse_prototype_order_metadata_and_constructability_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array reverse graph differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array reverse graph differential");
     assert_eq!(
         rust_graph_observations(),
         oracle_graph_observations(&oracle),
@@ -329,8 +325,7 @@ fn array_reverse_prototype_order_metadata_and_constructability_match_pinned_quic
 
 #[test]
 fn array_reverse_boxing_results_native_errors_and_user_throws_use_pinned_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_array_prototype = defining.array_prototype().unwrap();
@@ -469,9 +464,7 @@ fn array_reverse_boxing_results_native_errors_and_user_throws_use_pinned_realms(
 }
 
 fn rust_graph_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let array_prototype = context.array_prototype().unwrap();
     let function_prototype = context.function_prototype().unwrap();
     let implemented = [
@@ -537,12 +530,4 @@ fn rust_graph_observations() -> Vec<String> {
 
 fn oracle_graph_observations(oracle: &OsStr) -> Vec<String> {
     super::quickjs_oracle::eval_std_lines(oracle, GRAPH_ORACLE, "Array reverse graph oracle")
-}
-
-fn int_property(runtime: &Runtime, context: &mut Context, object: &ObjectRef, name: &str) -> i32 {
-    let key = runtime.intern_property_key(name).unwrap();
-    let Value::Int(value) = context.get_property(object, &key).unwrap() else {
-        panic!("{name} was not an Int property");
-    };
-    value
 }

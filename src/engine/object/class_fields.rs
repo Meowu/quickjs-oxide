@@ -118,7 +118,7 @@ impl Runtime {
             writable: false,
             enumerable: false,
             configurable: false,
-        }) = descriptor.as_ref().map(|descriptor| descriptor.record())
+        }) = descriptor.as_ref().map(|value| value.record())
         else {
             return Err(RuntimeError::Invariant(
                 "class initializer owner has no authenticated prototype",
@@ -141,7 +141,7 @@ impl Runtime {
         let constructor_key =
             self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Constructor)?;
         let descriptor = self.get_own_property_owned(prototype, &constructor_key)?;
-        if !matches!(descriptor.as_ref().map(|descriptor| descriptor.record()),
+        if !matches!(descriptor.as_ref().map(|value| value.record()),
             Some(crate::engine::object::property::CompletePropertyDescriptor::Data {
                 value: crate::engine::heap::RawValue::Object(owner), writable: true, enumerable: false, configurable: true,
             }) if *owner == constructor.object_id())
@@ -328,6 +328,7 @@ mod tests {
     use crate::engine::code::function::UnlinkedFunction;
     use crate::engine::code::function::metadata::FunctionMetadata;
     use crate::engine::object::AccessorValue;
+    use crate::engine::test_support::test_context;
     use crate::engine::value::JsString;
 
     use super::*;
@@ -376,8 +377,7 @@ mod tests {
 
     #[test]
     fn computed_field_defines_cwe_own_data_without_calling_inherited_setter() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let define = computed_field_callable(&runtime, &context);
         let throwing_setter = bytecode_callable(
             &runtime,
@@ -468,8 +468,7 @@ mod tests {
 
     #[test]
     fn computed_field_rejection_becomes_a_javascript_throw() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let define = computed_field_callable(&runtime, &context);
         let object = runtime.new_object(None).unwrap();
         runtime.prevent_extensions(&object).unwrap();
@@ -503,8 +502,7 @@ mod tests {
 
     #[test]
     fn computed_field_never_repeats_observable_property_key_conversion() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let define = computed_field_callable(&runtime, &context);
         let throwing_conversion = bytecode_callable(
             &runtime,

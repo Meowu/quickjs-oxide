@@ -1,16 +1,12 @@
 use super::quickjs_argv_completion_oracle::observe_completion_argv_trim_end as observe_oracle;
+use crate::grouped_case_oracle::assert_grouped_cases_agree;
+use crate::oracle_cases::GroupedCase as Case;
+use crate::runtime_observation::host_runtime_context;
 use crate::runtime_observation::{
     checked_value_type as value_type, primitive_value_text as primitive_text,
 };
 use crate::runtime_oracle::error_string_property;
 use quickjs_oxide::engine::api::{Context, Runtime, RuntimeError, Value};
-
-struct Case {
-    group: &'static str,
-    description: &'static str,
-    source: &'static str,
-    expected: &'static str,
-}
 
 // Pins QuickJS 2026-06-04's `OP_append`, `OP_apply`, and `OP_apply_eval`
 // pipeline. In particular, argument spread is not just generic IteratorStep:
@@ -384,76 +380,42 @@ fn argument_spread_oracle_inventory_is_stable() {
 
 #[test]
 fn argument_spread_matches_pinned_expectations() {
-    let mut failures = Vec::new();
-    for case in CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        let actual = observe_rust(&runtime, &mut context, case.source, case.description);
-        if actual != case.expected {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\noxide: {:?}\nexpected: {:?}",
-                case.group, case.description, case.source, actual, case.expected,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "argument-spread pinned expectations failed in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    assert_grouped_cases_agree(
+        CASES,
+        "argument-spread pinned expectations failed",
+        ["oxide", "expected"],
+        |case| {
+            let (runtime, mut context) = host_runtime_context();
+            observe_rust(&runtime, &mut context, case.source, case.description)
+        },
+        |case| case.expected.to_owned(),
     );
 }
 
 #[test]
 fn argument_spread_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP argument-spread oracle self-check: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
-    let mut failures = Vec::new();
-    for case in CASES.iter().chain(BOUNDARY_CASES) {
-        let actual = observe_oracle(&oracle, case.source, case.description);
-        if actual != case.expected {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\nactual: {:?}\nexpected: {:?}",
-                case.group, case.description, case.source, actual, case.expected,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "pinned QuickJS argument-spread vectors drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    let oracle = require_pinned_qjs_oracle!("argument-spread oracle self-check");
+    assert_grouped_cases_agree(
+        CASES.iter().chain(BOUNDARY_CASES),
+        "pinned QuickJS argument-spread vectors drifted",
+        ["actual", "expected"],
+        |case| observe_oracle(&oracle, case.source, case.description),
+        |case| case.expected.to_owned(),
     );
 }
 
 #[test]
 fn argument_spread_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP argument-spread differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
-    let mut failures = Vec::new();
-    for case in CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        let oxide = observe_rust(&runtime, &mut context, case.source, case.description);
-        let quickjs = observe_oracle(&oracle, case.source, case.description);
-        if oxide != quickjs {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\noxide: {:?}\nquickjs: {:?}",
-                case.group, case.description, case.source, oxide, quickjs,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "argument-spread semantics drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    let oracle = require_pinned_qjs_oracle!("argument-spread differential");
+    assert_grouped_cases_agree(
+        CASES,
+        "argument-spread semantics drifted",
+        ["oxide", "quickjs"],
+        |case| {
+            let (runtime, mut context) = host_runtime_context();
+            observe_rust(&runtime, &mut context, case.source, case.description)
+        },
+        |case| observe_oracle(&oracle, case.source, case.description),
     );
 }
 
@@ -463,9 +425,7 @@ fn argument_spread_runtime_argument_limit_matches_pinned_quickjs() {
     let oracle = std::env::var_os("QJS_ORACLE");
     let mut failures = Vec::new();
     for case in BOUNDARY_CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         let oxide = observe_rust(&runtime, &mut context, case.source, case.description);
         if oxide != case.expected {
             failures.push(format!(

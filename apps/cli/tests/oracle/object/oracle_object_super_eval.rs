@@ -1,12 +1,6 @@
-use crate::runtime_observation::{checked_value_type as value_type, primitive_value_text};
-use quickjs_oxide::engine::api::{Runtime, RuntimeError, Value};
-
-struct Case {
-    group: &'static str,
-    description: &'static str,
-    source: &'static str,
-    expected: &'static str,
-}
+use crate::grouped_case_oracle::{assert_cases_match_expectations, assert_cases_match_quickjs};
+use crate::oracle_cases::GroupedCase as Case;
+use crate::runtime_completion_oracle::rust_case_name_observation as rust_observation;
 
 // Pins direct-eval inheritance of ObjectLiteral HomeObject state against
 // QuickJS 2026-06-04. Classes, parameter initializers, async methods, and
@@ -422,118 +416,23 @@ const CASES: &[Case] = &[
 
 #[test]
 fn object_super_eval_semantics_match_pinned_expectations() {
-    for case in CASES {
-        assert_eq!(
-            rust_observation(case),
-            case.expected,
-            "Rust object-super-eval behavior drifted for {} / {}: {:?}",
-            case.group,
-            case.description,
-            case.source,
-        );
-    }
+    assert_cases_match_expectations("object-super-eval", CASES, rust_observation);
 }
 
 #[test]
 fn object_super_eval_semantics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP object-super-eval oracle: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
-
-    let quickjs = CASES
-        .iter()
-        .map(|case| {
+    assert_cases_match_quickjs(
+        "object-super-eval",
+        "object-super-eval oracle",
+        CASES,
+        |oracle, case| {
             super::quickjs_object_super_oracle::observe_completion_name_only(
-                &oracle,
+                oracle,
                 case.source,
                 case.group,
                 case.description,
             )
-        })
-        .collect::<Vec<_>>();
-    for (case, observation) in CASES.iter().zip(&quickjs) {
-        assert_eq!(
-            observation, case.expected,
-            "pinned QuickJS object-super-eval vector drifted for {} / {}: {:?}",
-            case.group, case.description, case.source,
-        );
-    }
-    for (case, observation) in CASES.iter().zip(&quickjs) {
-        assert_eq!(
-            rust_observation(case),
-            *observation,
-            "object-super-eval behavior differed from pinned QuickJS for {} / {}: {:?}",
-            case.group,
-            case.description,
-            case.source,
-        );
-    }
-}
-
-fn rust_observation(case: &Case) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
-    match context.eval(case.source) {
-        Ok(value) => format!(
-            "return|{}|{}",
-            value_type(&runtime, &value),
-            primitive_value_text(value),
-        ),
-        Err(RuntimeError::Exception) => {
-            let exception = context
-                .take_exception()
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "take Rust exception for {} / {}: {error}",
-                        case.group, case.description,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Rust exception was missing for {} / {}",
-                        case.group, case.description,
-                    )
-                });
-            match exception {
-                Value::Object(error) => format!(
-                    "throw|object|{}",
-                    error_name(&runtime, &mut context, &error, case),
-                ),
-                value => format!(
-                    "throw|{}|{}",
-                    value_type(&runtime, &value),
-                    primitive_value_text(value),
-                ),
-            }
-        }
-        Err(error) => panic!(
-            "Rust engine failure for {} / {} ({:?}): {error}",
-            case.group, case.description, case.source,
-        ),
-    }
-}
-
-fn error_name(
-    runtime: &Runtime,
-    context: &mut quickjs_oxide::engine::api::Context,
-    error: &quickjs_oxide::engine::api::ObjectRef,
-    case: &Case,
-) -> String {
-    let key = runtime
-        .intern_property_key("name")
-        .expect("Error name property key");
-    let Value::String(value) = context.get_property(error, &key).unwrap_or_else(|failure| {
-        panic!(
-            "read Error.name for {} / {}: {failure}",
-            case.group, case.description,
-        )
-    }) else {
-        panic!(
-            "Error.name was not a string for {} / {}",
-            case.group, case.description,
-        );
-    };
-    value.to_utf8_lossy()
+        },
+        rust_observation,
+    );
 }

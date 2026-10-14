@@ -1,6 +1,7 @@
-use quickjs_oxide::engine::api::{
-    Context, DescriptorField, OrdinaryPropertyDescriptor, Runtime, RuntimeError, Value,
-};
+use crate::object_graph_observation::data_property;
+use crate::runtime_observation::host_runtime_context;
+use crate::runtime_observation::string_text as text;
+use quickjs_oxide::engine::api::{Context, Runtime, RuntimeError, Value};
 
 const FIXTURE: &str = include_str!("host_gc_execution_turn.js");
 const QUICKJS_2026_06_04: &str =
@@ -23,23 +24,6 @@ fn eval(context: &mut Context, source: &str) -> Value {
         }
         panic!("unexpected engine error: {error}");
     })
-}
-
-fn text(value: Value) -> String {
-    let Value::String(value) = value else {
-        panic!("expected a string value");
-    };
-    value.to_utf8_lossy()
-}
-
-fn data_property(value: Value) -> OrdinaryPropertyDescriptor {
-    OrdinaryPropertyDescriptor {
-        value: DescriptorField::Present(value),
-        writable: DescriptorField::Present(true),
-        enumerable: DescriptorField::Present(true),
-        configurable: DescriptorField::Present(true),
-        ..OrdinaryPropertyDescriptor::new()
-    }
 }
 
 fn install_test262_gc(context: &mut Context) {
@@ -81,9 +65,11 @@ fn drain_jobs(runtime: &Runtime, context: &mut Context) {
         jobs += 1;
         assert!(jobs <= 64, "host GC fixture did not settle within 64 jobs");
         if let Err(error) = runtime.execute_pending_job() {
-            if error.error() == &RuntimeError::Exception {
-                panic!("host GC fixture job threw: {:?}", context.take_exception());
-            }
+            assert!(
+                error.error() != &RuntimeError::Exception,
+                "host GC fixture job threw: {:?}",
+                context.take_exception()
+            );
             panic!("host GC fixture job failed: {error}");
         }
     }
@@ -95,9 +81,7 @@ fn drain_jobs(runtime: &Runtime, context: &mut Context) {
 
 #[test]
 fn test262_gc_reentry_preserves_execution_turn_roots_and_job_order() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     install_test262_gc(&mut context);
 
     drop(eval(&mut context, FIXTURE));
@@ -170,9 +154,7 @@ fn test262_gc_reentry_preserves_execution_turn_roots_and_job_order() {
 
 #[test]
 fn test262_gc_nested_embedding_entries_share_the_explicit_execution_turn() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     install_test262_gc(&mut context);
     runtime.with_execution_turn(|| {
         drop(eval(&mut context, "var scopeRef = new WeakRef({}); var scopeJobs = 0; Promise.resolve().then(() => scopeJobs++);"));

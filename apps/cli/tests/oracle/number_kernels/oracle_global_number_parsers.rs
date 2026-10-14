@@ -1,4 +1,5 @@
-use quickjs_oxide::engine::api::{EvalOptions, Runtime, Value};
+use crate::runtime_observation::host_runtime_context;
+use quickjs_oxide::engine::api::{EvalOptions, Value};
 use std::ffi::OsStr;
 use std::process::Command;
 
@@ -31,15 +32,10 @@ const EXPRESSIONS: &[&str] = &[
 
 #[test]
 fn global_number_parsers_match_pinned_quickjs_through_source_execution() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP global numeric parser differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("global numeric parser differential");
 
     let expression = format!("'' + {}", EXPRESSIONS.join(" + '|' + "));
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     let Value::String(rust) = context.eval(&expression).unwrap() else {
         panic!("Rust numeric parser probe did not return a string");
     };
@@ -70,14 +66,9 @@ fn oracle_observation(oracle: &OsStr, expression: &str) -> String {
 
 #[test]
 fn parser_function_names_are_stable_in_native_error_stacks() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP numeric parser stack differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("numeric parser stack differential");
     let source = "parseInt('10', 1n)";
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert!(
         context
             .eval_with_options(source, &EvalOptions::new("<cmdline>"))

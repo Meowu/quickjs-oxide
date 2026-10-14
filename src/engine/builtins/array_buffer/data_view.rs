@@ -11,16 +11,12 @@
 use crate::engine::builtins::native::{DataViewElementKind, DataViewNativeKind};
 use crate::engine::heap::{ArrayBufferViewData, DataViewRealmData, ObjectData, ObjectPayload};
 
-#[cfg(test)]
-use crate::engine::api::context::Context;
 use crate::engine::{
     api::{error::NativeErrorKind, runtime::Runtime, runtime_error::RuntimeError},
     builtins::native::NativeFunctionId,
     heap::{ContextId, ObjectId},
-    object::{
-        DescriptorField, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, WellKnownSymbol,
-    },
-    value::{JsString, JsValue, Value, conversion::NativeConversion},
+    object::ObjectRef,
+    value::{JsValue, Value, conversion::NativeConversion},
     vm::{
         Completion, ToPrimitiveHint,
         call::{
@@ -112,25 +108,7 @@ impl Runtime {
             )?;
         }
 
-        let to_string_tag = PropertyKey::from(
-            self.well_known_symbol(WellKnownSymbol::ToStringTag)
-                .expect("well-known symbol"),
-        );
-        if !self.define_own_property(
-            &prototype,
-            &to_string_tag,
-            &OrdinaryPropertyDescriptor {
-                value: DescriptorField::Present(Value::String(JsString::from_static("DataView"))),
-                writable: DescriptorField::Present(false),
-                enumerable: DescriptorField::Present(false),
-                configurable: DescriptorField::Present(true),
-                ..OrdinaryPropertyDescriptor::new()
-            },
-        )? {
-            return Err(RuntimeError::Invariant(
-                "DataView toStringTag definition was rejected",
-            ));
-        }
+        self.define_to_string_tag(&prototype, "DataView")?;
 
         let constructor = self.new_native_builtin(
             function_prototype,
@@ -352,7 +330,7 @@ impl Runtime {
                 let signed = narrowed.as_i64().ok_or(RuntimeError::Invariant(
                     "64-bit DataView BigInt did not normalize to an i64",
                 ))?;
-                Ok(NativeConversion::Value(signed as u64))
+                Ok(NativeConversion::Value(signed.cast_unsigned()))
             }
             DataViewElementKind::Float16 => {
                 match self.number_from_primitive_jsvalue(realm, value)? {
@@ -710,14 +688,14 @@ fn data_view_decode(element: DataViewElementKind, bytes: [u8; 8], little_endian:
         }
     };
     match element {
-        DataViewElementKind::Int8 => Value::Int(i32::from(bytes[0] as i8)),
+        DataViewElementKind::Int8 => Value::Int(i32::from(bytes[0].cast_signed())),
         DataViewElementKind::Uint8 => Value::Int(i32::from(bytes[0])),
-        DataViewElementKind::Int16 => Value::Int(i32::from(u16_value() as i16)),
+        DataViewElementKind::Int16 => Value::Int(i32::from(u16_value().cast_signed())),
         DataViewElementKind::Uint16 => Value::Int(i32::from(u16_value())),
-        DataViewElementKind::Int32 => Value::Int(u32_value() as i32),
+        DataViewElementKind::Int32 => Value::Int(u32_value().cast_signed()),
         DataViewElementKind::Uint32 => Runtime::array_length_value(u32_value()),
         DataViewElementKind::BigInt64 => Value::BigInt(
-            crate::engine::value::bigint::JsBigInt::from(u64_value() as i64),
+            crate::engine::value::bigint::JsBigInt::from(u64_value().cast_signed()),
         ),
         DataViewElementKind::BigUint64 => {
             Value::BigInt(crate::engine::value::bigint::JsBigInt::from(u64_value()))

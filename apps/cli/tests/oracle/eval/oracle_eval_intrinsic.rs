@@ -1,3 +1,5 @@
+use crate::runtime_observation::string_value;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use quickjs_oxide::engine::api::{
     CallableRef, Context, DebugInfoMode, JsString, Runtime, RuntimeError, Value,
 };
@@ -1202,10 +1204,7 @@ fn eval_shell_matches_pinned_quickjs() {
     let rust = rust_observations();
     assert_eq!(rust, EXPECTED_OBSERVATIONS, "host-side eval shell drifted");
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP eval intrinsic differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("eval intrinsic differential");
     assert_eq!(
         rust,
         oracle_observations(&oracle),
@@ -1220,10 +1219,7 @@ fn eval_global_proxy_internal_methods_match_pinned_quickjs() {
         rust, EXPECTED_GLOBAL_PROXY_BINDINGS,
         "eval global Proxy binding contract drifted",
     );
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP eval global Proxy differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("eval global Proxy differential");
     assert_eq!(
         rust,
         oracle_value(&oracle, GLOBAL_PROXY_BINDING_PROBE),
@@ -1233,10 +1229,7 @@ fn eval_global_proxy_internal_methods_match_pinned_quickjs() {
 
 #[test]
 fn pinned_quickjs_direct_eval_syntax_contract_is_frozen() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP direct eval syntax differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("direct eval syntax differential");
     assert_eq!(
         oracle_value(&oracle, DIRECTNESS_ORACLE_PROBE),
         EXPECTED_DIRECTNESS,
@@ -1255,10 +1248,7 @@ fn primitive_string_directness_matches_the_supported_quickjs_slice() {
 
 #[test]
 fn pinned_quickjs_eval_environment_contract_is_frozen() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP eval environment differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("eval environment differential");
     assert_eq!(
         oracle_value(&oracle, ENVIRONMENT_ORACLE_PROBE)
             .lines()
@@ -1277,10 +1267,7 @@ fn eval_var_objects_and_source_order_match_pinned_quickjs() {
         "Rust sloppy eval declaration environment drifted",
     );
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP eval declaration differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("eval declaration differential");
     assert_eq!(
         rust,
         oracle_value(&oracle, R1Y_FUNCTION_DECLARATION_PROBE),
@@ -1297,10 +1284,7 @@ fn strict_and_indirect_eval_declarations_match_pinned_quickjs() {
         "Rust strict/indirect eval declaration environment drifted",
     );
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP eval-kind declaration differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("eval-kind declaration differential");
     assert_eq!(
         rust,
         oracle_value(&oracle, R1Y_EVAL_KIND_DECLARATION_PROBE),
@@ -1317,10 +1301,7 @@ fn eval_declarations_respect_catch_lexicals_and_implicit_bindings() {
         "Rust caller-binding precedence for eval declarations drifted",
     );
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP eval caller-binding differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("eval caller-binding differential");
     assert_eq!(
         rust,
         oracle_value(&oracle, R1Y_CALLER_BINDING_PROBE),
@@ -1337,12 +1318,7 @@ fn eval_declarations_do_not_replace_private_function_expression_names() {
         "Rust private function-name/eval declaration precedence drifted",
     );
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP private function-name/eval differential: set QJS_ORACLE to pinned upstream qjs"
-        );
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("private function-name/eval differential");
     assert_eq!(
         rust,
         oracle_value(&oracle, R2A_PRIVATE_NAME_DECLARATION_PROBE),
@@ -1359,12 +1335,7 @@ fn eval_declaration_conflicts_and_global_flags_match_pinned_quickjs() {
         "Rust eval declaration preflight or global flags drifted",
     );
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP eval declaration-conflict differential: set QJS_ORACLE to pinned upstream qjs"
-        );
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("eval declaration-conflict differential");
     assert_eq!(
         rust,
         oracle_value(&oracle, R1Y_DECLARATION_CONFLICT_PROBE),
@@ -1381,12 +1352,7 @@ fn eval_labelled_functions_keep_lexical_and_annex_b_closures_distinct() {
         "Rust eval labelled-function environments drifted",
     );
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP eval labelled-function differential: set QJS_ORACLE to pinned upstream qjs"
-        );
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("eval labelled-function differential");
     assert_eq!(
         rust,
         oracle_value(&oracle, R1Y_LABELLED_FUNCTION_PROBE),
@@ -1396,8 +1362,7 @@ fn eval_labelled_functions_keep_lexical_and_annex_b_closures_distinct() {
 
 #[test]
 fn foreign_realm_eval_callable_preserves_non_string_identity() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let eval = global_eval(&runtime, &mut defining);
@@ -1494,15 +1459,11 @@ fn syntactic_eval_replacements_take_the_complete_ordinary_call_path() {
             string_value("AB|x|7"),
         ),
     ] {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (_runtime, mut context) = host_runtime_context();
         assert_eq!(context.eval(source).unwrap(), expected, "source: {source}");
     }
 
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     assert_eq!(
         context
             .eval(
@@ -1520,9 +1481,7 @@ fn syntactic_eval_replacements_take_the_complete_ordinary_call_path() {
 
 #[test]
 fn primitive_string_eval_executes_indirect_and_direct_completion_values() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let eval = global_eval(&runtime, &mut context);
 
     assert_eq!(
@@ -1625,9 +1584,7 @@ fn eval_lexicals_are_ephemeral_but_returned_closures_retain_them() {
             "#,
         ),
     ] {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (_runtime, mut context) = host_runtime_context();
         assert_eq!(
             context.eval(source).unwrap(),
             string_value("42|undefined|undefined"),
@@ -1643,8 +1600,7 @@ fn returned_eval_closure_retains_caller_lexical_in_every_debug_mode() {
         DebugInfoMode::StripSource,
         DebugInfoMode::StripDebug,
     ] {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+        let runtime = host_runtime();
         runtime
             .set_debug_info_mode(debug_info)
             .expect("set runtime configuration");
@@ -1668,9 +1624,7 @@ fn returned_eval_closure_retains_caller_lexical_in_every_debug_mode() {
 
 #[test]
 fn eval_syntax_errors_are_catchable_and_direct_eval_inherits_strictness() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
 
     assert_eq!(
         context
@@ -1734,10 +1688,7 @@ fn nested_direct_eval_environment_relay_matches_pinned_quickjs() {
         "Rust nested direct-eval environment relay drifted",
     );
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP nested direct-eval differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("nested direct-eval differential");
     assert_eq!(
         rust,
         oracle_value(&oracle, R1Z_NESTED_DIRECT_EVAL_PROBE),
@@ -1747,8 +1698,7 @@ fn nested_direct_eval_environment_relay_matches_pinned_quickjs() {
 
 #[test]
 fn foreign_realm_primitive_string_eval_uses_its_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     drop(defining.eval("globalThis.evalRealmMarker = 42").unwrap());
@@ -1818,9 +1768,7 @@ fn rust_observations() -> Vec<String> {
 }
 
 fn rust_value(source: &str) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     let Value::String(value) = context.eval(source).unwrap() else {
         panic!("eval oracle probe did not return a String");
     };
@@ -1861,10 +1809,6 @@ fn global_eval(runtime: &Runtime, context: &mut Context) -> CallableRef {
         .as_callable(&function)
         .unwrap()
         .expect("global eval was not callable")
-}
-
-fn string_value(value: &str) -> Value {
-    Value::String(JsString::try_from_utf8(value).unwrap())
 }
 
 fn eval_object(context: &mut Context, source: &str) -> quickjs_oxide::engine::api::ObjectRef {

@@ -1,41 +1,10 @@
 use super::*;
-
-fn eval_string(context: &mut Context, source: &str) -> String {
-    let Value::String(value) = context.eval(source).unwrap() else {
-        panic!("TypedArray transform test did not return a String");
-    };
-    value.to_utf8_lossy()
-}
-
-fn assert_script(context: &mut Context, source: &str) {
-    assert_eq!(eval_string(context, source), "ok");
-}
-
-fn eval_object(context: &mut Context, source: &str, description: &str) -> ObjectRef {
-    let Value::Object(object) = context
-        .eval(source)
-        .unwrap_or_else(|error| panic!("TypedArray transform rejected {description}: {error}"))
-    else {
-        panic!("TypedArray transform {description} was not an Object");
-    };
-    object
-}
-
-fn take_exception_object(context: &mut Context, description: &str) -> ObjectRef {
-    let Value::Object(error) = context
-        .take_exception()
-        .unwrap_or_else(|failure| panic!("take {description}: {failure}"))
-        .unwrap_or_else(|| panic!("{description} was missing"))
-    else {
-        panic!("{description} was not an Object");
-    };
-    error
-}
+use crate::engine::test_support::test_context;
+use crate::engine::test_support::{assert_script, eval_object, take_exception_object};
 
 #[test]
 fn map_and_filter_match_quickjs_species_and_callback_contracts() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
 
     assert_script(
         &mut context,
@@ -303,8 +272,7 @@ fn map_and_filter_match_quickjs_species_and_callback_contracts() {
 
 #[test]
 fn map_and_filter_keep_snapshot_ranges_and_live_source_and_target_effects() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
 
     assert_script(
         &mut context,

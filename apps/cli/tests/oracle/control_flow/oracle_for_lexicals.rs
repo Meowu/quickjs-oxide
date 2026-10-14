@@ -1,7 +1,8 @@
 //! Differential coverage for classic `for` lexical environments.
 
-use crate::runtime_oracle::run_cli;
-use quickjs_oxide::engine::api::{Runtime, Value};
+use crate::runtime_completion_oracle::{compare_cli, rust_value_observation};
+use crate::runtime_observation::host_runtime_context;
+use crate::runtime_observation::normalize_rust_value_text as normalize_rust_value;
 use std::ffi::OsStr;
 use std::process::Command;
 
@@ -209,10 +210,7 @@ const SYNTAX_ERROR_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn classic_for_lexical_values_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP lexical-for differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("lexical-for differential");
 
     for &(description, source) in VALUE_CASES {
         assert_eq!(
@@ -233,16 +231,11 @@ fn classic_for_lexical_values_match_pinned_quickjs() {
 
 #[test]
 fn script_for_capture_survives_a_following_eval_like_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP lexical-for cross-eval differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("lexical-for cross-eval differential");
     let setup = "Function.saved=undefined;for(let value=0;value<1;value++){Function.saved=function(){return value};}";
     let observation = "Function.saved()+'|'+typeof value";
 
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     drop(
         context
             .eval(setup)
@@ -259,10 +252,7 @@ fn script_for_capture_survives_a_following_eval_like_pinned_quickjs() {
 
 #[test]
 fn classic_for_lexical_error_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP lexical-for Error differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("lexical-for Error differential");
 
     for &(description, source) in ERROR_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -271,10 +261,7 @@ fn classic_for_lexical_error_stacks_match_pinned_quickjs() {
 
 #[test]
 fn classic_for_lexical_strip_debug_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP lexical-for StripDebug differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("lexical-for StripDebug differential");
 
     for &(description, source) in ERROR_CASES {
         compare_cli(&oracle, &["-s"], source, description);
@@ -283,51 +270,10 @@ fn classic_for_lexical_strip_debug_stacks_match_pinned_quickjs() {
 
 #[test]
 fn classic_for_lexical_parser_diagnostics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP lexical-for parser differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("lexical-for parser differential");
 
     for &(description, source) in SYNTAX_ERROR_CASES {
         compare_cli(&oracle, &[], source, description);
-    }
-}
-
-fn compare_cli(oracle: &OsStr, options: &[&str], source: &str, description: &str) {
-    let rust = run_cli(
-        env!("CARGO_BIN_EXE_qjs").as_ref(),
-        options,
-        source,
-        description,
-    );
-    let quickjs = run_cli(oracle, options, source, description);
-    assert_eq!(rust.status.code(), quickjs.status.code(), "{description}");
-    assert_eq!(rust.stdout, quickjs.stdout, "{description}");
-    assert_eq!(rust.stderr, quickjs.stderr, "{description}");
-}
-
-fn rust_value_observation(source: &str, description: &str) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let value = runtime
-        .new_context()
-        .expect("create context")
-        .eval(source)
-        .unwrap_or_else(|error| panic!("Rust rejected {description} ({source:?}): {error}"));
-    normalize_rust_value(value)
-}
-
-fn normalize_rust_value(value: Value) -> String {
-    match value {
-        Value::Undefined => "undefined|undefined".to_owned(),
-        Value::Null => "object|null".to_owned(),
-        Value::Bool(value) => format!("boolean|{value}"),
-        Value::Int(value) => format!("number|{value}"),
-        Value::Float(value) => format!("number|{value}"),
-        Value::BigInt(value) => format!("bigint|{value}"),
-        Value::String(value) => format!("string|{}", value.to_utf8_lossy()),
-        Value::Object(_) => "object|<object>".to_owned(),
-        Value::Symbol(_) => "symbol|<symbol>".to_owned(),
     }
 }
 

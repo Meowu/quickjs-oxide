@@ -1,6 +1,7 @@
 use crate::quickjs_argv_completion_oracle;
-use crate::runtime_completion_oracle::observe_eval_completion_with_error_context as observe_rust_eval;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
+use crate::runtime_completion_oracle::compare_value_cases;
 use crate::runtime_observation::{
     primitive_value_text, property_callable_with_read_context as property_callable,
 };
@@ -243,10 +244,7 @@ print('meta='+metadata.join('|'));
 
 #[test]
 fn array_search_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array search oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array search oracle self-check");
     for &(group, cases) in &[
         ("values", VALUE_CASES),
         ("fromIndex", FROM_INDEX_CASES),
@@ -292,10 +290,7 @@ fn array_search_errors_match_pinned_quickjs() {
 
 #[test]
 fn array_search_prototype_order_and_metadata_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array search graph differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array search graph differential");
     let expected = oracle_graph_observations(&oracle);
     assert_eq!(
         rust_graph_observations(),
@@ -306,8 +301,7 @@ fn array_search_prototype_order_and_metadata_match_pinned_quickjs() {
 
 #[test]
 fn array_search_errors_use_the_native_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     drop(
@@ -344,28 +338,8 @@ fn array_search_errors_use_the_native_defining_realm() {
     }
 }
 
-fn compare_value_cases(group: &str, cases: &[(&str, &str)]) {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP {group} differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
-    for &(description, source) in cases {
-        let expected = observe_oracle(&oracle, source, description);
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        assert_eq!(
-            observe_rust_eval(&runtime, &mut context, source, description),
-            expected,
-            "{group} drifted for {description}: {source:?}",
-        );
-    }
-}
-
 fn rust_graph_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let array_prototype = context.array_prototype().unwrap();
     let function_prototype = context.function_prototype().unwrap();
     let selected = [
@@ -457,19 +431,11 @@ fn method_metadata(
         "{name}:{}:{}:D:{}{}{}:{}:{}:{}",
         primitive_value_text(function_name),
         primitive_value_text(function_length),
-        Number(writable),
-        Number(enumerable),
-        Number(configurable),
+        u8::from(writable),
+        u8::from(enumerable),
+        u8::from(configurable),
         true,
         runtime.get_prototype_of(&function).unwrap().as_ref() == Some(function_prototype),
         runtime.is_constructor(callable.as_object()).unwrap(),
     )
-}
-
-struct Number(bool);
-
-impl std::fmt::Display for Number {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(if self.0 { "1" } else { "0" })
-    }
 }

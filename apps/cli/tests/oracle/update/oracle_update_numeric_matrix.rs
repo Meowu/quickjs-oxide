@@ -1,4 +1,5 @@
-use quickjs_oxide::engine::api::{Runtime, Value, number_to_string};
+use crate::runtime_observation::host_runtime_context;
+use quickjs_oxide::engine::api::{Value, number_to_string};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::process::Command;
@@ -18,10 +19,7 @@ struct UpdateCase {
 
 #[test]
 fn update_numeric_matrix_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP update numeric oracle differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("update numeric oracle differential");
 
     let cases = update_cases();
     assert_eq!(
@@ -31,9 +29,7 @@ fn update_numeric_matrix_matches_pinned_quickjs() {
     );
     let oracle_observations = run_oracle_batch(&oracle, &cases);
 
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     for (index, (case, oracle_observation)) in cases.iter().zip(&oracle_observations).enumerate() {
         let rust_value = context.eval(&case.source).unwrap_or_else(|error| {
             panic!(

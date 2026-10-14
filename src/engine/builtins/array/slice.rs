@@ -381,21 +381,25 @@ impl SliceResume {
             Phase::Start => {
                 let mut index = Runtime::int64_from_number(number);
                 if index < 0 {
-                    index += self.0.length as i64;
+                    index += self.0.length.cast_signed();
                 }
-                self.0.start = index.clamp(0, self.0.length as i64) as u64;
+                self.0.start = index.clamp(0, self.0.length.cast_signed()).cast_unsigned();
                 self.end(runtime)
             }
             Phase::End => {
                 let mut value = Runtime::int64_from_number(number);
                 if matches!(self.0.kind, SliceKind::Slice) {
                     if value < 0 {
-                        value += self.0.length as i64;
+                        value += self.0.length.cast_signed();
                     }
-                    self.0.count =
-                        (value.clamp(0, self.0.length as i64) as u64).saturating_sub(self.0.start);
+                    self.0.count = value
+                        .clamp(0, self.0.length.cast_signed())
+                        .cast_unsigned()
+                        .saturating_sub(self.0.start);
                 } else {
-                    self.0.count = value.clamp(0, (self.0.length - self.0.start) as i64) as u64;
+                    self.0.count = value
+                        .clamp(0, (self.0.length - self.0.start).cast_signed())
+                        .cast_unsigned();
                 }
                 self.allocate(runtime)
             }
@@ -1140,11 +1144,11 @@ impl Runtime {
 
 #[cfg(test)]
 mod dense_slice_tests {
-    use crate::engine::{api::runtime::Runtime, value::Value};
+    use crate::engine::test_support::test_context;
+    use crate::engine::value::Value;
     #[test]
     fn dense_slice_preserves_species_holes_descriptors_and_owned_cells() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         let result = context.eval(r#"(() => {
             let x = {}, sym = Symbol();
             let dense = [x, sym, 3].slice(0, 2);

@@ -1,14 +1,10 @@
+use crate::oracle_cases::NativeErrorObservation as Observation;
+use crate::runtime_observation::host_runtime_context;
 use quickjs_oxide::engine::api::{
-    DescriptorField, JsString, OrdinaryPropertyDescriptor, Runtime, RuntimeError, Value,
+    DescriptorField, JsString, OrdinaryPropertyDescriptor, RuntimeError, Value,
 };
 use std::ffi::OsStr;
 use std::process::Command;
-
-#[derive(Debug, Eq, PartialEq)]
-struct Observation {
-    name: Vec<u16>,
-    message: Vec<u16>,
-}
 
 #[test]
 fn atom_error_format_preserves_ascii_fast_path_and_non_ascii_scratch_boundary() {
@@ -42,10 +38,7 @@ fn atom_error_format_preserves_ascii_fast_path_and_non_ascii_scratch_boundary() 
 
 #[test]
 fn atom_error_format_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP native atom-error differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("native atom-error differential");
     let cases = atom_cases();
     assert_eq!(
         rust_observations(&cases),
@@ -73,9 +66,7 @@ fn atom_cases() -> Vec<Vec<u16>> {
 }
 
 fn rust_observations(cases: &[Vec<u16>]) -> Vec<Observation> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let function_key = runtime.intern_property_key("Function").unwrap();
     let Value::Object(function) = context.get_property(&global, &function_key).unwrap() else {

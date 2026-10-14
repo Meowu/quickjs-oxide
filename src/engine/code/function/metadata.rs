@@ -10,7 +10,7 @@ use crate::engine::atom::Atom;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ParameterBodyStorage {
     Argument(u16),
-    #[expect(
+    #[allow(
         dead_code,
         reason = "Recognized by validation; current producers do not emit this form."
     )]
@@ -301,6 +301,19 @@ pub enum ClosureVariableKind {
 }
 
 impl ClosureVariableKind {
+    /// Private methods and accessors: bindings whose value is the class's
+    /// shared callable rather than a per-instance field.
+    #[must_use]
+    pub const fn is_private_callable(self) -> bool {
+        matches!(
+            self,
+            Self::PrivateMethod
+                | Self::PrivateGetter
+                | Self::PrivateSetter
+                | Self::PrivateGetterSetter
+        )
+    }
+
     #[must_use]
     pub const fn is_eval_variable_object(self) -> bool {
         matches!(self, Self::EvalVariableObject | Self::ArgEvalVariableObject)

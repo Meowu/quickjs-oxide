@@ -1,12 +1,12 @@
-use crate::runtime_completion_oracle::{
-    compare_read_context_eval_completion_cases_with_prelude,
-    observe_quickjs_completion_with_prelude,
-};
+use crate::runtime_completion_oracle::compare_read_context_eval_completion_cases_with_prelude;
+use crate::runtime_completion_oracle::self_check_prelude_vectors;
+use crate::runtime_observation::string_value;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use crate::runtime_observation::{
     string_property_with_read_context as string_property, take_exception_object,
 };
 use crate::runtime_oracle::{eval_callable, eval_object};
-use quickjs_oxide::engine::api::{JsString, Runtime, RuntimeError, Value};
+use quickjs_oxide::engine::api::{RuntimeError, Value};
 
 // Differential lock for pinned QuickJS 2026-06-04
 // `js_regexp_Symbol_split` (`quickjs.c` 48875-48990), including
@@ -508,31 +508,24 @@ const RECURSION_CASES: &[(&str, &str)] = &[(
 
 #[test]
 fn regexp_split_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP String/RegExp split oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
-    for &(group, cases) in &[
-        ("metadata", METADATA_CASES),
-        ("String integration", STRING_INTEGRATION_CASES),
-        ("species order", SPECIES_ORDER_CASES),
-        ("flags and advance", FLAGS_AND_ADVANCE_CASES),
-        ("limit and empty", LIMIT_AND_EMPTY_CASES),
-        ("captures", CAPTURE_CASES),
-        ("lastIndex and exec", LAST_INDEX_AND_EXEC_CASES),
-        ("abrupt completion", ABRUPT_CASES),
-        ("errors", ERROR_CASES),
-        ("recursion", RECURSION_CASES),
-    ] {
-        for &(description, source) in cases {
-            let observation =
-                observe_quickjs_completion_with_prelude(PRELUDE, &oracle, source, description);
-            assert!(
-                observation.starts_with("return|"),
-                "{group} oracle vector unexpectedly threw for {description}: {observation:?}",
-            );
-        }
-    }
+    let oracle = require_qjs_oracle!("String/RegExp split oracle self-check");
+    self_check_prelude_vectors(
+        &oracle,
+        PRELUDE,
+        &[
+            ("metadata", METADATA_CASES),
+            ("String integration", STRING_INTEGRATION_CASES),
+            ("species order", SPECIES_ORDER_CASES),
+            ("flags and advance", FLAGS_AND_ADVANCE_CASES),
+            ("limit and empty", LIMIT_AND_EMPTY_CASES),
+            ("captures", CAPTURE_CASES),
+            ("lastIndex and exec", LAST_INDEX_AND_EXEC_CASES),
+            ("abrupt completion", ABRUPT_CASES),
+            ("errors", ERROR_CASES),
+            ("recursion", RECURSION_CASES),
+        ],
+        &[],
+    );
 }
 
 #[test]
@@ -607,8 +600,7 @@ fn regexp_split_recursion_is_catchable_and_recovers_like_pinned_quickjs() {
 
 #[test]
 fn regexp_split_intrinsics_use_defining_realms_and_foreign_species() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
 
@@ -763,9 +755,7 @@ fn mixed_string_and_regexp_split_recursion_guard_is_catchable_and_recovers() {
         .name("string-regexp-split-stack-proof".into())
         .stack_size(2 * 1024 * 1024)
         .spawn(|| {
-            let runtime =
-                Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-            let mut context = runtime.new_context().expect("create context");
+            let (_runtime, mut context) = host_runtime_context();
             drop(
                 context
                     .eval(
@@ -843,8 +833,4 @@ fn mixed_string_and_regexp_split_recursion_guard_is_catchable_and_recovers() {
         .expect("2 MiB String/RegExp split stack-proof thread did not start")
         .join()
         .expect("2 MiB String/RegExp split stack-proof thread panicked");
-}
-
-fn string_value(value: &str) -> Value {
-    Value::String(JsString::try_from_utf8(value).unwrap())
 }

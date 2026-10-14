@@ -1,12 +1,7 @@
-use quickjs_oxide::engine::api::{Runtime, RuntimeError, Value};
-use std::ffi::OsStr;
-use std::process::Command;
-
-struct Case {
-    description: &'static str,
-    source: &'static str,
-    expected: &'static str,
-}
+use crate::oracle_cases::ExpectedCase as Case;
+use crate::string_value_cases::{
+    assert_string_cases_match_frozen, assert_string_cases_match_quickjs, oracle_string_observation,
+};
 
 const PRELUDE: &str = r#"
 function __bit(value){return value?"1":"0"}
@@ -391,25 +386,15 @@ const CASES: &[Case] = &[
 
 #[test]
 fn data_view_vectors_match_frozen_observations() {
-    for case in CASES {
-        assert_eq!(
-            oxide_observation(case),
-            case.expected,
-            "{}",
-            case.description,
-        );
-    }
+    assert_string_cases_match_frozen(Some(PRELUDE), CASES);
 }
 
 #[test]
 fn data_view_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP DataView oracle self-check: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("DataView oracle self-check");
     let observations = CASES
         .iter()
-        .map(|case| oracle_observation(&oracle, case))
+        .map(|case| oracle_string_observation(&oracle, Some(PRELUDE), case))
         .collect::<Vec<_>>();
     let expected = CASES.iter().map(|case| case.expected).collect::<Vec<_>>();
     assert_eq!(observations, expected);
@@ -417,64 +402,6 @@ fn data_view_oracle_vectors_self_check() {
 
 #[test]
 fn data_view_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP DataView differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
-    for case in CASES {
-        assert_eq!(
-            oxide_observation(case),
-            oracle_observation(&oracle, case),
-            "{}",
-            case.description,
-        );
-    }
-}
-
-fn observed_source(source: &str) -> String {
-    format!("{PRELUDE}\n{source}")
-}
-
-fn oxide_observation(case: &Case) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
-    match context.eval(&observed_source(case.source)) {
-        Ok(Value::String(value)) => value.to_utf8_lossy(),
-        Ok(value) => panic!(
-            "Oxide returned a non-string for {}: {value:?}",
-            case.description,
-        ),
-        Err(RuntimeError::Exception) => {
-            let exception = context.take_exception().unwrap();
-            panic!("Oxide threw for {}: {exception:?}", case.description);
-        }
-        Err(error) => panic!("Oxide failed for {}: {error}", case.description),
-    }
-}
-
-fn oracle_observation(oracle: &OsStr, case: &Case) -> String {
-    let wrapper = r#"
-try {
-  var value = std.evalScript(scriptArgs[0]);
-  print(String(value));
-} catch (error) {
-  print("UNEXPECTED THROW: " + error.name + ": " + error.message);
-}
-"#;
-    let source = observed_source(case.source);
-    let output = Command::new(oracle)
-        .args(["--std", "-e", wrapper, &source])
-        .output()
-        .unwrap_or_else(|error| panic!("could not run QuickJS for {}: {error}", case.description));
-    assert!(
-        output.status.success(),
-        "QuickJS failed for {}: {}",
-        case.description,
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .trim_end()
-        .to_owned()
+    let oracle = require_pinned_qjs_oracle!("DataView differential");
+    assert_string_cases_match_quickjs(&oracle, Some(PRELUDE), CASES);
 }

@@ -278,7 +278,7 @@ impl Frame {
     /// The next instruction boundary in the sole published word stream.
     pub(super) fn next_pc(&self) -> Result<usize, Error> {
         #[cfg(test)]
-        NEXT_PC_CALLS.set(NEXT_PC_CALLS.get() + 1);
+        NEXT_PC_CALLS.update(|value| value + 1);
         self.executable
             .exec
             .decode(self.fault_pc as u32)
@@ -386,7 +386,7 @@ impl FrameStore {
                             .cold
                             .entry_guard
                             .as_ref()
-                            .map(|guard| guard.registry_depth()),
+                            .map(|value| value.registry_depth()),
                         super::BytecodePc::new(frame.fault_pc),
                     )
                     .map_err(runtime_error_to_vm_error)?;

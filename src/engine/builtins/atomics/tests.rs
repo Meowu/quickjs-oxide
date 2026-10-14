@@ -2,22 +2,13 @@ use crate::engine::api::Context;
 use crate::engine::atom::AtomIdx;
 use crate::engine::builtins::native::NativeCProto;
 use crate::engine::object::{DescriptorField, OrdinaryPropertyDescriptor};
+use crate::engine::test_support::assert_script;
+use crate::engine::test_support::test_context;
 
 use super::*;
 use crate::engine::heap::shared_memory::SharedBufferHandle;
 use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant};
-
-fn eval_string(context: &mut Context, source: &str) -> String {
-    let Value::String(value) = context.eval(source).unwrap() else {
-        panic!("Atomics test did not return a String");
-    };
-    value.to_utf8_lossy()
-}
-
-fn assert_script(context: &mut Context, source: &str) {
-    assert_eq!(eval_string(context, source), "ok");
-}
 
 fn publish_shared_buffer(
     runtime: &Runtime,
@@ -214,8 +205,7 @@ fn global_atomics_is_lazy_realm_local_and_has_the_pinned_surface() {
 
 #[test]
 fn integer_typed_array_operations_return_old_values_and_wrap_in_place() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
     assert_script(
         &mut context,
         r#"(function(){
@@ -272,8 +262,7 @@ fn integer_typed_array_operations_return_old_values_and_wrap_in_place() {
 
 #[test]
 fn shared_integer_typed_array_operations_linearize_each_machine_word() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
     assert_script(
         &mut context,
         r#"(function(){
@@ -315,8 +304,7 @@ fn shared_integer_typed_array_operations_linearize_each_machine_word() {
 
 #[test]
 fn shared_access_coercions_observe_old_length_and_revalidate_before_locking() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
     assert_script(
         &mut context,
         r#"(function(){
@@ -372,8 +360,7 @@ fn shared_add_is_atomic_across_two_runtime_threads() {
         let (start_sender, start_receiver) = mpsc::channel();
         start_senders.push(start_sender);
         workers.push(std::thread::spawn(move || {
-            let runtime = Runtime::new();
-            let mut context = runtime.new_context().expect("create context");
+            let (runtime, mut context) = test_context();
             publish_shared_buffer(&runtime, &mut context, "__shared", worker_handle);
 
             worker_ready.send(()).unwrap();
@@ -427,8 +414,7 @@ fn distinct_shared_backings_follow_one_sequentially_consistent_order() {
         let worker_ready = ready_sender.clone();
         let worker_result = result_sender.clone();
         workers.push(std::thread::spawn(move || {
-            let runtime = Runtime::new();
-            let mut context = runtime.new_context().expect("create context");
+            let (runtime, mut context) = test_context();
             publish_shared_buffer(&runtime, &mut context, "__own", own);
             publish_shared_buffer(&runtime, &mut context, "__other", other);
             drop(
@@ -499,8 +485,7 @@ fn distinct_shared_backings_follow_one_sequentially_consistent_order() {
 
 #[test]
 fn store_returns_the_full_converted_value_while_writing_narrow_bits() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
     assert_script(
         &mut context,
         r#"(function(){
@@ -540,8 +525,7 @@ fn store_returns_the_full_converted_value_while_writing_narrow_bits() {
 
 #[test]
 fn access_and_operand_coercions_revalidate_at_the_quickjs_boundaries() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
     assert_script(
         &mut context,
         r#"(function(){
@@ -620,8 +604,7 @@ fn access_and_operand_coercions_revalidate_at_the_quickjs_boundaries() {
 
 #[test]
 fn wait_notify_pause_and_lock_free_keep_the_non_shared_quickjs_contract() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
     assert_script(
         &mut context,
         r#"(function(){
@@ -774,8 +757,7 @@ fn bigint_wait_is_notified_by_int32_view_in_another_runtime() {
         "Atomics.wait(new BigInt64Array(__shared),0,0n,1500)",
     );
 
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = test_context();
     publish_shared_buffer(&runtime, &mut context, "__shared", handle);
     drop(
         context

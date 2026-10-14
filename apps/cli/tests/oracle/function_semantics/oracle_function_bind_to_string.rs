@@ -1,10 +1,13 @@
+use crate::object_graph_observation::{bit, function, get_property};
+use crate::runtime_observation::hex;
+use crate::runtime_observation::text as plain_string;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use quickjs_oxide::engine::api::{
     AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DescriptorField,
     JsString, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError, Value,
     WellKnownSymbol,
 };
 use std::ffi::OsStr;
-use std::process::Command;
 
 const ORACLE_PROBE: &str = r#"
 function bit(value) { return value ? 1 : 0; }
@@ -276,12 +279,7 @@ print("cross-realm-prototype=" +
 
 #[test]
 fn function_bind_and_to_string_match_quickjs_oracle() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP Function.prototype bind/toString differential: set QJS_ORACLE to upstream qjs"
-        );
-        return;
-    };
+    let oracle = require_qjs_oracle!("Function.prototype bind/toString differential");
 
     assert_eq!(rust_observations(), oracle_observations(&oracle));
 }
@@ -305,9 +303,7 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         let function_prototype = context.function_prototype().unwrap();
         let bind = property_callable(&runtime, &mut context, &function_prototype, "bind");
         let to_string = property_callable(&runtime, &mut context, &function_prototype, "toString");
@@ -1084,8 +1080,7 @@ fn rust_bound_execution_observations() -> Vec<String> {
         )
         .unwrap();
 
-    let cross_runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let cross_runtime = host_runtime();
     let mut target_realm = cross_runtime.new_context().expect("create context");
     let mut bind_realm = cross_runtime.new_context().expect("create context");
     let cross_target = function(
@@ -1170,21 +1165,6 @@ fn property_callable_key(
         .as_callable(&value)
         .unwrap()
         .expect("callable property was not callable")
-}
-
-fn function(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("function probe did not return an object: {source}");
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("function probe was not callable: {source}"))
-}
-
-fn get_property(runtime: &Runtime, context: &mut Context, object: &ObjectRef, name: &str) -> Value {
-    let key = runtime.intern_property_key(name).unwrap();
-    context.get_property(object, &key).unwrap()
 }
 
 fn global_value(runtime: &Runtime, context: &mut Context, name: &str) -> Value {
@@ -1418,13 +1398,6 @@ fn show_value(value: Value) -> String {
     }
 }
 
-fn plain_string(value: Value) -> String {
-    let Value::String(value) = value else {
-        panic!("expected a string, got {value:?}");
-    };
-    value.to_utf8_lossy()
-}
-
 fn plain_bool(value: Value) -> bool {
     let Value::Bool(value) = value else {
         panic!("expected a boolean, got {value:?}");
@@ -1445,30 +1418,6 @@ fn value_type(runtime: &Runtime, value: &Value) -> &'static str {
     }
 }
 
-fn hex(value: &JsString) -> String {
-    value
-        .utf16_units()
-        .map(|unit| format!("{unit:04x}"))
-        .collect()
-}
-
-const fn bit(value: bool) -> u8 {
-    value as u8
-}
-
 fn oracle_observations(oracle: &OsStr) -> Vec<String> {
-    let output = Command::new(oracle)
-        .args(["-e", ORACLE_PROBE])
-        .output()
-        .expect("run QuickJS Function.prototype bind/toString oracle");
-    assert!(
-        output.status.success(),
-        "QuickJS Function.prototype bind/toString oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("QuickJS Function.prototype bind/toString oracle emitted non-UTF-8 output")
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    crate::quickjs_oracle::probe_lines(oracle, ORACLE_PROBE, "Function.prototype bind/toString")
 }

@@ -1,48 +1,10 @@
-use std::ffi::OsStr;
-use std::process::{Command, Output};
-
-use quickjs_oxide::engine::api::{Context, Runtime, RuntimeError, Value};
-
-fn eval(context: &mut Context, source: &str) -> Value {
-    context.eval(source).unwrap_or_else(|error| {
-        if error == RuntimeError::Exception {
-            panic!(
-                "unexpected JavaScript exception: {:?}",
-                context.take_exception()
-            );
-        }
-        panic!("unexpected engine error: {error}");
-    })
-}
-
-fn text(value: Value) -> String {
-    let Value::String(value) = value else {
-        panic!("expected a string");
-    };
-    value.to_utf8_lossy()
-}
-
-fn integer(value: Value) -> i32 {
-    let Value::Int(value) = value else {
-        panic!("expected an integer");
-    };
-    value
-}
-
-fn drain(runtime: &Runtime) -> usize {
-    let mut count = 0;
-    while runtime.is_job_pending().expect("runtime state") {
-        assert!(runtime.execute_pending_job().unwrap().executed());
-        count += 1;
-    }
-    count
-}
+use crate::runtime_completion_oracle::run;
+use crate::runtime_observation::host_runtime_context;
+use crate::runtime_observation::{drain, eval, integer, text};
 
 #[test]
 fn async_arrow_shape_source_and_await_match_pinned_quickjs() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(
         text(eval(
             &mut context,
@@ -97,9 +59,7 @@ try {
 
 #[test]
 fn async_arrow_keeps_lexical_this_arguments_and_new_target_across_await() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     drop(eval(
         &mut context,
         r#"
@@ -134,9 +94,7 @@ new Outer(1).then(function (value) {
 
 #[test]
 fn async_arrow_keeps_lexical_super_and_receiver_across_await() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     drop(eval(
         &mut context,
         r#"
@@ -169,9 +127,7 @@ new Derived().read().then(function (value) {
 
 #[test]
 fn async_arrow_parameter_abrupt_becomes_a_rejected_promise() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(
         text(eval(
             &mut context,
@@ -270,10 +226,7 @@ outer().then(function (middle) {
         );
     }
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP async-arrow token differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("async-arrow token differential");
     for source in VALID {
         let quickjs = run(&oracle, source);
         assert!(
@@ -290,11 +243,4 @@ outer().then(function (middle) {
             "pinned QuickJS accepted a recorded rejection edge {source:?}"
         );
     }
-}
-
-fn run(executable: &OsStr, source: &str) -> Output {
-    Command::new(executable)
-        .args(["-e", source])
-        .output()
-        .unwrap_or_else(|error| panic!("could not run {executable:?}: {error}"))
 }

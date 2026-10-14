@@ -1,5 +1,6 @@
 use crate::common::compile_syntax_error;
-use quickjs_oxide::engine::api::{Runtime, Value};
+use crate::runtime_observation::host_runtime_context;
+use quickjs_oxide::engine::api::Value;
 use std::ffi::OsStr;
 use std::process::Command;
 
@@ -187,19 +188,14 @@ fn base_class_observation_is_stable() {
 
 #[test]
 fn base_class_observation_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP base-class differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("base-class differential");
     assert_eq!(rust_observation(), oracle_observation(&oracle));
 }
 
 #[test]
 fn public_async_generator_class_method_smoke_is_admitted() {
     let source = "class C { async *method() {} }";
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     context
         .compile(source)
         .expect("public async-generator class methods should compile");
@@ -231,9 +227,7 @@ fn base_class_early_errors_are_rejected_during_compilation() {
 
 #[test]
 fn class_expression_restores_outer_lexing_and_asi_trivia() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     let Value::String(name) = context
         .eval("var AsiClass = class AsiClass {}\nAsiClass.name")
         .expect("class expression followed by ASI should compile and run")
@@ -244,9 +238,7 @@ fn class_expression_restores_outer_lexing_and_asi_trivia() {
 }
 
 fn rust_observation() -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     let diagnostic_probe = [
         "try { ",
         PROBE,

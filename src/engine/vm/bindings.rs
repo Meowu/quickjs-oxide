@@ -34,16 +34,6 @@ pub(in crate::engine::vm) enum FrameBinding {
 const _: () = assert!(std::mem::size_of::<FrameBinding>() == 16);
 const _: () = assert!(std::mem::size_of::<Option<FrameBinding>>() == 16);
 
-pub(in crate::engine::vm) const fn is_private_callable_kind(kind: ClosureVariableKind) -> bool {
-    matches!(
-        kind,
-        ClosureVariableKind::PrivateMethod
-            | ClosureVariableKind::PrivateGetter
-            | ClosureVariableKind::PrivateSetter
-            | ClosureVariableKind::PrivateGetterSetter
-    )
-}
-
 /// Release every owner a frame binding carried. Direct internal values take
 /// the deferred-release path; the handle variants release their single edge
 /// through the nothrow heap paths.
@@ -312,7 +302,7 @@ pub(in crate::engine::vm) fn capture_frame_binding(
             Ok(root)
         }
         FrameBinding::PrivateCallable(object) => {
-            if !is_private_callable_kind(descriptor.kind)
+            if !descriptor.kind.is_private_callable()
                 || !descriptor.is_lexical
                 || !descriptor.is_const
             {
@@ -380,7 +370,7 @@ pub(in crate::engine::vm) fn close_frame_binding(
                 .private_name_index_from_raw_var_ref(&view)
                 .map_err(runtime_error_to_vm_error)?,
         ),
-        RawValue::Object(_) if is_private_callable_kind(kind) => FrameBinding::PrivateCallable(
+        RawValue::Object(_) if kind.is_private_callable() => FrameBinding::PrivateCallable(
             runtime
                 .private_callable_id_from_raw_var_ref(&view, kind)
                 .map_err(runtime_error_to_vm_error)?,
@@ -867,22 +857,22 @@ mod layout_tests;
 
 #[cfg(test)]
 mod binding_value_tests {
-    use super::*;
+
+    use crate::engine::test_support::assert_script_true;
+    use crate::engine::test_support::test_context;
     use crate::engine::value::Value;
 
     #[test]
     fn owned_cell_reads_keep_global_and_captured_function_identity() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         drop(
             context
                 .eval("let ownedCellGlobal = function() { return 7; };")
                 .unwrap(),
         );
-        assert_eq!(
-            context
-                .eval(
-                    r#"
+        assert_script_true(
+            &mut context,
+            r#"
             (() => {
                 let f = ownedCellGlobal;
                 function get() { return f; }
@@ -890,18 +880,16 @@ mod binding_value_tests {
                 f = function() { return 9; };
                 return get()() === 9 && ownedCellGlobal() === 7;
             })()
-        "#
-                )
-                .unwrap(),
-            Value::Bool(true)
+        "#,
         );
     }
 
     #[test]
     fn immediate_cell_writes_preserve_assignment_results_and_error_order() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
-        assert_eq!(context.eval(r#"(()=>{
+        let (_, mut context) = test_context();
+        assert_script_true(
+            &mut context,
+            r#"(()=>{
             let x=1; function read(){return x;} function set(v){return x=v;}
             if(set(2)!==2 || read()!==2)return false;
             if((x=3)!==3 || read()!==3)return false;
@@ -916,9 +904,12 @@ mod binding_value_tests {
             try { (()=>later=2)(); let later=1; } catch(e){if(e instanceof ReferenceError)trace+='tdz';}
             const c=1; try { (()=>c=2)(); } catch(e){if(e instanceof TypeError)trace+='const';}
             return mapped(1) && strict(1) && trace==='tdzconst' && c===1;
-        })()"#).unwrap(), Value::Bool(true));
+        })()"#,
+        );
         drop(context.eval("let immediateWriteGlobal=1;").unwrap());
-        assert_eq!(context.eval(r#"(()=>{
+        assert_script_true(
+            &mut context,
+            r#"(()=>{
             immediateWriteGlobal=2; let a=immediateWriteGlobal;
             immediateWriteGlobal={answer:3}; let b=immediateWriteGlobal.answer;
             immediateWriteGlobal=4; let c=immediateWriteGlobal;
@@ -926,13 +917,13 @@ mod binding_value_tests {
             Object.defineProperty(globalThis,'cellSetterProbe',{configurable:true,set(v){calls++;last=v;}});
             cellSetterProbe=8; cellSetterProbe=9; delete globalThis.cellSetterProbe;
             return a===2 && b===3 && c===4 && calls===2 && last===9;
-        })()"#).unwrap(), Value::Bool(true));
+        })()"#,
+        );
     }
 
     #[test]
     fn owned_cell_writes_preserve_global_and_captured_values() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         drop(context.eval("let profileWriteGlobal=1;").unwrap());
         drop(
             context
@@ -950,9 +941,10 @@ mod binding_value_tests {
 
     #[test]
     fn captured_reads_observe_callbacks_eval_arguments_and_tdz() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
-        assert_eq!(context.eval(r#"(()=>{
+        let (_, mut context) = test_context();
+        assert_script_true(
+            &mut context,
+            r#"(()=>{
             let value=1;
             function read(){return value;}
             function mutate(next){value=next;}
@@ -967,9 +959,12 @@ mod binding_value_tests {
             let tdz=false; try { (()=>later)(); let later=1; } catch(e){tdz=e instanceof ReferenceError;}
             const constant=9; function constantRead(){return constant;}
             return mapped(1) && strict(1) && tdz && constantRead()===9;
-        })()"#).unwrap(), Value::Bool(true));
+        })()"#,
+        );
         drop(context.eval("let immediateGlobal=1;").unwrap());
-        assert_eq!(context.eval(r#"(()=>{
+        assert_script_true(
+            &mut context,
+            r#"(()=>{
             let first=immediateGlobal;
             immediateGlobal=2;
             let second=immediateGlobal;
@@ -980,13 +975,13 @@ mod binding_value_tests {
             let a=cellGetterProbe,b=cellGetterProbe;
             delete globalThis.cellGetterProbe;
             return first===1 && second===2 && third===3 && a===1 && b===2;
-        })()"#).unwrap(), Value::Bool(true));
+        })()"#,
+        );
     }
 
     #[test]
     fn captured_reads_preserve_global_and_closure_values() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         drop(context.eval("let immediateProfileGlobal=7;").unwrap());
         assert_eq!(
             context.eval("immediateProfileGlobal").unwrap(),

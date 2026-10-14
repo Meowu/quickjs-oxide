@@ -1,9 +1,11 @@
+use crate::runtime_observation::host_runtime_context;
 use std::ffi::OsStr;
 use std::io::Write;
 
 use std::process::{Command, Stdio};
 
-use quickjs_oxide::engine::api::{CompileOptions, Runtime, RuntimeError, Value, number_to_string};
+use crate::runtime_observation::normalize_rust_value_units as normalize_rust_value;
+use quickjs_oxide::engine::api::{CompileOptions, Runtime, RuntimeError, Value};
 
 const ORACLE_NORMALIZER: &str = r#"
 var __qjo_type = typeof __qjo_value;
@@ -1115,14 +1117,9 @@ const RUNTIME_ERROR_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn future_reserved_words_match_quickjs_oracle() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP future-reserved-word differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("future-reserved-word differential");
 
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let import_options = CompileOptions::new("future-reserved-import.js");
     for &(description, source) in FUTURE_RESERVED_IMPORT_CALL_CASES {
         context
@@ -1182,9 +1179,7 @@ fn primitive_expressions_match_quickjs_oracle() {
         return;
     };
 
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
 
     for &(description, source) in CASES {
         let rust_value = context.eval(source).unwrap_or_else(|error| {
@@ -1202,14 +1197,9 @@ fn primitive_expressions_match_quickjs_oracle() {
 
 #[test]
 fn implemented_errors_match_quickjs_oracle() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP syntax-error oracle differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("syntax-error oracle differential");
 
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     for &(description, source) in SHARED_ERRORS {
         assert!(
             context.eval(source).is_err(),
@@ -1243,14 +1233,9 @@ fn implemented_errors_match_quickjs_oracle() {
 
 #[test]
 fn runtime_error_kind_and_message_match_quickjs_oracle() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP runtime-error oracle differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("runtime-error oracle differential");
 
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let name_key = runtime.intern_property_key("name").unwrap();
     let message_key = runtime.intern_property_key("message").unwrap();
     for &(description, source) in RUNTIME_ERROR_CASES {
@@ -1275,19 +1260,14 @@ fn runtime_error_kind_and_message_match_quickjs_oracle() {
 
 #[test]
 fn compiler_call_capacity_matches_quickjs_error_classes() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP compiler-capacity oracle differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("compiler-capacity oracle differential");
 
     let arguments = std::iter::repeat_n("0", usize::from(u16::MAX))
         .collect::<Vec<_>>()
         .join(",");
     let source = format!("(function() {{}})({arguments})");
 
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(context.compile(&source), Err(RuntimeError::Exception));
     let rust_observation = take_rust_error_observation(&runtime, &mut context);
     assert_eq!(rust_observation, "InternalError|stack overflow");
@@ -1401,40 +1381,4 @@ fn take_rust_error_observation(
         panic!("Rust Error message was not a string");
     };
     format!("{}|{}", name.to_utf8_lossy(), message.to_utf8_lossy())
-}
-
-fn normalize_rust_value(value: &Value) -> String {
-    match value {
-        Value::Undefined => "undefined|undefined".to_owned(),
-        Value::Null => "object|null".to_owned(),
-        Value::Bool(value) => format!("boolean|{value}"),
-        Value::Int(value) => normalize_number(f64::from(*value)),
-        Value::Float(value) => normalize_number(*value),
-        Value::BigInt(value) => format!("bigint|{value}"),
-        Value::String(value) => {
-            let units = value
-                .utf16_units()
-                .map(|unit| format!("{unit:04x}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("string|{}|{units}", value.len())
-        }
-        Value::Symbol(_) => "symbol|<identity>".to_owned(),
-        Value::Object(_) => "object|<identity>".to_owned(),
-    }
-}
-
-#[allow(clippy::float_cmp)]
-fn normalize_number(value: f64) -> String {
-    if value.is_nan() {
-        "number|NaN".to_owned()
-    } else if value == 0.0 && value.is_sign_negative() {
-        "number|-0".to_owned()
-    } else if value == f64::INFINITY {
-        "number|Infinity".to_owned()
-    } else if value == f64::NEG_INFINITY {
-        "number|-Infinity".to_owned()
-    } else {
-        format!("number|{}", number_to_string(value))
-    }
 }

@@ -1,14 +1,14 @@
+use crate::object_graph_observation::require_object as expect_object;
 use crate::runtime_completion_oracle::{
     compare_read_context_eval_completion_cases_with_prelude,
     observe_quickjs_completion_with_prelude, observe_read_context_eval_completion_with_prelude,
 };
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use crate::runtime_observation::{
     property_callable_with_read_context as property_callable, take_exception_object,
 };
 use crate::runtime_oracle::{eval_callable, eval_object};
-use quickjs_oxide::engine::api::{
-    CallableRef, Context, JsString, ObjectRef, Runtime, RuntimeError, Value,
-};
+use quickjs_oxide::engine::api::{CallableRef, Context, JsString, Runtime, RuntimeError, Value};
 
 // Differential lock for observable RegExp semantics in pinned QuickJS
 // 2026-06-04. The vectors deliberately stay below later String.prototype
@@ -571,10 +571,7 @@ const TEST_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn regexp_intrinsic_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP RegExp intrinsic oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("RegExp intrinsic oracle self-check");
     for &(group, cases) in &[
         ("graph", GRAPH_CASES),
         ("constructor", CONSTRUCTOR_CASES),
@@ -619,8 +616,7 @@ fn regexp_literal_allocation_and_intrinsic_bypass_match_pinned_quickjs() {
 
 #[test]
 fn regexp_literal_uses_the_bytecode_realm_and_is_fresh_on_every_execution() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_prototype = eval_object(
@@ -689,9 +685,7 @@ fn regexp_exec_reentrant_compile_matches_pinned_quickjs() {
     };
     let mut failures = Vec::new();
     for &(description, source, expected) in EXEC_REENTRANT_COMPILE_CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         let oxide = observe_rust_eval(&runtime, &mut context, source, description);
         let quickjs =
             observe_quickjs_completion_with_prelude(PRELUDE, &oracle, source, description);
@@ -717,9 +711,7 @@ fn regexp_test_and_abstract_exec_match_pinned_quickjs() {
 
 #[test]
 fn regexp_test_calls_callable_proxy_exec_without_an_oracle() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(
         observe_rust_eval(
             &runtime,
@@ -733,8 +725,7 @@ fn regexp_test_calls_callable_proxy_exec_without_an_oracle() {
 
 #[test]
 fn regexp_cross_realm_prototypes_results_fallback_and_errors_use_exact_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
 
@@ -893,11 +884,4 @@ fn regexp_constructor(runtime: &Runtime, context: &mut Context) -> CallableRef {
 fn regexp_prototype_callable(runtime: &Runtime, context: &mut Context, name: &str) -> CallableRef {
     let prototype = eval_object(context, "RegExp.prototype", "RegExp prototype");
     property_callable(runtime, context, &prototype, name)
-}
-
-fn expect_object(value: Value, description: &str) -> ObjectRef {
-    let Value::Object(object) = value else {
-        panic!("{description} was not an object");
-    };
-    object
 }

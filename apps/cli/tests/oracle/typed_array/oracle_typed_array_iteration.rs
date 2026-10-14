@@ -1,22 +1,20 @@
-use super::quickjs_typed_array_oracle::observe_string_value;
+use crate::object_graph_observation::data_property as data_descriptor;
+use crate::oracle_cases::ExpectedCase as Case;
+use crate::runtime_observation::host_runtime;
 use crate::runtime_observation::{
     property_callable_with_read_context as property_callable, take_exception_object,
 };
 use crate::runtime_oracle::{eval_callable, eval_object};
-use quickjs_oxide::engine::api::{
-    Context, DescriptorField, ObjectRef, OrdinaryPropertyDescriptor, Runtime, RuntimeError, Value,
+use crate::string_value_cases::{
+    assert_quickjs_string_cases_match_frozen, assert_string_cases_match_frozen,
+    assert_string_cases_match_quickjs,
 };
+use quickjs_oxide::engine::api::{Context, ObjectRef, Runtime, RuntimeError, Value};
 
 // These observations pin QuickJS 2026-06-04's shared
 // `js_create_typed_array_iterator` / `js_array_iterator_next` path. Keep
 // entries, keys, values, and @@iterator together: they differ only in the
 // iterator kind selected after the same TypedArray validation.
-struct Case {
-    description: &'static str,
-    source: &'static str,
-    expected: &'static str,
-}
-
 const CASES: &[Case] = &[
     Case {
         description: "brand and initial buffer-state validation",
@@ -184,54 +182,24 @@ const CASES: &[Case] = &[
 
 #[test]
 fn typed_array_iterator_vectors_match_frozen_quickjs_observations() {
-    for case in CASES {
-        assert_eq!(
-            oxide_observation(case),
-            case.expected,
-            "{}",
-            case.description
-        );
-    }
+    assert_string_cases_match_frozen(None, CASES);
 }
 
 #[test]
 fn typed_array_iterator_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP TypedArray iterator oracle self-check: set QJS_ORACLE to pinned upstream qjs"
-        );
-        return;
-    };
-    for case in CASES {
-        assert_eq!(
-            observe_string_value(&oracle, case.source, case.description),
-            case.expected,
-            "{}",
-            case.description,
-        );
-    }
+    let oracle = require_pinned_qjs_oracle!("TypedArray iterator oracle self-check");
+    assert_quickjs_string_cases_match_frozen(&oracle, None, CASES);
 }
 
 #[test]
 fn typed_array_iterators_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP TypedArray iterator differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
-    for case in CASES {
-        assert_eq!(
-            oxide_observation(case),
-            observe_string_value(&oracle, case.source, case.description),
-            "{}",
-            case.description,
-        );
-    }
+    let oracle = require_pinned_qjs_oracle!("TypedArray iterator differential");
+    assert_string_cases_match_quickjs(&oracle, None, CASES);
 }
 
 #[test]
 fn typed_array_entries_pair_and_errors_use_the_builtin_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_array_prototype = defining.array_prototype().unwrap();
@@ -348,24 +316,6 @@ fn typed_array_entries_pair_and_errors_use_the_builtin_defining_realm() {
     );
 }
 
-fn oxide_observation(case: &Case) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
-    match context.eval(case.source) {
-        Ok(Value::String(value)) => value.to_utf8_lossy(),
-        Ok(value) => panic!(
-            "Oxide returned a non-string for {}: {value:?}",
-            case.description,
-        ),
-        Err(RuntimeError::Exception) => {
-            let exception = context.take_exception().unwrap();
-            panic!("Oxide threw for {}: {exception:?}", case.description);
-        }
-        Err(error) => panic!("Oxide failed for {}: {error}", case.description),
-    }
-}
-
 fn object_property(
     runtime: &Runtime,
     context: &mut Context,
@@ -380,14 +330,4 @@ fn object_property(
         panic!("{name} was not an object");
     };
     value
-}
-
-fn data_descriptor(value: Value) -> OrdinaryPropertyDescriptor {
-    OrdinaryPropertyDescriptor {
-        value: DescriptorField::Present(value),
-        writable: DescriptorField::Present(true),
-        enumerable: DescriptorField::Present(true),
-        configurable: DescriptorField::Present(true),
-        ..OrdinaryPropertyDescriptor::new()
-    }
 }

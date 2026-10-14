@@ -1,13 +1,14 @@
-use crate::quickjs_array_completion_oracle;
+use crate::object_graph_observation::data_bits;
+use crate::object_graph_observation::own_data_descriptor as data_descriptor;
+use crate::runtime_completion_oracle::compare_array_value_cases as compare_value_cases;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use crate::runtime_observation::{
-    error_string_property, primitive_value_text,
-    property_callable_with_read_context as property_callable, take_exception_object,
+    primitive_value_text, property_callable_with_read_context as property_callable,
+    take_exception_object,
 };
-use crate::runtime_oracle::{eval_object, value_type};
-use quickjs_array_completion_oracle::observe_array_completion;
+use crate::runtime_oracle::eval_object;
 use quickjs_oxide::engine::api::{
-    CompleteOrdinaryPropertyDescriptor, Context, ObjectRef, PropertyKey, Runtime, RuntimeError,
-    Value, WellKnownSymbol,
+    Context, ObjectRef, PropertyKey, Runtime, RuntimeError, Value, WellKnownSymbol,
 };
 use std::ffi::OsStr;
 use std::process::Command;
@@ -516,10 +517,7 @@ const VALUE_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn math_intrinsic_graph_and_descriptors_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Math graph differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Math graph differential");
     assert_eq!(
         rust_graph_observations(),
         oracle_graph_observations(&oracle),
@@ -534,9 +532,7 @@ fn math_values_match_pinned_quickjs() {
 
 #[test]
 fn math_methods_are_not_constructable() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let math = math_object(&runtime, &mut context);
     for &(name, _) in METHODS {
         let callable = property_callable(&runtime, &mut context, &math, name);
@@ -559,8 +555,7 @@ fn math_methods_are_not_constructable() {
 
 #[test]
 fn math_native_errors_use_the_method_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_type_error = eval_object(
@@ -626,9 +621,7 @@ fn math_native_errors_use_the_method_defining_realm() {
 
 #[test]
 fn math_rust_smoke_runs_without_an_oracle() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     let value = context
         .eval("Math.sumPrecise([20,22])")
         .expect("execute Math smoke");
@@ -638,96 +631,8 @@ fn math_rust_smoke_runs_without_an_oracle() {
     );
 }
 
-fn compare_value_cases(group: &str, cases: &[(&str, &str)]) {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP {group} differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
-    for &(description, source) in cases {
-        let expected = observe_array_completion(&oracle, source, description);
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        assert_eq!(
-            observe_rust_eval(&runtime, &mut context, source, description),
-            expected,
-            "{group} drifted for {description}: {source:?}",
-        );
-    }
-}
-
-fn observe_rust_eval(
-    runtime: &Runtime,
-    context: &mut Context,
-    source: &str,
-    description: &str,
-) -> String {
-    match context.eval(source) {
-        Ok(Value::Object(object)) if runtime.is_array_object(&object).unwrap() => format!(
-            "return|array|{}",
-            array_value_text(runtime, context, &object, description),
-        ),
-        Ok(value) => format!(
-            "return|{}|{}",
-            value_type(runtime, &value),
-            primitive_value_text(value),
-        ),
-        Err(RuntimeError::Exception) => {
-            let exception = context
-                .take_exception()
-                .unwrap_or_else(|error| panic!("take Rust exception for {description}: {error}"))
-                .unwrap_or_else(|| panic!("Rust exception was missing for {description}"));
-            match exception {
-                Value::Object(error) => format!(
-                    "throw|object|{}|{}",
-                    error_string_property(runtime, context, &error, "name", description),
-                    error_string_property(runtime, context, &error, "message", description),
-                ),
-                value => format!(
-                    "throw|{}|{}",
-                    value_type(runtime, &value),
-                    primitive_value_text(value),
-                ),
-            }
-        }
-        Err(error) => panic!("Rust engine failure for {description} ({source:?}): {error}"),
-    }
-}
-
-fn array_value_text(
-    runtime: &Runtime,
-    context: &mut Context,
-    array: &ObjectRef,
-    description: &str,
-) -> String {
-    let length_key = runtime.intern_property_key("length").unwrap();
-    let length = context
-        .get_property(array, &length_key)
-        .unwrap_or_else(|error| panic!("read result Array length for {description}: {error}"));
-    let length = match length {
-        Value::Int(value) if value >= 0 => value as usize,
-        Value::Float(value) if value >= 0.0 && value.fract() == 0.0 => value as usize,
-        value => panic!(
-            "result Array length for {description} was invalid: {}",
-            primitive_value_text(value),
-        ),
-    };
-    (0..length)
-        .map(|index| {
-            let key = runtime.intern_property_key(&index.to_string()).unwrap();
-            let value = context.get_property(array, &key).unwrap_or_else(|error| {
-                panic!("read result Array[{index}] for {description}: {error}")
-            });
-            primitive_value_text(value)
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 fn rust_graph_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let object_prototype = context.object_prototype().unwrap();
     let function_prototype = context.function_prototype().unwrap();
@@ -863,36 +768,6 @@ fn math_object(runtime: &Runtime, context: &mut Context) -> ObjectRef {
     math
 }
 
-fn data_descriptor(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    key: &PropertyKey,
-) -> (Value, bool, bool, bool) {
-    let descriptor = runtime
-        .get_own_property(object, key)
-        .unwrap()
-        .expect("expected own property descriptor");
-    let CompleteOrdinaryPropertyDescriptor::Data {
-        value,
-        writable,
-        enumerable,
-        configurable,
-    } = descriptor
-    else {
-        panic!("expected a data property descriptor");
-    };
-    (value, writable, enumerable, configurable)
-}
-
-fn data_bits(writable: bool, enumerable: bool, configurable: bool) -> String {
-    format!(
-        "D:{}{}{}",
-        Number(writable),
-        Number(enumerable),
-        Number(configurable),
-    )
-}
-
 fn own_key_names(runtime: &Runtime, object: &ObjectRef) -> Vec<String> {
     let to_string_tag = PropertyKey::from(
         runtime
@@ -914,12 +789,4 @@ fn own_key_names(runtime: &Runtime, object: &ObjectRef) -> Vec<String> {
             }
         })
         .collect()
-}
-
-struct Number(bool);
-
-impl std::fmt::Display for Number {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(if self.0 { "1" } else { "0" })
-    }
 }

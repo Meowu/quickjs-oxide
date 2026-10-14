@@ -17,8 +17,6 @@ use crate::engine::heap::{
 use crate::engine::object::builtin_properties::NativeBuiltinProperty;
 
 use super::MAX_ARRAY_BUFFER_LENGTH;
-#[cfg(test)]
-use crate::engine::api::context::Context;
 use crate::engine::{
     api::{
         error::{Error, ErrorKind, NativeErrorKind},
@@ -551,7 +549,7 @@ impl Runtime {
             }
             TypedArrayNativeKind::From => self.call_typed_array_from(realm, invocation, arguments),
             TypedArrayNativeKind::Of => self.call_typed_array_of(realm, invocation, arguments),
-            TypedArrayNativeKind::Species => self.call_typed_array_species(&invocation),
+            TypedArrayNativeKind::Species => self.call_species_getter(&invocation),
             TypedArrayNativeKind::Length
             | TypedArrayNativeKind::Buffer
             | TypedArrayNativeKind::ByteLength
@@ -701,18 +699,6 @@ impl Runtime {
             fixed_byte_length,
             element,
         )?))
-    }
-
-    pub(in crate::engine::builtins) fn call_typed_array_species(
-        &self,
-        invocation: &NativeInvocation,
-    ) -> Result<Completion, RuntimeError> {
-        let NativeInvocation::Getter { this_value } = invocation else {
-            return Err(RuntimeError::Invariant(
-                "TypedArray species did not receive a getter invocation",
-            ));
-        };
-        Ok(Completion::Return(self.dup_jsvalue(this_value)?))
     }
 
     pub(in crate::engine::builtins) fn call_typed_array_getter(
@@ -1576,7 +1562,7 @@ fn typed_array_encode_bigint(
     let signed = narrowed.as_i64().ok_or(RuntimeError::Invariant(
         "64-bit TypedArray BigInt did not normalize to an i64",
     ))?;
-    Ok((signed as u64).to_ne_bytes())
+    Ok(signed.cast_unsigned().to_ne_bytes())
 }
 
 fn typed_array_encode_number(element: TypedArrayElementKind, number: f64) -> [u8; 8] {
@@ -1648,7 +1634,7 @@ fn typed_array_decode_number(
         TypedArrayElementKind::Uint8Clamped | TypedArrayElementKind::Uint8 => {
             Number::Int(i32::from(bytes[0]))
         }
-        TypedArrayElementKind::Int8 => Number::Int(i32::from(bytes[0] as i8)),
+        TypedArrayElementKind::Int8 => Number::Int(i32::from(bytes[0].cast_signed())),
         TypedArrayElementKind::Int16 => {
             Number::Int(i32::from(i16::from_ne_bytes([bytes[0], bytes[1]])))
         }
@@ -1680,7 +1666,7 @@ fn typed_array_decode_number(
     }
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn typed_array_to_uint8_clamp(number: f64) -> u8 {
     if number.is_nan() || number <= 0.0 {
         return 0;

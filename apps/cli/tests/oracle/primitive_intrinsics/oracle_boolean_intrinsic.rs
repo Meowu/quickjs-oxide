@@ -1,11 +1,15 @@
+use crate::object_graph_observation::{
+    define_accessor, define_accessor_key, define_data_key_with_flags as define_data_key,
+    define_data_with_flags as define_data, define_global_key as define_global, eval_callable,
+    expect_object, global_object_value as global_value, object_has_prototype, own_key_names,
+};
+use crate::runtime_observation::host_runtime_context;
 use crate::runtime_observation::property_callable;
 use quickjs_oxide::engine::api::{
-    AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DescriptorField,
-    JsBigInt, JsString, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError,
-    Value, WellKnownSymbol,
+    CallableRef, CompleteOrdinaryPropertyDescriptor, Context, JsBigInt, JsString, ObjectRef,
+    PropertyKey, Runtime, Value, WellKnownSymbol,
 };
 use std::ffi::OsStr;
-use std::process::Command;
 
 // Deliberate current-slice boundary: the oracle can use Object/Reflect and
 // literals to describe the result compactly, while the Rust side constructs
@@ -187,10 +191,7 @@ print("custom-object-methods=" + [
 
 #[test]
 fn boolean_intrinsic_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Boolean intrinsic differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Boolean intrinsic differential");
 
     assert_eq!(
         rust_observations(),
@@ -200,9 +201,7 @@ fn boolean_intrinsic_matches_pinned_quickjs() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let object_prototype = context.object_prototype().unwrap();
     let function_prototype = context.function_prototype().unwrap();
@@ -798,149 +797,8 @@ fn rust_observations() -> Vec<String> {
     observations
 }
 
-fn define_global(runtime: &Runtime, global: &ObjectRef, name: &str, value: Value) -> PropertyKey {
-    let key = runtime.intern_property_key(name).unwrap();
-    define_data_key(runtime, global, &key, value, true, true, true);
-    key
-}
-
-fn define_data(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    name: &str,
-    value: Value,
-    writable: bool,
-    enumerable: bool,
-    configurable: bool,
-) {
-    let key = runtime.intern_property_key(name).unwrap();
-    define_data_key(
-        runtime,
-        object,
-        &key,
-        value,
-        writable,
-        enumerable,
-        configurable,
-    );
-}
-
-fn define_data_key(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    key: &PropertyKey,
-    value: Value,
-    writable: bool,
-    enumerable: bool,
-    configurable: bool,
-) {
-    assert!(
-        runtime
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(writable),
-                    enumerable: DescriptorField::Present(enumerable),
-                    configurable: DescriptorField::Present(configurable),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap(),
-        "host data-property definition was rejected"
-    );
-}
-
-fn define_accessor(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    name: &str,
-    get: Option<CallableRef>,
-    set: Option<CallableRef>,
-) {
-    let key = runtime.intern_property_key(name).unwrap();
-    define_accessor_key(runtime, object, &key, get, set);
-}
-
-fn define_accessor_key(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    key: &PropertyKey,
-    get: Option<CallableRef>,
-    set: Option<CallableRef>,
-) {
-    assert!(
-        runtime
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    get: DescriptorField::Present(
-                        get.map_or(AccessorValue::Undefined, AccessorValue::Callable),
-                    ),
-                    set: DescriptorField::Present(
-                        set.map_or(AccessorValue::Undefined, AccessorValue::Callable),
-                    ),
-                    enumerable: DescriptorField::Present(false),
-                    configurable: DescriptorField::Present(true),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap(),
-        "host accessor-property definition was rejected"
-    );
-}
-
-fn eval_callable(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("callable source did not produce an object: {source:?}");
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("source did not produce a callable: {source:?}"))
-}
-
-fn global_value(runtime: &Runtime, context: &mut Context, global: &ObjectRef, name: &str) -> Value {
-    context
-        .get_property(global, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-}
-
 fn unbox_boolean(context: &mut Context, value_of: &CallableRef, this_value: Value) -> Value {
     context.call(value_of, this_value, &[]).unwrap()
-}
-
-fn object_has_prototype(runtime: &Runtime, value: &Value, prototype: &ObjectRef) -> bool {
-    let Value::Object(object) = value else {
-        return false;
-    };
-    runtime
-        .get_prototype_of(object)
-        .unwrap()
-        .is_some_and(|actual| actual == *prototype)
-}
-
-fn expect_object(value: Value, description: &str) -> ObjectRef {
-    let Value::Object(object) = value else {
-        panic!("{description} did not produce an object");
-    };
-    object
-}
-
-fn own_key_names(runtime: &Runtime, object: &ObjectRef) -> Vec<String> {
-    runtime
-        .own_property_keys(object)
-        .unwrap()
-        .iter()
-        .map(|key| {
-            runtime
-                .property_key_to_js_string(key)
-                .unwrap()
-                .to_utf8_lossy()
-        })
-        .collect()
 }
 
 fn data_flags(runtime: &Runtime, object: &ObjectRef, name: &str) -> String {
@@ -967,13 +825,7 @@ fn data_flags(runtime: &Runtime, object: &ObjectRef, name: &str) -> String {
 }
 
 fn observe_eval(runtime: &Runtime, context: &mut Context, source: &str) -> String {
-    match context.eval(source) {
-        Ok(value) => plain_value(value),
-        Err(RuntimeError::Exception) => take_error(runtime, context),
-        Err(error) => {
-            panic!("Rust source failed outside JavaScript completion: {source:?}: {error}")
-        }
-    }
+    crate::primitive_probe::observe_eval(runtime, context, source, plain_value)
 }
 
 fn observe_call(
@@ -982,37 +834,11 @@ fn observe_call(
     callable: &CallableRef,
     this_value: Value,
 ) -> String {
-    match context.call(callable, this_value, &[]) {
-        Ok(value) => plain_value(value),
-        Err(RuntimeError::Exception) => take_error(runtime, context),
-        Err(error) => panic!("Rust call failed outside JavaScript completion: {error}"),
-    }
-}
-
-fn take_error(runtime: &Runtime, context: &mut Context) -> String {
-    let Value::Object(error) = context.take_exception().unwrap().unwrap() else {
-        panic!("Boolean operation did not throw an Error object");
-    };
-    let name = error_text(runtime, context, &error, "name");
-    let message = error_text(runtime, context, &error, "message");
-    format!("throw:{name}:{message}")
-}
-
-fn error_text(runtime: &Runtime, context: &mut Context, error: &ObjectRef, name: &str) -> String {
-    let key = runtime.intern_property_key(name).unwrap();
-    let Value::String(value) = context.get_property(error, &key).unwrap() else {
-        panic!("Error.{name} was not a string");
-    };
-    value.to_utf8_lossy()
+    crate::primitive_probe::observe_call(runtime, context, callable, this_value, &[], plain_value)
 }
 
 fn join_values(values: &[Value]) -> String {
-    values
-        .iter()
-        .map(|value| value.try_clone().expect("duplicate root"))
-        .map(plain_value)
-        .collect::<Vec<_>>()
-        .join("|")
+    crate::primitive_probe::join_values(values, plain_value)
 }
 
 fn plain_value(value: Value) -> String {
@@ -1032,18 +858,5 @@ fn plain_value(value: Value) -> String {
 }
 
 fn oracle_observations(oracle: &OsStr) -> Vec<String> {
-    let output = Command::new(oracle)
-        .args(["-e", ORACLE_PROBE])
-        .output()
-        .expect("run QuickJS Boolean intrinsic oracle");
-    assert!(
-        output.status.success(),
-        "QuickJS Boolean intrinsic oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("QuickJS Boolean intrinsic oracle emitted non-UTF-8 output")
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    crate::quickjs_oracle::probe_lines(oracle, ORACLE_PROBE, "Boolean intrinsic")
 }

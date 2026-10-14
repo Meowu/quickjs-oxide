@@ -43,7 +43,7 @@ impl RuntimeState {
     /// domain) and immediates leave without the general promotion. Every other
     /// case continues in the cold selection, which does not probe again.
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn select_linked_data_into(
         &self,
         domain_id: u64,
@@ -95,7 +95,7 @@ impl RuntimeState {
     /// count a cooldown step twice.
     #[cold]
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn select_linked_data_cold(
         &self,
         domain_id: u64,
@@ -199,7 +199,6 @@ impl RuntimeState {
     /// same state borrow before it can escape.
     #[cold]
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
     fn select_linked_miss(
         &self,
         domain_id: u64,
@@ -373,9 +372,11 @@ impl RuntimeState {
 mod tests {
     use super::*;
     use crate::engine::code::bytecode::Instruction;
+    use crate::engine::test_support::assert_script_true;
+    use crate::engine::test_support::test_context;
     use crate::engine::value::Value;
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn select(
         state: &RuntimeState,
         domain: u64,
@@ -407,7 +408,7 @@ mod tests {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn read(
         state: &RuntimeState,
         domain: u64,
@@ -472,8 +473,7 @@ mod tests {
 
     #[test]
     fn field_read_counts_one_cooldown_step_per_read() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = site(&runtime);
         let cache = code.property_read_ic.site(pc).unwrap();
         let receivers = (0..6)
@@ -519,8 +519,7 @@ mod tests {
 
     #[test]
     fn direct_state_read_keeps_result_after_final_receiver_release() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = site(&runtime);
         let base = runtime
             .into_jsvalue(context.eval("({x:{marker:42}})").unwrap())
@@ -551,8 +550,7 @@ mod tests {
 
     #[test]
     fn direct_state_selection_preserves_prototypes_and_getter_progress() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = site(&runtime);
         let inherited = runtime
             .into_jsvalue(context.eval("Object.create({x:42})").unwrap())
@@ -627,8 +625,7 @@ mod tests {
         // Heap handles promote through the trusted saturating retain; a
         // symbol keeps the checked atom retain, so its overflow is the
         // promotion failure that must leave both owners in place.
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = site(&runtime);
         let base = runtime
             .into_jsvalue(context.eval("({x:Symbol('promotion ownership')})").unwrap())
@@ -680,8 +677,7 @@ mod tests {
     #[test]
     fn direct_state_promotion_saturates_an_immortal_string() {
         use crate::engine::heap::RawId;
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = site(&runtime);
         let base = runtime
             .into_jsvalue(context.eval("({x:'promotion ownership'})").unwrap())
@@ -780,8 +776,7 @@ mod tests {
 
     #[test]
     fn direct_state_scalar_and_dense_writes_preserve_rejections() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = site(&runtime);
         let base = runtime
             .into_jsvalue(context.eval("({x:1})").unwrap())
@@ -888,8 +883,7 @@ mod tests {
 
     #[test]
     fn linked_scalar_field_write_commits_without_set_protocol() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, _, key) = site(&runtime);
         let base = runtime
             .into_jsvalue(
@@ -938,8 +932,7 @@ mod tests {
 
     #[test]
     fn linked_field_exchange_declines_observable_storage() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, _, key) = site(&runtime);
         for source in [
             "Object.freeze({x:1})",
@@ -995,9 +988,10 @@ mod tests {
 
     #[test]
     fn scalar_field_vm_preserves_assignment_results_and_fallbacks() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
-        assert_eq!(context.eval(r#"
+        let (runtime, mut context) = test_context();
+        assert_script_true(
+            &mut context,
+            r#"
             (() => {
                 let calls = 0;
                 const o = {x:1, y:0};
@@ -1021,15 +1015,15 @@ mod tests {
                 ({}).x = 1;
                 return frozen.x === 1;
             })()
-        "#).unwrap(), Value::Bool(true));
+        "#,
+        );
         assert!(runtime.0.state.borrow().active_frames.is_empty());
     }
 
     #[cfg(feature = "profiling")]
     #[test]
     fn scalar_field_vm_records_local_completion() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         let _ = context.eval("globalThis.scalarProfile = {x:0};").unwrap();
         let profile = crate::engine::api::profiling::CostProfile::start();
         assert_eq!(
@@ -1050,8 +1044,7 @@ mod tests {
 
     #[test]
     fn initialized_function_slot_completes_locally_after_lazy_decline() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = site_for(&runtime, "(function(o){return o.prototype})");
         let base = runtime
             .into_jsvalue(
@@ -1093,8 +1086,7 @@ mod tests {
 
     #[test]
     fn string_prototype_selection_preserves_data_and_getter_semantics() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let callable = runtime
             .callable_from_value(context.eval("(function(o){return o.charAt})").unwrap())
             .unwrap();
@@ -1156,8 +1148,7 @@ mod tests {
 
     #[test]
     fn shared_selection_uses_cold_inherited_data_and_current_warm_value() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = site(&runtime);
         let base = runtime
             .into_jsvalue(
@@ -1220,8 +1211,7 @@ mod tests {
 
     #[test]
     fn cold_and_warm_accessor_selection_tracks_current_shape() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = site(&runtime);
         let base = runtime
             .into_jsvalue(
@@ -1266,8 +1256,7 @@ mod tests {
 
     #[test]
     fn uncached_own_read_retains_every_owner_after_last_base_release() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = site(&runtime);
         // Three distinct shapes put this site into its megamorphic cooldown.
         // Every following value must therefore use the uncached own-slot path.
@@ -1331,8 +1320,7 @@ mod tests {
 
     #[test]
     fn uncached_own_read_declines_accessors_and_proxies() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = site(&runtime);
         for expression in [
             "({get x(){throw 1}})",
@@ -1379,8 +1367,7 @@ mod tests {
 
     #[test]
     fn uncached_native_hint_describes_the_retained_current_value() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = site(&runtime);
         let poison = runtime
             .into_jsvalue(context.eval("({get x(){throw 1}})").unwrap())
@@ -1426,8 +1413,7 @@ mod tests {
 
     #[test]
     fn owned_ic_promotes_every_public_value_and_reads_current_slot() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         for expression in [
             "undefined",
             "null",
@@ -1489,8 +1475,7 @@ mod tests {
 
     #[test]
     fn owned_ic_native_hint_is_bound_to_current_retained_function() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = site(&runtime);
         let base = runtime
             .into_jsvalue(
@@ -1610,8 +1595,7 @@ mod tests {
     #[test]
     fn append_site_learns_then_moves_owners_into_the_shared_successor() {
         use crate::engine::object::FieldStore;
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = store_site_for(&runtime);
         let site = code.property_append_ic.site(pc).unwrap();
         let value = runtime
@@ -1688,8 +1672,7 @@ mod tests {
     #[test]
     fn existing_slot_site_learns_and_declines_reconfigured_layouts() {
         use crate::engine::object::FieldStore;
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = store_site_for(&runtime);
         let site = code.property_append_ic.site(pc).unwrap();
         let mut make = |source: &str| runtime.into_jsvalue(context.eval(source).unwrap()).unwrap();
@@ -1761,8 +1744,7 @@ mod tests {
     #[test]
     fn append_site_declines_changed_prototypes_and_receiver_capabilities() {
         use crate::engine::object::FieldStore;
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = store_site_for(&runtime);
         let site = code.property_append_ic.site(pc).unwrap();
         drop(
@@ -1845,8 +1827,7 @@ mod tests {
     fn rejected_append_site_hit_restores_input_and_both_shapes() {
         use crate::engine::heap::RawId;
         use crate::engine::object::FieldStore;
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let (code, pc, key) = store_site_for(&runtime);
         let site = code.property_append_ic.site(pc).unwrap();
         let learned = runtime.into_jsvalue(context.eval("({})").unwrap()).unwrap();

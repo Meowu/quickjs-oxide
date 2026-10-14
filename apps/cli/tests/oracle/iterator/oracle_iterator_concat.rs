@@ -1,16 +1,14 @@
 use super::quickjs_string_result_oracle::observe_string_result;
+use crate::grouped_case_oracle::assert_grouped_cases_agree;
+use crate::object_graph_observation::checked_property_value as object_property;
+use crate::oracle_cases::GroupedCase as Case;
+use crate::runtime_completion_oracle::observe_oxide;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use crate::runtime_observation::{
     property_callable_with_read_context as property_callable, take_exception_object,
 };
 use crate::runtime_oracle::eval_object;
-use quickjs_oxide::engine::api::{Context, ObjectRef, Runtime, RuntimeError, Value};
-
-struct Case {
-    group: &'static str,
-    description: &'static str,
-    source: &'static str,
-    expected: &'static str,
-}
+use quickjs_oxide::engine::api::{RuntimeError, Value};
 
 const ORACLE_WRAPPER: &str = r#"
 var value = std.evalScript(scriptArgs[0]);
@@ -654,82 +652,42 @@ const CASES: &[Case] = &[
 
 #[test]
 fn iterator_concat_matches_pinned_expectations() {
-    let mut failures = Vec::new();
-    for case in CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        let actual = observe_oxide(&mut context, case);
-        if actual != case.expected {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\nactual: {:?}\nexpected: {:?}",
-                case.group, case.description, case.source, actual, case.expected,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "Iterator.concat pinned expectations failed in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    assert_grouped_cases_agree(
+        CASES,
+        "Iterator.concat pinned expectations failed",
+        ["actual", "expected"],
+        |case| {
+            let (_runtime, mut context) = host_runtime_context();
+            observe_oxide(&mut context, case)
+        },
+        |case| case.expected.to_owned(),
     );
 }
 
 #[test]
 fn iterator_concat_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP Iterator.concat oracle self-check: \
-             set QJS_ORACLE to pinned upstream qjs"
-        );
-        return;
-    };
-    let mut failures = Vec::new();
-    for case in CASES {
-        let actual = observe_string_result(&oracle, case.source, case.description, ORACLE_WRAPPER);
-        if actual != case.expected {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\nactual: {:?}\nexpected: {:?}",
-                case.group, case.description, case.source, actual, case.expected,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "pinned QuickJS Iterator.concat vectors drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    let oracle = require_pinned_qjs_oracle!("Iterator.concat oracle self-check");
+    assert_grouped_cases_agree(
+        CASES,
+        "pinned QuickJS Iterator.concat vectors drifted",
+        ["actual", "expected"],
+        |case| observe_string_result(&oracle, case.source, case.description, ORACLE_WRAPPER),
+        |case| case.expected.to_owned(),
     );
 }
 
 #[test]
 fn iterator_concat_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP Iterator.concat differential: \
-             set QJS_ORACLE to pinned upstream qjs"
-        );
-        return;
-    };
-    let mut failures = Vec::new();
-    for case in CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        let oxide = observe_oxide(&mut context, case);
-        let quickjs = observe_string_result(&oracle, case.source, case.description, ORACLE_WRAPPER);
-        if oxide != quickjs {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\noxide: {:?}\nquickjs: {:?}",
-                case.group, case.description, case.source, oxide, quickjs,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "Iterator.concat semantics drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    let oracle = require_pinned_qjs_oracle!("Iterator.concat differential");
+    assert_grouped_cases_agree(
+        CASES,
+        "Iterator.concat semantics drifted",
+        ["oxide", "quickjs"],
+        |case| {
+            let (_runtime, mut context) = host_runtime_context();
+            observe_oxide(&mut context, case)
+        },
+        |case| observe_string_result(&oracle, case.source, case.description, ORACLE_WRAPPER),
     );
 }
 
@@ -742,8 +700,7 @@ fn iterator_concat_cross_realm_graph_and_native_next_use_the_current_realm() {
     // current context rather than switching to the inner method's realm. A
     // same-runtime, two-context probe against the pinned libquickjs reports:
     // `sequence-prototype=1:0|step-prototype=1|value-identity=1|native-error=1:0`.
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
 
@@ -869,29 +826,4 @@ fn iterator_concat_cross_realm_graph_and_native_next_use_the_current_realm() {
         runtime.get_prototype_of(&error).unwrap(),
         Some(caller_type_error),
     );
-}
-
-fn observe_oxide(context: &mut Context, case: &Case) -> String {
-    let value = context
-        .eval(case.source)
-        .unwrap_or_else(|error| panic!("Oxide observer failed for {}: {error}", case.description));
-    let Value::String(value) = value else {
-        panic!(
-            "Oxide observer returned a non-String for {}",
-            case.description
-        );
-    };
-    value.to_utf8_lossy()
-}
-
-fn object_property(
-    runtime: &Runtime,
-    context: &mut Context,
-    object: &ObjectRef,
-    name: &str,
-) -> Value {
-    let key = runtime.intern_property_key(name).unwrap();
-    context
-        .get_property(object, &key)
-        .unwrap_or_else(|error| panic!("read {name}: {error}"))
 }

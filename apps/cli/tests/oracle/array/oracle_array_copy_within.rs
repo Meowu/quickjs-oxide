@@ -1,8 +1,8 @@
 use super::support::*;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
-use quickjs_oxide::engine::api::{
-    CompleteOrdinaryPropertyDescriptor, Context, ObjectRef, Runtime, RuntimeError, Value,
-};
+use crate::object_graph_observation::int_property;
+use quickjs_oxide::engine::api::{RuntimeError, Value};
 use std::ffi::OsStr;
 
 // This target pins QuickJS 2026-06-04 `Array.prototype.copyWithin`, including
@@ -223,10 +223,7 @@ print('meta=copyWithin:'+fn.name+':'+fn.length+':'+bits(descriptor)+':'+
 
 #[test]
 fn array_copy_within_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array.copyWithin oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array.copyWithin oracle self-check");
     for &(group, cases) in &[
         ("values", VALUE_CASES),
         ("bounds", BOUND_CASES),
@@ -272,10 +269,7 @@ fn array_copy_within_errors_match_pinned_quickjs() {
 
 #[test]
 fn array_copy_within_prototype_order_and_metadata_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array.copyWithin graph differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array.copyWithin graph differential");
     assert_eq!(
         rust_graph_observations(),
         oracle_graph_observations(&oracle),
@@ -285,8 +279,7 @@ fn array_copy_within_prototype_order_and_metadata_match_pinned_quickjs() {
 
 #[test]
 fn array_copy_within_boxing_native_errors_and_user_throws_use_pinned_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_array_prototype = defining.array_prototype().unwrap();
@@ -416,9 +409,7 @@ fn array_copy_within_boxing_native_errors_and_user_throws_use_pinned_realms() {
 }
 
 fn rust_graph_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let array_prototype = context.array_prototype().unwrap();
     let function_prototype = context.function_prototype().unwrap();
     let implemented = [
@@ -462,66 +453,4 @@ fn rust_graph_observations() -> Vec<String> {
 
 fn oracle_graph_observations(oracle: &OsStr) -> Vec<String> {
     super::quickjs_oracle::eval_std_lines(oracle, GRAPH_ORACLE, "Array.copyWithin graph oracle")
-}
-
-fn method_metadata(
-    runtime: &Runtime,
-    context: &mut Context,
-    owner: &ObjectRef,
-    function_prototype: &ObjectRef,
-    name: &str,
-) -> String {
-    let key = runtime.intern_property_key(name).unwrap();
-    let descriptor = runtime
-        .get_own_property(owner, &key)
-        .unwrap()
-        .unwrap_or_else(|| panic!("missing Array.prototype.{name}"));
-    let CompleteOrdinaryPropertyDescriptor::Data {
-        value: Value::Object(function),
-        writable,
-        enumerable,
-        configurable,
-    } = &descriptor
-    else {
-        panic!("Array.prototype.{name} was not a function data property");
-    };
-    let callable = runtime
-        .as_callable(function)
-        .unwrap()
-        .unwrap_or_else(|| panic!("Array.prototype.{name} was not callable"));
-    let function_name = context
-        .get_property(function, &runtime.intern_property_key("name").unwrap())
-        .unwrap();
-    let function_length = context
-        .get_property(function, &runtime.intern_property_key("length").unwrap())
-        .unwrap();
-    let name_descriptor = runtime
-        .get_own_property(function, &runtime.intern_property_key("name").unwrap())
-        .unwrap()
-        .expect("Array.copyWithin name descriptor");
-    let length_descriptor = runtime
-        .get_own_property(function, &runtime.intern_property_key("length").unwrap())
-        .unwrap()
-        .expect("Array.copyWithin length descriptor");
-    format!(
-        "{name}:{}:{}:D{}{}{}:{}:{}:{}:{}:{}",
-        primitive_value_text(function_name),
-        primitive_value_text(function_length),
-        Number(*writable),
-        Number(*enumerable),
-        Number(*configurable),
-        data_descriptor_bits(&name_descriptor),
-        data_descriptor_bits(&length_descriptor),
-        true,
-        runtime.get_prototype_of(function).unwrap().as_ref() == Some(function_prototype),
-        runtime.is_constructor(callable.as_object()).unwrap(),
-    )
-}
-
-fn int_property(runtime: &Runtime, context: &mut Context, object: &ObjectRef, name: &str) -> i32 {
-    let key = runtime.intern_property_key(name).unwrap();
-    let Value::Int(value) = context.get_property(object, &key).unwrap() else {
-        panic!("{name} was not an Int property");
-    };
-    value
 }

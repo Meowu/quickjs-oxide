@@ -1,7 +1,10 @@
+use crate::oracle_cases::{CompileCase, ExpectedMatchCase as MatchCase};
+use crate::runtime_completion_oracle::observe_rust_result;
+use crate::runtime_observation::utf16;
+use crate::support::regexp_probe_oracle::{MatchProbe, run_compile_probes, run_match_probes};
 use quickjs_oxide::engine::api::JsString;
 use quickjs_oxide::regexp::{CompileErrorKind, compile, execute};
 use std::ffi::OsStr;
-use std::fmt::Write as _;
 
 // Differential lock for pinned QuickJS 2026-06-04 Unicode property escapes.
 //
@@ -12,23 +15,6 @@ use std::fmt::Write as _;
 // pin representative canonical and short aliases, exact parser diagnostics,
 // class placement, Annex B non-Unicode identity behavior, the Unicode
 // ignoreCase ordering for \P, scoped modifiers, and UTF-16/code-point edges.
-
-#[derive(Debug)]
-struct MatchCase {
-    label: &'static str,
-    pattern: Vec<u16>,
-    flags: &'static str,
-    input: Vec<u16>,
-    expected: &'static str,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CompileCase {
-    label: &'static str,
-    pattern: &'static str,
-    flags: &'static str,
-    expected: &'static str,
-}
 
 const COMPILE_CASES: &[CompileCase] = &[
     CompileCase {
@@ -203,10 +189,7 @@ const COMPILE_CASES: &[CompileCase] = &[
 
 #[test]
 fn regexp_unicode_property_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP RegExp Unicode property oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("RegExp Unicode property oracle self-check");
 
     let cases = match_cases();
     let observations = run_match_oracle(&oracle, &cases);
@@ -232,10 +215,7 @@ fn regexp_unicode_property_oracle_vectors_self_check() {
 
 #[test]
 fn regexp_unicode_properties_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP RegExp Unicode property differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("RegExp Unicode property differential");
 
     let cases = match_cases();
     let oracle_observations = run_match_oracle(&oracle, &cases);
@@ -551,10 +531,6 @@ fn ascii(
     }
 }
 
-fn utf16(value: &str) -> Vec<u16> {
-    value.encode_utf16().collect()
-}
-
 fn observe_rust_match(case: &MatchCase) -> String {
     let pattern = JsString::try_from_utf16(case.pattern.iter().copied()).unwrap();
     let flags = JsString::try_from_utf8(case.flags).unwrap();
@@ -587,125 +563,30 @@ fn observe_rust_compile(case: &CompileCase) -> String {
     }
 }
 
-fn observe_rust_result(
-    result: Option<&quickjs_oxide::regexp::RegExpMatch>,
-    input: &[u16],
-) -> String {
-    let Some(result) = result else {
-        return "N".to_owned();
-    };
-    let complete = result
-        .capture(0)
-        .expect("a successful match has capture zero");
-    let mut output = format!("M|{}|{}", complete.start, result.captures().len());
-    for capture in result.captures() {
-        match capture {
-            None => output.push_str("|U"),
-            Some(range) => {
-                write!(output, "|{},{}:", range.start, range.end).unwrap();
-                for unit in &input[range.clone()] {
-                    write!(output, "{unit:04x}").unwrap();
-                }
-            }
-        }
-    }
-    output
-}
-
 fn run_match_oracle(oracle: &OsStr, cases: &[MatchCase]) -> Vec<String> {
-    let mut source = String::from(
-        r#"
-function __qjo_hex_utf16(value) {
-    var result = "";
-    for (var i = 0; i < value.length; i++)
-        result += ("0000" + value.charCodeAt(i).toString(16)).slice(-4);
-    return result;
-}
-function __qjo_observe_unicode_property(test) {
-    var flags = test.flags;
-    if (flags.indexOf("d") < 0) flags += "d";
-    if (flags.indexOf("g") < 0 && flags.indexOf("y") < 0) flags += "g";
-    var regexp = new RegExp(test.pattern, flags);
-    var match = regexp.exec(test.input);
-    if (match === null) return "N";
-    var fields = ["M", String(match.index), String(match.length)];
-    for (var i = 0; i < match.length; i++) {
-        if (match[i] === undefined) {
-            fields.push("U");
-        } else {
-            var range = match.indices[i];
-            fields.push(String(range[0]) + "," + String(range[1]) + ":" +
-                        __qjo_hex_utf16(match[i]));
-        }
-    }
-    return fields.join("|");
-}
-var __qjo_unicode_property_cases = [
-"#,
-    );
-    for case in cases {
-        writeln!(
-            source,
-            "{{pattern:{},flags:{:?},input:{}}},",
-            js_utf16(&case.pattern),
-            case.flags,
-            js_utf16(&case.input),
-        )
-        .unwrap();
-    }
-    source.push_str(
-        r#"];
-for (var __qjo_i = 0; __qjo_i < __qjo_unicode_property_cases.length; __qjo_i++)
-    print(__qjo_i + "|" +
-          __qjo_observe_unicode_property(__qjo_unicode_property_cases[__qjo_i]));
-"#,
-    );
-    super::quickjs_indexed_oracle::eval_indexed_plain_lines(
+    let probes = cases
+        .iter()
+        .map(|case| MatchProbe {
+            pattern: &case.pattern,
+            flags: case.flags,
+            input: &case.input,
+            start: None,
+        })
+        .collect::<Vec<_>>();
+    run_match_probes(
         oracle,
-        &source,
-        cases.len(),
+        "_unicode_property",
+        &probes,
         "RegExp Unicode property matching",
     )
 }
 
 fn run_compile_oracle(oracle: &OsStr, cases: &[CompileCase]) -> Vec<String> {
-    let mut source = String::from("var __qjo_unicode_property_compile_cases = [\n");
-    for case in cases {
-        writeln!(
-            source,
-            "{{pattern:{},flags:{:?}}},",
-            js_utf16(&utf16(case.pattern)),
-            case.flags,
-        )
-        .unwrap();
-    }
-    source.push_str(
-        r#"];
-for (var __qjo_i = 0; __qjo_i < __qjo_unicode_property_compile_cases.length; __qjo_i++) {
-    var result = "ok";
-    try {
-        new RegExp(__qjo_unicode_property_compile_cases[__qjo_i].pattern,
-                   __qjo_unicode_property_compile_cases[__qjo_i].flags);
-    } catch (error) {
-        result = error.name + "|" + error.message;
-    }
-    print(__qjo_i + "|" + result);
-}
-"#,
-    );
-    super::quickjs_indexed_oracle::eval_indexed_plain_lines(
+    run_compile_probes(
         oracle,
-        &source,
-        cases.len(),
+        "_unicode_property",
+        cases,
+        r#"error.name + "|" + error.message"#,
         "RegExp Unicode property grammar",
     )
-}
-
-fn js_utf16(units: &[u16]) -> String {
-    let mut source = String::from("\"");
-    for unit in units {
-        write!(source, "\\u{unit:04x}").unwrap();
-    }
-    source.push('"');
-    source
 }

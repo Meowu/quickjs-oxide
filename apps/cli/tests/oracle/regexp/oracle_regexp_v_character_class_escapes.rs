@@ -1,3 +1,5 @@
+use crate::oracle_cases::ExpectedMatchCase as MatchCase;
+use crate::runtime_observation::from_char_code_source as js_utf16;
 use quickjs_oxide::engine::api::JsString;
 use quickjs_oxide::regexp::{CompileErrorKind, compile, execute};
 use std::ffi::OsStr;
@@ -5,15 +7,6 @@ use std::fmt::Write as _;
 
 // Differential lock for pinned QuickJS 2026-06-04 Unicode Sets parsing,
 // string/range algebra, and execution ordering.
-
-#[derive(Debug)]
-struct MatchCase {
-    label: &'static str,
-    pattern: Vec<u16>,
-    flags: &'static str,
-    input: Vec<u16>,
-    expected: &'static str,
-}
 
 #[test]
 fn regexp_v_character_classes_match_expected_semantics() {
@@ -339,13 +332,4 @@ fn observe_quickjs(oracle: &OsStr, cases: &[MatchCase]) -> Vec<String> {
         cases.len(),
         "RegExp v character class escapes",
     )
-}
-
-fn js_utf16(units: &[u16]) -> String {
-    let values = units
-        .iter()
-        .map(|unit| format!("0x{unit:04x}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("String.fromCharCode({values})")
 }

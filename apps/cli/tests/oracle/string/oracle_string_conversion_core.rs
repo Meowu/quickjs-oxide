@@ -1,7 +1,15 @@
+use crate::object_graph_observation::{
+    checked_data_flags as data_flags, define_builtin_data_key as define_data_key,
+    define_named_builtin_data as define_data, eval_callable, global_object_value as global_value,
+    intrinsic_prototype, own_key_names,
+};
+use crate::object_graph_observation::{define_accessor, define_accessor_key};
+use crate::runtime_observation::hex;
+use crate::runtime_observation::take_hex_error as take_error;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use crate::runtime_observation::{property_callable, take_error_object as take_exception_object};
 use quickjs_oxide::engine::api::{
-    AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DescriptorField,
-    JsString, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError, Value,
+    CallableRef, Context, JsString, ObjectRef, PropertyKey, Runtime, RuntimeError, Value,
     WellKnownSymbol,
 };
 
@@ -109,10 +117,7 @@ print("tag-throw=" + [tagThrow, hex(vo.call(tagThis)),
 
 #[test]
 fn string_conversion_core_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP String conversion-core differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("String conversion-core differential");
     assert_eq!(
         rust_observations(),
         super::quickjs_oracle::eval_std_lines(&oracle, ORACLE_PROBE, "String conversion-core",),
@@ -121,9 +126,7 @@ fn string_conversion_core_matches_pinned_quickjs() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let prototype = context.string_prototype().unwrap();
     let object_prototype = context.object_prototype().unwrap();
@@ -335,8 +338,7 @@ fn rust_observations() -> Vec<String> {
 
 #[test]
 fn string_conversion_core_cross_realm_and_error_realm_match_quickjs() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut first = runtime.new_context().expect("create context");
     let mut second = runtime.new_context().expect("create context");
     let first_string = first.string_prototype().unwrap();
@@ -403,8 +405,7 @@ fn string_conversion_core_cross_realm_and_error_realm_match_quickjs() {
 
 #[test]
 fn string_conversion_core_wrapper_realm_graph_is_collectable() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let wrapper = {
         let mut context = runtime.new_context().expect("create context");
         let object = context.object_prototype().unwrap();
@@ -470,120 +471,6 @@ fn signature(runtime: &Runtime, context: &mut Context, callable: &CallableRef) -
     )
 }
 
-fn define_data(runtime: &Runtime, object: &ObjectRef, name: &str, value: Value) {
-    let key = runtime.intern_property_key(name).unwrap();
-    define_data_key(runtime, object, &key, value);
-}
-
-fn define_data_key(runtime: &Runtime, object: &ObjectRef, key: &PropertyKey, value: Value) {
-    assert!(
-        runtime
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(true),
-                    enumerable: DescriptorField::Present(false),
-                    configurable: DescriptorField::Present(true),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap()
-    );
-}
-
-fn define_accessor(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    name: &str,
-    get: Option<CallableRef>,
-    set: Option<CallableRef>,
-) {
-    let key = runtime.intern_property_key(name).unwrap();
-    define_accessor_key(runtime, object, &key, get, set);
-}
-
-fn define_accessor_key(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    key: &PropertyKey,
-    get: Option<CallableRef>,
-    set: Option<CallableRef>,
-) {
-    assert!(
-        runtime
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    get: DescriptorField::Present(
-                        get.map_or(AccessorValue::Undefined, AccessorValue::Callable),
-                    ),
-                    set: DescriptorField::Present(
-                        set.map_or(AccessorValue::Undefined, AccessorValue::Callable),
-                    ),
-                    enumerable: DescriptorField::Present(false),
-                    configurable: DescriptorField::Present(true),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap()
-    );
-}
-
-fn eval_callable(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("callable source did not produce an object: {source:?}");
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("source did not produce a callable: {source:?}"))
-}
-
-fn global_value(runtime: &Runtime, context: &mut Context, global: &ObjectRef, name: &str) -> Value {
-    context
-        .get_property(global, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-}
-
-fn own_key_names(runtime: &Runtime, object: &ObjectRef) -> Vec<String> {
-    runtime
-        .own_property_keys(object)
-        .unwrap()
-        .iter()
-        .map(|key| {
-            runtime
-                .property_key_to_js_string(key)
-                .unwrap()
-                .to_utf8_lossy()
-        })
-        .collect()
-}
-
-fn data_flags(runtime: &Runtime, object: &ObjectRef, name: &str) -> String {
-    let descriptor = runtime
-        .get_own_property(object, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-        .unwrap_or_else(|| panic!("{name} descriptor was absent"));
-    let CompleteOrdinaryPropertyDescriptor::Data {
-        writable,
-        enumerable,
-        configurable,
-        ..
-    } = descriptor
-    else {
-        panic!("{name} descriptor was not data");
-    };
-    format!(
-        "{}{}{}",
-        u8::from(writable),
-        u8::from(enumerable),
-        u8::from(configurable)
-    )
-}
-
 fn observe_call(
     runtime: &Runtime,
     context: &mut Context,
@@ -621,48 +508,4 @@ fn encoded_value(value: Value) -> String {
         Value::Symbol(_) => panic!("unexpected Symbol observation"),
         Value::Object(_) => panic!("unexpected Object observation"),
     }
-}
-
-fn take_error(runtime: &Runtime, context: &mut Context) -> String {
-    let error = take_exception_object(context);
-    let name = error_string(runtime, context, &error, "name");
-    let message = error_string(runtime, context, &error, "message");
-    format!("throw:{}:{}", hex(&name), hex(&message))
-}
-
-fn error_string(
-    runtime: &Runtime,
-    context: &mut Context,
-    error: &ObjectRef,
-    name: &str,
-) -> JsString {
-    let Value::String(value) = context
-        .get_property(error, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-    else {
-        panic!("Error.{name} was not a String");
-    };
-    value
-}
-
-fn intrinsic_prototype(runtime: &Runtime, context: &mut Context, name: &str) -> ObjectRef {
-    let global = context.global_object().unwrap();
-    let constructor = property_callable(runtime, context, &global, name);
-    let Value::Object(prototype) = context
-        .get_property(
-            constructor.as_object(),
-            &runtime.intern_property_key("prototype").unwrap(),
-        )
-        .unwrap()
-    else {
-        panic!("{name}.prototype was not an object");
-    };
-    prototype
-}
-
-fn hex(value: &JsString) -> String {
-    value
-        .utf16_units()
-        .map(|unit| format!("{unit:04x}"))
-        .collect()
 }

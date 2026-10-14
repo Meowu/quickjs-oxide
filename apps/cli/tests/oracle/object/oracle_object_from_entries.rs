@@ -1,15 +1,16 @@
+use crate::object_graph_observation::object_static_after_delete;
 use crate::object_graph_observation::{
     data_bits, data_descriptor, eval_object, global_callable, int_property, intrinsic_prototype,
     oracle_lines, own_key_names,
 };
 use crate::quickjs_oracle::observe_completion as observe_oracle;
 use crate::runtime_completion_oracle::compare_eval_completion_cases as compare_cases;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
 use crate::runtime_observation::{
     property_callable, string_property, take_pending_exception_object as take_exception_object,
 };
-use crate::runtime_oracle::value_type;
-use quickjs_oxide::engine::api::{JsString, Runtime, RuntimeError, Value};
+use quickjs_oxide::engine::api::{JsString, RuntimeError, Value};
 use std::ffi::OsStr;
 
 // Pins QuickJS 2026-06-04 `js_object_fromEntries`. In particular, the
@@ -351,10 +352,7 @@ print([deleted,'fromEntries' in Object,Object.prototype.hasOwnProperty.call(Obje
 
 #[test]
 fn object_from_entries_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Object.fromEntries oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Object.fromEntries oracle self-check");
     for &(group, cases) in &[
         ("values", VALUE_CASES),
         ("order and close", ORDER_CASES),
@@ -403,10 +401,7 @@ fn object_from_entries_exotic_surfaces_match_pinned_quickjs() {
 
 #[test]
 fn object_from_entries_graph_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Object.fromEntries graph: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Object.fromEntries graph");
     assert_eq!(
         rust_graph_observations(),
         oracle_graph_observations(&oracle),
@@ -416,46 +411,18 @@ fn object_from_entries_graph_matches_pinned_quickjs() {
 
 #[test]
 fn object_from_entries_autoinit_can_be_deleted_before_materialization() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Object.fromEntries AutoInit delete: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Object.fromEntries AutoInit delete");
     let expected = oracle_lines(
         &oracle,
         FRESH_DELETE_ORACLE,
         "Object.fromEntries fresh delete",
     );
-
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
-    let object = global_callable(&runtime, &mut context, "Object");
-    let key = runtime.intern_property_key("fromEntries").unwrap();
-    let deleted = runtime
-        .delete_property(object.as_object(), &key)
-        .unwrap()
-        .to_string();
-    let Value::Bool(in_object) = context.eval("'fromEntries' in Object").unwrap() else {
-        panic!("Object.fromEntries inherited-presence probe was not boolean");
-    };
-    let own = runtime
-        .has_own_property(object.as_object(), &key)
-        .unwrap()
-        .to_string();
-    let kind = value_type(
-        &runtime,
-        &context.get_property(object.as_object(), &key).unwrap(),
-    );
-    assert_eq!(
-        vec![format!("{deleted}|{in_object}|{own}|{kind}")],
-        expected,
-    );
+    assert_eq!(vec![object_static_after_delete("fromEntries")], expected);
 }
 
 #[test]
 fn object_from_entries_uses_defining_realm_and_preserves_user_throws() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_object = global_callable(&runtime, &mut defining, "Object");
@@ -572,8 +539,7 @@ fn object_from_entries_uses_defining_realm_and_preserves_user_throws() {
 
 #[test]
 fn object_from_entries_method_and_result_retain_then_release_their_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let (from_entries, result) = {
         let mut first = runtime.new_context().expect("create context");
         let mut second = runtime.new_context().expect("create context");
@@ -636,9 +602,7 @@ fn object_from_entries_method_and_result_retain_then_release_their_realm() {
 }
 
 fn rust_graph_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let function_prototype = context.function_prototype().unwrap();
     let object = global_callable(&runtime, &mut context, "Object");
     let selected = [

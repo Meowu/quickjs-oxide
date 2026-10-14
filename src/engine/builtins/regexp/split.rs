@@ -220,7 +220,7 @@ impl Runtime {
     /// The split loop itself, so `call_standard_regexp_split` stays a thin
     /// shell around allocation and error cleanup. A `Throw` outcome leaves
     /// `array` released by the caller.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn standard_regexp_split_loop(
         &self,
         program: &Rc<CompiledRegExp>,
@@ -276,7 +276,7 @@ impl Runtime {
                 return Ok(StandardSplitOutcome::Complete);
             }
             p = e;
-            for range in matched.captures()[1..].iter() {
+            for range in &matched.captures()[1..] {
                 self.push_standard_split_piece(
                     array,
                     input,

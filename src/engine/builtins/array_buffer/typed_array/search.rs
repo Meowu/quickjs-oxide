@@ -20,8 +20,6 @@ use crate::engine::{
 };
 
 #[cfg(test)]
-use crate::engine::value::Value;
-#[cfg(test)]
 mod tests;
 
 impl Runtime {
@@ -326,7 +324,7 @@ impl TypedSearchResume {
                 } else {
                     Completion::Return(
                         runtime
-                            .typed_array_read_index_jsvalue(&self.0.target, index as u64)?
+                            .typed_array_read_index_jsvalue(&self.0.target, index.cast_unsigned())?
                             .unwrap_or(JsValue::Undefined),
                     )
                 }

@@ -1,15 +1,13 @@
 use super::quickjs_syntax_diagnostic_oracle::observe_cmdline_syntax_error as oracle_diagnostic_observation;
+use crate::runtime_observation::host_runtime_context;
 use quickjs_oxide::engine::api::testing::{Lexer, TokenKind};
-use quickjs_oxide::engine::api::{Runtime, RuntimeError, Value};
+use quickjs_oxide::engine::api::{RuntimeError, Value};
 use std::ffi::OsStr;
 use std::process::Command;
 
 #[test]
 fn unicode_identifier_execution_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Unicode identifier differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Unicode identifier differential");
 
     let newest_unicode_17_start = char::from_u32(0x33479).unwrap();
     let cases = vec![
@@ -71,9 +69,7 @@ fn unicode_identifier_execution_matches_pinned_quickjs() {
         ),
     ];
 
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     for (description, source) in cases {
         assert_eq!(
             context.eval(&source).unwrap_or_else(|error| {
@@ -92,10 +88,7 @@ fn unicode_identifier_execution_matches_pinned_quickjs() {
 
 #[test]
 fn unicode_17_identifier_classification_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Unicode table differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Unicode table differential");
 
     let rust = rust_classification_observation();
     let source = r#"
@@ -144,10 +137,7 @@ print(startCount + "|" + continueCount + "|" + hash + "|" + planes.join(";"));
 
 #[test]
 fn escaped_new_target_pseudo_keyword_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP escaped new.target differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("escaped new.target differential");
 
     for source in [
         r"(function(){ return new.\u0074arget; })()",
@@ -166,10 +156,7 @@ fn escaped_new_target_pseudo_keyword_matches_pinned_quickjs() {
 
 #[test]
 fn identifier_diagnostic_priority_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP identifier diagnostic differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("identifier diagnostic differential");
 
     let cases = [
         (
@@ -379,9 +366,7 @@ fn oracle_number_observation(oracle: &OsStr, source: &str, description: &str) ->
 }
 
 fn rust_error_observation(source: &str) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(context.eval(source), Err(RuntimeError::Exception));
     let Value::Object(error) = context.take_exception().unwrap().unwrap() else {
         panic!("Rust parser did not materialize an Error object for {source:?}");
@@ -415,9 +400,7 @@ fn oracle_error_observation(oracle: &OsStr, source: &str) -> String {
 }
 
 fn rust_diagnostic_observation(source: &str) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(context.eval(source), Err(RuntimeError::Exception));
     let Value::Object(error) = context.take_exception().unwrap().unwrap() else {
         panic!("Rust parser did not materialize an Error object for {source:?}");

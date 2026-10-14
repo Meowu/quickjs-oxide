@@ -1,33 +1,14 @@
-use quickjs_oxide::engine::api::{Context, PendingJobOutcome, Runtime, RuntimeError, Value};
+use crate::runtime_observation::host_runtime_context;
+use crate::runtime_observation::{eval, string_text as text};
+use quickjs_oxide::engine::api::{PendingJobOutcome, Value};
 
 const FIXTURE: &str = include_str!("../fixtures/inputs/create_realm_host.js");
 const QUICKJS_2026_06_04: &str =
     include_str!("../fixtures/expected/create_realm_host.quickjs-2026-06-04.txt");
 
-fn eval(context: &mut Context, source: &str) -> Value {
-    context.eval(source).unwrap_or_else(|error| {
-        if error == RuntimeError::Exception {
-            panic!(
-                "unexpected JavaScript exception: {:?}",
-                context.take_exception()
-            );
-        }
-        panic!("unexpected engine error: {error}");
-    })
-}
-
-fn text(value: Value) -> String {
-    let Value::String(value) = value else {
-        panic!("expected a string value");
-    };
-    value.to_utf8_lossy()
-}
-
 #[test]
 fn test262_create_realm_and_eval_script_match_pinned_quickjs_transcript() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let installed = context
         .install_test262_host()
         .expect("install Test262 host surface");
@@ -71,9 +52,7 @@ fn test262_create_realm_and_eval_script_match_pinned_quickjs_transcript() {
 
 #[test]
 fn returned_child_host_retains_and_then_releases_its_realm_cycle() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let parent_262 = context
         .install_test262_host()
         .expect("install parent Test262 host surface");

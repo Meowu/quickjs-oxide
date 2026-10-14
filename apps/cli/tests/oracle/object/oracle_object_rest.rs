@@ -1,5 +1,6 @@
+use crate::runtime_completion_oracle::compare_object_pattern_cases as compare_cases;
 use crate::runtime_completion_oracle::observe_legacy_float_eval_completion as observe_rust_eval;
-use quickjs_oxide::engine::api::Runtime;
+use crate::runtime_observation::host_runtime_context;
 
 // Pins QuickJS 2026-06-04 ObjectBindingPattern rest lowering. The excluded-key
 // object is built before CopyDataProperties, and the rest target is a fresh
@@ -338,10 +339,7 @@ fn object_rest_abrupt_completion_matches_pinned_quickjs() {
 
 #[test]
 fn object_rest_parser_diagnostics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP object-rest parser differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("object-rest parser differential");
     for &(description, source) in PARSER_CASES {
         let rust = super::quickjs_object_pattern_oracle::run_cli_exact(
             env!("CARGO_BIN_EXE_qjs").as_ref(),
@@ -358,32 +356,9 @@ fn object_rest_parser_diagnostics_match_pinned_quickjs() {
 
 #[test]
 fn object_rest_smoke_runs_without_an_oracle() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(
         observe_rust_eval(&runtime, &mut context, SMOKE_SOURCE, "object-rest smoke"),
         "return|string|1|other:40|1:2",
     );
-}
-
-fn compare_cases(group: &str, cases: &[(&str, &str)]) {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP {group} differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
-    for &(description, source) in cases {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        assert_eq!(
-            observe_rust_eval(&runtime, &mut context, source, description),
-            super::quickjs_object_pattern_oracle::observe_completion_strip_one_lf(
-                &oracle,
-                source,
-                description,
-            ),
-            "{group} drifted for {description}: {source:?}",
-        );
-    }
 }

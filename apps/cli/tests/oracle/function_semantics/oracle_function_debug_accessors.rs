@@ -1,3 +1,6 @@
+use crate::object_graph_observation::bit;
+use crate::runtime_observation::hex;
+use crate::runtime_observation::host_runtime;
 use quickjs_oxide::engine::api::{
     CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DebugInfoMode, DescriptorField,
     JsString, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, Runtime, Value, WellKnownSymbol,
@@ -106,10 +109,7 @@ print("invalid-receivers=" + getters.map(function (getter) {
 
 #[test]
 fn function_debug_accessors_and_strip_modes_match_quickjs_oracle() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP function debug accessor differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("function debug accessor differential");
 
     for (mode, oracle_flag) in [
         (DebugInfoMode::Full, None),
@@ -125,8 +125,7 @@ fn function_debug_accessors_and_strip_modes_match_quickjs_oracle() {
 }
 
 fn rust_observations(mode: DebugInfoMode) -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     runtime
         .set_debug_info_mode(mode)
         .expect("set runtime configuration");
@@ -474,17 +473,6 @@ fn plain_value(value: Value) -> String {
         Value::String(value) => value.to_utf8_lossy(),
         Value::Symbol(_) | Value::Object(_) => panic!("unexpected observation value"),
     }
-}
-
-fn hex(value: &JsString) -> String {
-    value
-        .utf16_units()
-        .map(|unit| format!("{unit:04x}"))
-        .collect()
-}
-
-const fn bit(value: bool) -> u8 {
-    value as u8
 }
 
 fn oracle_observations(oracle: &OsStr, flag: Option<&str>) -> Vec<String> {

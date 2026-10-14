@@ -1,9 +1,9 @@
 use super::quickjs_argv_completion_oracle::observe_completion_argv_sequence_strip_one_lf as observe_oracle_sequence;
 use crate::runtime_completion_oracle::observe_legacy_float_eval_completion as observe_rust_eval;
-use crate::runtime_oracle::run_cli;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
-use quickjs_oxide::engine::api::{JsString, Runtime, Value};
-use std::ffi::OsStr;
+use crate::runtime_completion_oracle::compare_cli;
+use quickjs_oxide::engine::api::{JsString, Value};
 
 const VALUE_CASES: &[(&str, &str)] = &[
     (
@@ -139,15 +139,10 @@ const SYNTAX_ERROR_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn block_function_values_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP block-function differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("block-function differential");
 
     for &(description, source) in VALUE_CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         assert_eq!(
             observe_rust_eval(&runtime, &mut context, source, description),
             observe_oracle_sequence(&oracle, &[source], description),
@@ -158,15 +153,10 @@ fn block_function_values_match_pinned_quickjs() {
 
 #[test]
 fn block_function_errors_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP block-function error differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("block-function error differential");
 
     for &(description, source) in ERROR_CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         assert_eq!(
             observe_rust_eval(&runtime, &mut context, source, description),
             observe_oracle_sequence(&oracle, &[source], description),
@@ -177,20 +167,13 @@ fn block_function_errors_match_pinned_quickjs() {
 
 #[test]
 fn escaped_block_lexical_after_failed_initializer_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP block-function failed-initializer differential: set QJS_ORACLE to upstream qjs"
-        );
-        return;
-    };
+    let oracle = require_qjs_oracle!("block-function failed-initializer differential");
     let description = "failed block lexical initializer preserves the escaped function cell";
     let sources = [
         "(function(){{function escapedBlock(){return later}Function.savedBlock=escapedBlock;let later=missingBlockInitializer}})()",
         "Function.savedBlock()",
     ];
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let rust = sources
         .iter()
         .map(|source| observe_rust_eval(&runtime, &mut context, source, description))
@@ -205,19 +188,14 @@ fn escaped_block_lexical_after_failed_initializer_matches_pinned_quickjs() {
 
 #[test]
 fn program_annex_then_lexical_state_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP block-function global-state differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("block-function global-state differential");
     let description = "Annex global var precedes a later global lexical";
     let sources = [
         "{function orderedGlobalCollision(){}}let orderedGlobalCollision;",
         "typeof globalThis.orderedGlobalCollision",
         "orderedGlobalCollision",
     ];
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let rust = sources
         .iter()
         .map(|source| observe_rust_eval(&runtime, &mut context, source, description))
@@ -232,10 +210,7 @@ fn program_annex_then_lexical_state_matches_pinned_quickjs() {
 
 #[test]
 fn block_function_full_and_strip_debug_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP block-function stack differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("block-function stack differential");
 
     for &(description, source) in STACK_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -245,10 +220,7 @@ fn block_function_full_and_strip_debug_stacks_match_pinned_quickjs() {
 
 #[test]
 fn block_function_parser_diagnostics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP block-function parser differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("block-function parser differential");
 
     for &(description, source) in SYNTAX_ERROR_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -259,8 +231,7 @@ fn block_function_parser_diagnostics_match_pinned_quickjs() {
 fn block_function_cross_realm_regression() {
     // Pinned with the QuickJS C API compile-in-A/execute-in-B path. The Rust
     // API exposes the same operation directly, so this remains unconditional.
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     drop(defining.eval("globalThis.realmTag='A'").unwrap());
@@ -302,17 +273,4 @@ fn block_function_cross_realm_regression() {
             Value::String(JsString::try_from_utf8("B|false").unwrap())
         );
     }
-}
-
-fn compare_cli(oracle: &OsStr, options: &[&str], source: &str, description: &str) {
-    let rust = run_cli(
-        env!("CARGO_BIN_EXE_qjs").as_ref(),
-        options,
-        source,
-        description,
-    );
-    let quickjs = run_cli(oracle, options, source, description);
-    assert_eq!(rust.status.code(), quickjs.status.code(), "{description}");
-    assert_eq!(rust.stdout, quickjs.stdout, "{description}");
-    assert_eq!(rust.stderr, quickjs.stderr, "{description}");
 }

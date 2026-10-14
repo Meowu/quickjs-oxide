@@ -17,7 +17,11 @@ use crate::engine::object::builtin_properties::NativeBuiltinProperty;
 /// back to the ordinary `Date { ... }` object shell instead of throwing.
 pub(crate) fn qjs_print_iso_string(value: f64) -> Option<String> {
     let fields = calendar::get_date_fields(value, false, false, |_| 0);
-    format::format_date_string(fields.as_ref(), format::DateStringKind::IsoString).ok()
+    format::format_date_string(
+        fields.as_ref(),
+        crate::engine::builtins::native::DateStringMethod::IsoString,
+    )
+    .ok()
 }
 
 impl Runtime {
@@ -295,7 +299,7 @@ mod tests {
         }
 
         fn random_seed(&self) -> u64 {
-            self.random_seed_calls.set(self.random_seed_calls.get() + 1);
+            self.random_seed_calls.update(|value| value + 1);
             self.random_seed
         }
     }

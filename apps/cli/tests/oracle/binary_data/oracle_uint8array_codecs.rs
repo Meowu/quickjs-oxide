@@ -1,21 +1,20 @@
+use crate::object_graph_observation::int_property;
+use crate::oracle_cases::ExpectedCase as Case;
+use crate::runtime_observation::host_runtime;
 use crate::runtime_observation::{
     property_callable_with_read_context as property_callable, take_exception_object,
 };
 use crate::runtime_oracle::eval_object;
-use quickjs_oxide::engine::api::{Context, ObjectRef, Runtime, RuntimeError, Value};
-use std::ffi::OsStr;
-use std::process::Command;
+use crate::string_value_cases::{
+    assert_quickjs_string_cases_match_frozen, assert_string_cases_match_frozen,
+    assert_string_cases_match_quickjs,
+};
+use quickjs_oxide::engine::api::{RuntimeError, Value};
 
 // These vectors freeze the complete Uint8Array base64/hex codec surface in
 // QuickJS 2026-06-04. In particular, they preserve the upstream decoder's
 // complete-quantum capacity rule, partial writes before syntax errors, option
 // getter ordering, WTF-8 rejection, and detached/out-of-bounds revalidation.
-struct Case {
-    description: &'static str,
-    source: &'static str,
-    expected: &'static str,
-}
-
 const PRELUDE: &str = r#"
 function __bit(value){return value?"1":"0"}
 function __bits(object,key){
@@ -513,58 +512,24 @@ const CASES: &[Case] = &[
 
 #[test]
 fn uint8array_codec_vectors_match_frozen_observations() {
-    for case in CASES {
-        assert_eq!(
-            oxide_observation(case),
-            case.expected,
-            "{}",
-            case.description,
-        );
-    }
+    assert_string_cases_match_frozen(Some(PRELUDE), CASES);
 }
 
 #[test]
 fn uint8array_codec_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP Uint8Array codec oracle self-check: \
-             set QJS_ORACLE to pinned upstream qjs"
-        );
-        return;
-    };
-    for case in CASES {
-        assert_eq!(
-            oracle_observation(&oracle, case),
-            case.expected,
-            "{}",
-            case.description,
-        );
-    }
+    let oracle = require_pinned_qjs_oracle!("Uint8Array codec oracle self-check");
+    assert_quickjs_string_cases_match_frozen(&oracle, Some(PRELUDE), CASES);
 }
 
 #[test]
 fn uint8array_codecs_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP Uint8Array codec differential: \
-             set QJS_ORACLE to pinned upstream qjs"
-        );
-        return;
-    };
-    for case in CASES {
-        assert_eq!(
-            oxide_observation(case),
-            oracle_observation(&oracle, case),
-            "{}",
-            case.description,
-        );
-    }
+    let oracle = require_pinned_qjs_oracle!("Uint8Array codec differential");
+    assert_string_cases_match_quickjs(&oracle, Some(PRELUDE), CASES);
 }
 
 #[test]
 fn uint8array_codec_results_and_errors_use_the_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
 
@@ -702,60 +667,4 @@ fn uint8array_codec_results_and_errors_use_the_defining_realm() {
         Some(caller_type_error),
         "Uint8Array codec replaced a caller getter throw",
     );
-}
-
-fn observed_source(source: &str) -> String {
-    format!("{PRELUDE}\n{source}")
-}
-
-fn oxide_observation(case: &Case) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
-    match context.eval(&observed_source(case.source)) {
-        Ok(Value::String(value)) => value.to_utf8_lossy(),
-        Ok(value) => panic!(
-            "Oxide returned a non-string for {}: {value:?}",
-            case.description,
-        ),
-        Err(RuntimeError::Exception) => {
-            let exception = context.take_exception().unwrap();
-            panic!("Oxide threw for {}: {exception:?}", case.description);
-        }
-        Err(error) => panic!("Oxide failed for {}: {error}", case.description),
-    }
-}
-
-fn oracle_observation(oracle: &OsStr, case: &Case) -> String {
-    let wrapper = r#"
-try {
-  var value = std.evalScript(scriptArgs[0]);
-  print(String(value));
-} catch (error) {
-  print("UNEXPECTED THROW: " + error.name + ": " + error.message);
-}
-"#;
-    let source = observed_source(case.source);
-    let output = Command::new(oracle)
-        .args(["--std", "-e", wrapper, &source])
-        .output()
-        .unwrap_or_else(|error| panic!("could not run QuickJS for {}: {error}", case.description));
-    assert!(
-        output.status.success(),
-        "QuickJS failed for {}: {}",
-        case.description,
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .trim_end()
-        .to_owned()
-}
-
-fn int_property(runtime: &Runtime, context: &mut Context, object: &ObjectRef, name: &str) -> i32 {
-    let key = runtime.intern_property_key(name).unwrap();
-    let Value::Int(value) = context.get_property(object, &key).unwrap() else {
-        panic!("{name} was not an Int property");
-    };
-    value
 }

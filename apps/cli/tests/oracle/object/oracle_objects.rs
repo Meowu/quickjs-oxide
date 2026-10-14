@@ -1,3 +1,6 @@
+use crate::runtime_observation::host_runtime_context;
+use crate::runtime_observation::integer as int_value;
+use crate::runtime_observation::string_units as units;
 use quickjs_oxide::engine::api::{
     CompleteOrdinaryPropertyDescriptor, Context, DescriptorField, JsString,
     OrdinaryPropertyDescriptor, PropertyKey, Runtime, Value, WellKnownSymbol,
@@ -82,10 +85,7 @@ print("symbols=" + String(Symbol.keyFor(Symbol.iterator)) + "," +
 
 #[test]
 fn ordinary_object_core_matches_quickjs_oracle() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP object oracle differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("object oracle differential");
     assert_eq!(
         rust_observations(),
         super::quickjs_oracle::eval_std_lines(&oracle, ORACLE_PROBE, "ordinary object core",)
@@ -93,9 +93,7 @@ fn ordinary_object_core_matches_quickjs_oracle() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let mut output = Vec::new();
 
     let ordered = runtime.new_object(None).unwrap();
@@ -190,9 +188,9 @@ fn rust_observations() -> Vec<String> {
     };
     output.push(format!(
         "defaults={value},{},{},{}",
-        Number(writable),
-        Number(enumerable),
-        Number(configurable)
+        u8::from(writable),
+        u8::from(enumerable),
+        u8::from(configurable)
     ));
 
     let frozen = runtime.new_object(None).unwrap();
@@ -374,27 +372,4 @@ fn string_keys(runtime: &Runtime, object: &quickjs_oxide::engine::api::ObjectRef
                 .to_utf8_lossy()
         })
         .collect()
-}
-
-fn units(value: &JsString) -> String {
-    value
-        .utf16_units()
-        .map(|unit| format!("{unit:04x}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn int_value(value: Value) -> i32 {
-    let Value::Int(value) = value else {
-        panic!("expected integer property value");
-    };
-    value
-}
-
-struct Number(bool);
-
-impl std::fmt::Display for Number {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(if self.0 { "1" } else { "0" })
-    }
 }

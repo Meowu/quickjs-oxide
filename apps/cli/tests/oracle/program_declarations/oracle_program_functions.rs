@@ -1,14 +1,17 @@
 use super::quickjs_argv_completion_oracle::observe_completion_argv_sequence_strip_one_lf as observe_oracle_sequence;
 use super::quickjs_program_property_oracle::observe_program_property_lines;
 use crate::runtime_completion_oracle::observe_legacy_float_eval_completion as observe_rust_eval;
-use crate::runtime_observation::primitive_value_text_with_rust_float as primitive_value_text;
+use crate::runtime_observation::take_exception_object as take_object_exception;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
-use crate::runtime_oracle::{run_cli, value_type};
+use crate::object_graph_observation::{define_global_data, function_setup as function};
+use crate::runtime_completion_oracle::compare_cli;
+use crate::runtime_observation::eval_text;
+use crate::runtime_oracle::value_type;
 use quickjs_oxide::engine::api::{
     AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DescriptorField,
-    JsString, ObjectRef, OrdinaryPropertyDescriptor, Runtime, RuntimeError, Value,
+    JsString, OrdinaryPropertyDescriptor, Runtime, RuntimeError, Value,
 };
-use std::ffi::OsStr;
 
 const VALUE_CASES: &[(&str, &str)] = &[
     (
@@ -242,15 +245,10 @@ line('sealed-state', observe(
 
 #[test]
 fn program_function_values_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Program function differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Program function differential");
 
     for &(description, source) in VALUE_CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         let rust = observe_rust_eval(&runtime, &mut context, source, description);
         let quickjs = observe_oracle_sequence(&oracle, &[source], description);
         assert_eq!(rust, quickjs, "Program function drifted for {description}");
@@ -259,10 +257,7 @@ fn program_function_values_match_pinned_quickjs() {
 
 #[test]
 fn program_function_cross_eval_state_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Program function state differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Program function state differential");
 
     let sequences: &[(&str, &[&str])] = &[
         (
@@ -320,9 +315,7 @@ fn program_function_cross_eval_state_matches_pinned_quickjs() {
     ];
 
     for &(description, sources) in sequences {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         let rust = sources
             .iter()
             .map(|source| observe_rust_eval(&runtime, &mut context, source, description))
@@ -338,10 +331,7 @@ fn program_function_cross_eval_state_matches_pinned_quickjs() {
 
 #[test]
 fn program_function_global_property_matrix_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Program function property differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Program function property differential");
 
     assert_eq!(
         rust_property_observations(),
@@ -352,10 +342,7 @@ fn program_function_global_property_matrix_matches_pinned_quickjs() {
 
 #[test]
 fn program_function_full_and_strip_debug_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Program function stack differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Program function stack differential");
 
     for &(description, source) in ERROR_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -365,10 +352,7 @@ fn program_function_full_and_strip_debug_stacks_match_pinned_quickjs() {
 
 #[test]
 fn program_function_parser_diagnostics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Program function parser differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Program function parser differential");
 
     for &(description, source) in SYNTAX_ERROR_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -377,13 +361,9 @@ fn program_function_parser_diagnostics_match_pinned_quickjs() {
 
 #[test]
 fn program_function_cross_realm_matches_pinned_c_api() {
-    let Some(_oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Program function cross-realm oracle: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let _oracle = require_qjs_oracle!("Program function cross-realm oracle");
 
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     drop(defining.eval("globalThis.realmTag='A'").unwrap());
@@ -561,9 +541,7 @@ fn program_function_cross_realm_matches_pinned_c_api() {
 }
 
 fn rust_property_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let mut output = Vec::new();
 
     output.push(format!(
@@ -840,34 +818,6 @@ fn rust_property_observations() -> Vec<String> {
     output
 }
 
-fn define_global_data(
-    runtime: &Runtime,
-    context: &mut Context,
-    name: &str,
-    value: Value,
-    writable: bool,
-    enumerable: bool,
-    configurable: bool,
-) {
-    let global = context.global_object().unwrap();
-    let key = runtime.intern_property_key(name).unwrap();
-    assert!(
-        context
-            .define_own_property(
-                &global,
-                &key,
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(writable),
-                    enumerable: DescriptorField::Present(enumerable),
-                    configurable: DescriptorField::Present(configurable),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap()
-    );
-}
-
 fn define_global_accessor(
     runtime: &Runtime,
     context: &mut Context,
@@ -896,24 +846,6 @@ fn define_global_accessor(
             )
             .unwrap()
     );
-}
-
-fn function(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("function setup did not produce an object: {source}");
-    };
-    runtime.as_callable(&object).unwrap().unwrap()
-}
-
-fn take_object_exception(context: &mut Context, description: &str) -> ObjectRef {
-    let Value::Object(error) = context
-        .take_exception()
-        .unwrap_or_else(|failure| panic!("take {description} exception: {failure}"))
-        .unwrap_or_else(|| panic!("{description} exception was missing"))
-    else {
-        panic!("{description} did not throw an object");
-    };
-    error
 }
 
 fn descriptor_text(runtime: &Runtime, context: &mut Context, name: &str) -> String {
@@ -951,21 +883,4 @@ fn accessor_type(value: &Option<CallableRef>) -> &'static str {
     } else {
         "undefined"
     }
-}
-
-fn eval_text(context: &mut Context, source: &str) -> String {
-    primitive_value_text(context.eval(source).unwrap())
-}
-
-fn compare_cli(oracle: &OsStr, options: &[&str], source: &str, description: &str) {
-    let rust = run_cli(
-        env!("CARGO_BIN_EXE_qjs").as_ref(),
-        options,
-        source,
-        description,
-    );
-    let quickjs = run_cli(oracle, options, source, description);
-    assert_eq!(rust.status.code(), quickjs.status.code(), "{description}");
-    assert_eq!(rust.stdout, quickjs.stdout, "{description}");
-    assert_eq!(rust.stderr, quickjs.stderr, "{description}");
 }

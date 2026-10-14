@@ -24,7 +24,7 @@ use crate::engine::object::{
     PropertyKey, WellKnownSymbol,
 };
 use crate::engine::value::conversion::NativeConversion;
-use crate::engine::value::{JsString, JsValue, Value};
+use crate::engine::value::{JsValue, Value};
 use crate::engine::vm::Completion;
 use crate::engine::vm::call::{NativeArguments, NativeInvocation};
 
@@ -227,7 +227,7 @@ impl Runtime {
             0,
             0,
         )?;
-        self.define_iterator_data_tag(&concat_prototype, "Iterator Concat")?;
+        self.define_to_string_tag(&concat_prototype, "Iterator Concat")?;
 
         for (kind, name) in [
             (IteratorResumeKind::Next, "next"),
@@ -242,7 +242,7 @@ impl Runtime {
                 0,
             )?;
         }
-        self.define_iterator_data_tag(&helper_prototype, "Iterator Helper")?;
+        self.define_to_string_tag(&helper_prototype, "Iterator Helper")?;
 
         for (kind, name) in [
             (IteratorResumeKind::Next, "next"),
@@ -274,30 +274,6 @@ impl Runtime {
                 wrap_prototype: wrap_prototype.object_id(),
             },
         )?;
-        Ok(())
-    }
-
-    fn define_iterator_data_tag(
-        &self,
-        object: &ObjectRef,
-        value: &'static str,
-    ) -> Result<(), RuntimeError> {
-        let key = PropertyKey::from(self.well_known_symbol(WellKnownSymbol::ToStringTag)?);
-        if !self.define_own_property(
-            object,
-            &key,
-            &OrdinaryPropertyDescriptor {
-                value: DescriptorField::Present(Value::String(JsString::from_static(value))),
-                writable: DescriptorField::Present(false),
-                enumerable: DescriptorField::Present(false),
-                configurable: DescriptorField::Present(true),
-                ..OrdinaryPropertyDescriptor::new()
-            },
-        )? {
-            return Err(RuntimeError::Invariant(
-                "Iterator helper toStringTag definition was rejected",
-            ));
-        }
         Ok(())
     }
 
@@ -631,6 +607,8 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::test_support::assert_script_true;
+    use crate::engine::test_support::test_context;
 
     #[test]
     fn high_finite_helper_limits_use_quickjs_low_sixty_four_bits() {
@@ -648,12 +626,10 @@ mod tests {
         assert_eq!(quickjs_to_int64_free(-1e100), 0);
         assert_eq!(quickjs_to_int64_free(f64::MAX), 0);
 
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
-        assert_eq!(
-            context
-                .eval(
-                    r#"
+        let (_, mut context) = test_context();
+        assert_script_true(
+            &mut context,
+            r#"
 (function () {
     var rangeError = false;
     try {
@@ -668,20 +644,15 @@ mod tests {
         taken.value === undefined && taken.done === true;
 })()
 "#,
-                )
-                .unwrap(),
-            Value::Bool(true)
         );
     }
 
     #[test]
     fn flat_map_inner_normal_close_error_replaces_the_step_error() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
-        assert_eq!(
-            context
-                .eval(
-                    r#"
+        let (_, mut context) = test_context();
+        assert_script_true(
+            &mut context,
+            r#"
 (function () {
     var firstLog = [];
     var firstOuter = {
@@ -747,9 +718,6 @@ mod tests {
         secondLog.join(",") === "get-return-1,get-return-2,outer-return";
 })()
 "#,
-                )
-                .unwrap(),
-            Value::Bool(true)
         );
     }
 
@@ -793,10 +761,9 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            first
-                .eval(
-                    r#"
+        assert_script_true(
+            &mut first,
+            r#"
 (function () {
     var threw = false;
     try {
@@ -818,16 +785,12 @@ mod tests {
         !(setterError instanceof foreignTypeError);
 })()
 "#,
-                )
-                .unwrap(),
-            Value::Bool(true)
         );
     }
 
     #[test]
     fn iterator_hidden_edges_survive_gc_and_unrooted_cycles_collect() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         assert_eq!(
             context
                 .eval(
@@ -852,10 +815,9 @@ mod tests {
             Value::Undefined
         );
         runtime.run_gc().unwrap();
-        assert_eq!(
-            context
-                .eval(
-                    r#"
+        assert_script_true(
+            &mut context,
+            r#"
 (function () {
     var valid = helper.next().value === 41 &&
         wrapper.next().value === 7;
@@ -864,9 +826,6 @@ mod tests {
     return valid;
 })()
 "#,
-                )
-                .unwrap(),
-            Value::Bool(true)
         );
         runtime.run_gc().unwrap();
 

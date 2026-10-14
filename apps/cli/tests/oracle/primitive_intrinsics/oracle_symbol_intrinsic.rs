@@ -1,10 +1,21 @@
+use crate::object_graph_observation::define_accessor;
+use crate::object_graph_observation::{
+    data_flags_key, define_accessor_key, define_data_key_with_flags as define_data_key,
+    define_global_key as define_global, expect_object, global_object_value as global_value,
+    named_data_flags as data_flags,
+};
+use crate::primitive_probe::conversion_object;
+use crate::primitive_probe::eval_callable;
+use crate::primitive_probe::install_primitive_accessors;
+use crate::primitive_probe::take_error;
+use crate::runtime_observation::string_units as utf16_units;
+use crate::runtime_observation::take_error_object as take_exception_object;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use quickjs_oxide::engine::api::{
-    AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DescriptorField,
-    JsBigInt, JsString, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError,
-    SymbolRef, Value, WellKnownSymbol,
+    CallableRef, CompleteOrdinaryPropertyDescriptor, Context, JsBigInt, JsString, ObjectRef,
+    PropertyKey, Runtime, RuntimeError, SymbolRef, Value, WellKnownSymbol,
 };
 use std::ffi::OsStr;
-use std::process::Command;
 
 // The pinned probe uses Object and Reflect to inspect QuickJS. quickjs-oxide
 // intentionally exposes the same graph through its public host API while the
@@ -314,10 +325,7 @@ fn symbol_intrinsic_matches_pinned_quickjs() {
         "the Symbol differential unexpectedly changed breadth"
     );
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Symbol intrinsic differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Symbol intrinsic differential");
     assert_eq!(
         rust,
         oracle_observations(&oracle),
@@ -326,9 +334,7 @@ fn symbol_intrinsic_matches_pinned_quickjs() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let object_prototype = context.object_prototype().unwrap();
     let function_prototype = context.function_prototype().unwrap();
@@ -1270,8 +1276,7 @@ fn rust_observations() -> Vec<String> {
 
 #[test]
 fn symbol_cross_realm_routes_registry_boxing_lookup_and_errors() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut first = runtime.new_context().expect("create context");
     let mut second = runtime.new_context().expect("create context");
     let first_global = first.global_object().unwrap();
@@ -1571,8 +1576,7 @@ fn symbol_cross_realm_routes_registry_boxing_lookup_and_errors() {
 
 #[test]
 fn symbol_primitives_do_not_retain_realms_but_wrappers_do_and_atoms_survive() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let primitive = {
         let mut context = runtime.new_context().expect("create context");
         let global = context.global_object().unwrap();
@@ -1648,12 +1652,6 @@ fn well_known_entries() -> [(&'static str, WellKnownSymbol); 13] {
     ]
 }
 
-fn define_global(runtime: &Runtime, global: &ObjectRef, name: &str, value: Value) -> PropertyKey {
-    let key = runtime.intern_property_key(name).unwrap();
-    define_data_key(runtime, global, &key, value, true, true, true);
-    key
-}
-
 fn define_data(
     runtime: &Runtime,
     object: &ObjectRef,
@@ -1672,98 +1670,6 @@ fn define_data(
         enumerable,
         configurable,
     );
-}
-
-fn define_data_key(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    key: &PropertyKey,
-    value: Value,
-    writable: bool,
-    enumerable: bool,
-    configurable: bool,
-) {
-    assert!(
-        runtime
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(writable),
-                    enumerable: DescriptorField::Present(enumerable),
-                    configurable: DescriptorField::Present(configurable),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap(),
-        "host data-property definition was rejected"
-    );
-}
-
-fn define_accessor(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    name: &str,
-    get: Option<CallableRef>,
-    set: Option<CallableRef>,
-) {
-    define_accessor_key(
-        runtime,
-        object,
-        &runtime.intern_property_key(name).unwrap(),
-        get,
-        set,
-    );
-}
-
-fn define_accessor_key(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    key: &PropertyKey,
-    get: Option<CallableRef>,
-    set: Option<CallableRef>,
-) {
-    assert!(
-        runtime
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    get: DescriptorField::Present(
-                        get.map_or(AccessorValue::Undefined, AccessorValue::Callable),
-                    ),
-                    set: DescriptorField::Present(
-                        set.map_or(AccessorValue::Undefined, AccessorValue::Callable),
-                    ),
-                    enumerable: DescriptorField::Present(false),
-                    configurable: DescriptorField::Present(true),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap(),
-        "host accessor-property definition was rejected"
-    );
-}
-
-fn eval_callable(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let value = match context.eval(source) {
-        Ok(value) => value,
-        Err(RuntimeError::Exception) => {
-            panic!(
-                "callable source threw: {source:?}: {}",
-                take_error(runtime, context)
-            )
-        }
-        Err(error) => panic!("callable source failed: {source:?}: {error}"),
-    };
-    let Value::Object(object) = value else {
-        panic!("callable source did not produce an object: {source:?}");
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("source did not produce a callable: {source:?}"))
 }
 
 fn property_callable(
@@ -1808,25 +1714,6 @@ fn accessor_getter(runtime: &Runtime, object: &ObjectRef, key: &PropertyKey) -> 
     get
 }
 
-fn conversion_object(runtime: &Runtime, context: &mut Context, source: &str) -> ObjectRef {
-    let object = context.new_object().unwrap();
-    let conversion = eval_callable(runtime, context, source);
-    define_data_key(
-        runtime,
-        &object,
-        &PropertyKey::from(
-            runtime
-                .well_known_symbol(WellKnownSymbol::ToPrimitive)
-                .expect("well-known symbol"),
-        ),
-        Value::Object(conversion.as_object().try_clone().expect("duplicate root")),
-        true,
-        false,
-        true,
-    );
-    object
-}
-
 fn own_key_names(runtime: &Runtime, object: &ObjectRef) -> Vec<String> {
     runtime
         .own_property_keys(object)
@@ -1851,32 +1738,6 @@ fn own_key_names(runtime: &Runtime, object: &ObjectRef) -> Vec<String> {
                 })
         })
         .collect()
-}
-
-fn data_flags(runtime: &Runtime, object: &ObjectRef, name: &str) -> String {
-    data_flags_key(runtime, object, &runtime.intern_property_key(name).unwrap())
-}
-
-fn data_flags_key(runtime: &Runtime, object: &ObjectRef, key: &PropertyKey) -> String {
-    let descriptor = runtime
-        .get_own_property(object, key)
-        .unwrap()
-        .expect("property descriptor was absent");
-    let CompleteOrdinaryPropertyDescriptor::Data {
-        writable,
-        enumerable,
-        configurable,
-        ..
-    } = descriptor
-    else {
-        panic!("property descriptor was not data");
-    };
-    format!(
-        "{}{}{}",
-        u8::from(writable),
-        u8::from(enumerable),
-        u8::from(configurable)
-    )
 }
 
 fn accessor_flags(
@@ -1991,11 +1852,14 @@ fn observe_call(
     this_value: Value,
     arguments: &[Value],
 ) -> String {
-    match context.call(callable, this_value, arguments) {
-        Ok(value) => render_value(runtime, value),
-        Err(RuntimeError::Exception) => take_error(runtime, context),
-        Err(error) => panic!("Rust call failed outside JavaScript completion: {error}"),
-    }
+    crate::primitive_probe::observe_call(
+        runtime,
+        context,
+        callable,
+        this_value,
+        arguments,
+        |value| render_value(runtime, value),
+    )
 }
 
 fn observe_construct(
@@ -2004,11 +1868,9 @@ fn observe_construct(
     callable: &CallableRef,
     arguments: &[Value],
 ) -> String {
-    match context.construct(callable, arguments) {
-        Ok(value) => render_value(runtime, value),
-        Err(RuntimeError::Exception) => take_error(runtime, context),
-        Err(error) => panic!("Rust construct failed outside JavaScript completion: {error}"),
-    }
+    crate::primitive_probe::observe_construct(runtime, context, callable, arguments, |value| {
+        render_value(runtime, value)
+    })
 }
 
 fn observe_construct_with_new_target(
@@ -2018,21 +1880,20 @@ fn observe_construct_with_new_target(
     new_target: &CallableRef,
     arguments: &[Value],
 ) -> String {
-    match context.construct_with_new_target(callable, new_target, arguments) {
-        Ok(value) => render_value(runtime, value),
-        Err(RuntimeError::Exception) => take_error(runtime, context),
-        Err(error) => panic!("Rust construct failed outside JavaScript completion: {error}"),
-    }
+    crate::primitive_probe::observe_construct_with_new_target(
+        runtime,
+        context,
+        callable,
+        new_target,
+        arguments,
+        |value| render_value(runtime, value),
+    )
 }
 
 fn observe_eval(runtime: &Runtime, context: &mut Context, source: &str) -> String {
-    match context.eval(source) {
-        Ok(value) => render_value(runtime, value),
-        Err(RuntimeError::Exception) => take_error(runtime, context),
-        Err(error) => {
-            panic!("Rust source failed outside JavaScript completion: {source:?}: {error}")
-        }
-    }
+    crate::primitive_probe::observe_eval(runtime, context, source, |value| {
+        render_value(runtime, value)
+    })
 }
 
 fn symbol_record(runtime: &Runtime, symbol: &SymbolRef) -> String {
@@ -2077,14 +1938,6 @@ fn symbol_description_units(runtime: &Runtime, symbol: &SymbolRef) -> String {
         .map_or_else(|| "undefined".to_owned(), utf16_units)
 }
 
-fn utf16_units(value: &JsString) -> String {
-    value
-        .utf16_units()
-        .map(|unit| format!("{unit:04x}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 fn symbol_tags(
     runtime: &Runtime,
     context: &mut Context,
@@ -2103,61 +1956,12 @@ fn symbol_tags(
     .collect()
 }
 
-fn install_primitive_accessors(
-    runtime: &Runtime,
-    context: &mut Context,
-    global: &ObjectRef,
-    prototype: &ObjectRef,
-) {
-    for name in [
-        "strictGetThis",
-        "sloppyGetThis",
-        "strictSetThis",
-        "sloppySetThis",
-    ] {
-        define_global(runtime, global, name, Value::Undefined);
-    }
-    let strict_get = eval_callable(
-        runtime,
-        context,
-        r#"(function() { "use strict"; strictGetThis = this; return this; })"#,
-    );
-    let sloppy_get = eval_callable(
-        runtime,
-        context,
-        "(function() { sloppyGetThis = this; return this.valueOf(); })",
-    );
-    let strict_set = eval_callable(
-        runtime,
-        context,
-        r#"(function() { "use strict"; strictSetThis = this; })"#,
-    );
-    let sloppy_set = eval_callable(runtime, context, "(function() { sloppySetThis = this; })");
-    define_accessor(runtime, prototype, "__strictGet", Some(strict_get), None);
-    define_accessor(runtime, prototype, "__sloppyGet", Some(sloppy_get), None);
-    define_accessor(runtime, prototype, "__strictSet", None, Some(strict_set));
-    define_accessor(runtime, prototype, "__sloppySet", None, Some(sloppy_set));
-}
-
-fn global_value(runtime: &Runtime, context: &mut Context, global: &ObjectRef, name: &str) -> Value {
-    context
-        .get_property(global, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-}
-
 fn object_has_prototype(runtime: &Runtime, value: &Value, prototype: &ObjectRef) -> bool {
     let Value::Object(object) = value else {
         return false;
     };
     runtime.get_prototype_of(object).unwrap()
         == Some(prototype.try_clone().expect("duplicate root"))
-}
-
-fn expect_object(value: Value, description: &str) -> ObjectRef {
-    let Value::Object(object) = value else {
-        panic!("{description} did not produce an object");
-    };
-    object
 }
 
 fn expect_symbol(value: Value, description: &str) -> SymbolRef {
@@ -2185,30 +1989,6 @@ fn render_value(runtime: &Runtime, value: Value) -> String {
     }
 }
 
-fn take_error(runtime: &Runtime, context: &mut Context) -> String {
-    let error = take_exception_object(context);
-    let name = error_text(runtime, context, &error, "name");
-    let message = error_text(runtime, context, &error, "message");
-    format!("throw:{name}:{message}")
-}
-
-fn take_exception_object(context: &mut Context) -> ObjectRef {
-    let Value::Object(error) = context.take_exception().unwrap().unwrap() else {
-        panic!("Symbol operation did not throw an Error object");
-    };
-    error
-}
-
-fn error_text(runtime: &Runtime, context: &mut Context, error: &ObjectRef, name: &str) -> String {
-    let Value::String(value) = context
-        .get_property(error, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-    else {
-        panic!("Error.{name} was not a string");
-    };
-    value.to_utf8_lossy()
-}
-
 fn intrinsic_prototype(runtime: &Runtime, context: &mut Context, name: &str) -> ObjectRef {
     let global = context.global_object().unwrap();
     let constructor = property_callable(runtime, context, &global, name);
@@ -2225,18 +2005,5 @@ fn intrinsic_prototype(runtime: &Runtime, context: &mut Context, name: &str) -> 
 }
 
 fn oracle_observations(oracle: &OsStr) -> Vec<String> {
-    let output = Command::new(oracle)
-        .args(["-e", ORACLE_PROBE])
-        .output()
-        .expect("run QuickJS Symbol intrinsic oracle");
-    assert!(
-        output.status.success(),
-        "QuickJS Symbol intrinsic oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("QuickJS Symbol intrinsic oracle emitted non-UTF-8 output")
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    crate::quickjs_oracle::probe_lines(oracle, ORACLE_PROBE, "Symbol intrinsic")
 }

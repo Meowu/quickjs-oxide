@@ -1,3 +1,9 @@
+use crate::object_graph_observation::{
+    define_checked_builtin_data as define_data, define_checked_builtin_data_key as define_data_key,
+    eval_callable, expect_object, global_callable, global_string as string_global,
+};
+use crate::runtime_observation::error_text;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use crate::runtime_observation::{property_callable, take_thrown_object as take_exception_object};
 use quickjs_oxide::engine::api::{
     AccessorValue, CallableRef, Context, DescriptorField, JsBigInt, JsString, ObjectRef,
@@ -5,7 +11,6 @@ use quickjs_oxide::engine::api::{
     number_to_string,
 };
 use std::ffi::OsStr;
-use std::process::Command;
 
 const ORACLE_PROBE: &str = r#"
 function numberText(value) {
@@ -74,10 +79,7 @@ fn number_call_conversion_matches_the_pinned_quickjs_probe() {
         "host-side Number conversion contract changed"
     );
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Number constructor differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Number constructor differential");
     assert_eq!(
         rust,
         oracle_observations(&oracle),
@@ -87,8 +89,7 @@ fn number_call_conversion_matches_the_pinned_quickjs_probe() {
 
 #[test]
 fn number_construct_converts_before_new_target_prototype_and_uses_its_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut first = runtime.new_context().expect("create context");
     let mut second = runtime.new_context().expect("create context");
     let first_global = first.global_object().unwrap();
@@ -263,8 +264,7 @@ fn number_construct_converts_before_new_target_prototype_and_uses_its_realm() {
 
 #[test]
 fn number_construct_preserves_conversion_and_prototype_getter_throws_in_order() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut constructor_context = runtime.new_context().expect("create context");
     let mut target_context = runtime.new_context().expect("create context");
     let global = constructor_context.global_object().unwrap();
@@ -370,8 +370,7 @@ fn number_construct_preserves_conversion_and_prototype_getter_throws_in_order() 
 
 #[test]
 fn number_constructor_and_brand_errors_use_the_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut first = runtime.new_context().expect("create context");
     let mut second = runtime.new_context().expect("create context");
     let first_number = global_callable(&runtime, &mut first, "Number");
@@ -491,8 +490,7 @@ fn number_constructor_and_brand_errors_use_the_defining_realm() {
 
 #[test]
 fn number_wrapper_keeps_its_realm_graph_alive_until_collection() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let wrapper = {
         let mut context = runtime.new_context().expect("create context");
         let number = global_callable(&runtime, &mut context, "Number");
@@ -513,9 +511,7 @@ fn number_wrapper_keeps_its_realm_graph_alive_until_collection() {
 }
 
 fn rust_constructor_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let number = global_callable(&runtime, &mut context, "Number");
 
@@ -693,11 +689,6 @@ fn rust_constructor_observations() -> Vec<String> {
     ]
 }
 
-fn global_callable(runtime: &Runtime, context: &mut Context, name: &str) -> CallableRef {
-    let global = context.global_object().unwrap();
-    property_callable(runtime, context, &global, name)
-}
-
 fn constructor_prototype(
     runtime: &Runtime,
     context: &mut Context,
@@ -725,42 +716,8 @@ fn bound_constructor(runtime: &Runtime, context: &mut Context) -> CallableRef {
     function
 }
 
-fn eval_callable(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("callable source did not produce an object: {source:?}");
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("source did not produce a callable: {source:?}"))
-}
-
 fn define_global(runtime: &Runtime, global: &ObjectRef, name: &str, value: Value) {
     define_data(runtime, global, name, value);
-}
-
-fn define_data(runtime: &Runtime, object: &ObjectRef, name: &str, value: Value) {
-    let key = runtime.intern_property_key(name).unwrap();
-    define_data_key(runtime, object, &key, value);
-}
-
-fn define_data_key(runtime: &Runtime, object: &ObjectRef, key: &PropertyKey, value: Value) {
-    assert!(
-        runtime
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(true),
-                    enumerable: DescriptorField::Present(false),
-                    configurable: DescriptorField::Present(true),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap(),
-        "host data-property definition was rejected"
-    );
 }
 
 fn define_getter(runtime: &Runtime, object: &ObjectRef, name: &str, getter: CallableRef) {
@@ -781,38 +738,6 @@ fn define_getter(runtime: &Runtime, object: &ObjectRef, name: &str, getter: Call
             .unwrap(),
         "host accessor-property definition was rejected"
     );
-}
-
-fn string_global(
-    runtime: &Runtime,
-    context: &mut Context,
-    global: &ObjectRef,
-    name: &str,
-) -> String {
-    let Value::String(value) = context
-        .get_property(global, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-    else {
-        panic!("global {name} was not a string");
-    };
-    value.to_utf8_lossy()
-}
-
-fn error_text(runtime: &Runtime, context: &mut Context, error: &ObjectRef, name: &str) -> String {
-    let Value::String(value) = context
-        .get_property(error, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-    else {
-        panic!("Error.{name} was not a string");
-    };
-    value.to_utf8_lossy()
-}
-
-fn expect_object(value: Value, description: &str) -> ObjectRef {
-    let Value::Object(object) = value else {
-        panic!("{description} did not produce an object");
-    };
-    object
 }
 
 fn assert_number(value: Value, expected: f64) {
@@ -859,18 +784,5 @@ fn value_text(value: Value) -> String {
 }
 
 fn oracle_observations(oracle: &OsStr) -> Vec<String> {
-    let output = Command::new(oracle)
-        .args(["-e", ORACLE_PROBE])
-        .output()
-        .expect("run QuickJS Number constructor oracle");
-    assert!(
-        output.status.success(),
-        "QuickJS Number constructor oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("QuickJS Number constructor oracle emitted non-UTF-8 output")
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    crate::quickjs_oracle::probe_lines(oracle, ORACLE_PROBE, "Number constructor")
 }

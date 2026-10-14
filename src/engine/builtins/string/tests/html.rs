@@ -1,13 +1,13 @@
 use crate::engine::atom::AtomIdx;
 use crate::engine::heap::{AutoInitProperty, PropertySlot};
 use crate::engine::object::shape::PropertyFlags;
+use crate::engine::test_support::test_context;
 
 use super::*;
 
 #[test]
 fn string_create_html_family_is_ordered_autoinit_and_has_distinct_stable_functions() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = test_context();
     let prototype = context.string_prototype().unwrap();
     let keys = STRING_CREATE_HTML_ENTRIES.map(|(name, selector, length)| {
         (
@@ -120,8 +120,7 @@ fn string_create_html_family_is_ordered_autoinit_and_has_distinct_stable_functio
 
 #[test]
 fn string_create_html_maps_tags_and_preserves_pinned_conversion_and_argument_rules() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
 
     assert_eq!(
         context
@@ -226,8 +225,7 @@ fn string_create_html_maps_tags_and_preserves_pinned_conversion_and_argument_rul
 
 #[test]
 fn string_create_html_escapes_only_quotes_and_preserves_raw_utf16_nul_and_ropes() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = test_context();
     let prototype = context.string_prototype().unwrap();
     let anchor_key = runtime.intern_property_key("anchor").unwrap();
     let Value::Object(anchor_object) = context.get_property(&prototype, &anchor_key).unwrap()
@@ -322,8 +320,7 @@ fn string_create_html_escapes_only_quotes_and_preserves_raw_utf16_nul_and_ropes(
 
 #[test]
 fn string_create_html_small_limit_latches_too_long_but_attribute_throw_wins() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = test_context();
     drop(
         context
             .eval(
@@ -479,7 +476,7 @@ fn string_create_html_reservation_oom_uses_defining_realm_is_latched_and_recover
     let receiver = caller.eval("createHtmlReservationReceiver").unwrap();
     let attribute = caller.eval("createHtmlReservationAttribute").unwrap();
 
-    crate::engine::value::fail_next_create_html_reservation_for_test();
+    crate::engine::value::fail_next_replacement_reservation_for_test();
     assert_eq!(
         caller.call(
             &anchor,
@@ -524,7 +521,7 @@ fn string_create_html_reservation_oom_uses_defining_realm_is_latched_and_recover
 
     drop(caller.eval("createHtmlReservationLog=''").unwrap());
     let throwing_attribute = caller.eval("createHtmlReservationThrow").unwrap();
-    crate::engine::value::fail_next_create_html_reservation_for_test();
+    crate::engine::value::fail_next_replacement_reservation_for_test();
     assert_eq!(
         caller.call(
             &anchor,

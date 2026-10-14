@@ -1,17 +1,8 @@
 use super::*;
 use crate::engine::api::context::Context;
 use crate::engine::api::error::ErrorKind;
-
-fn eval_string(context: &mut Context, source: &str) -> String {
-    let Value::String(value) = context.eval(source).unwrap() else {
-        panic!("TypedArray stringification test did not return a String");
-    };
-    value.to_utf8_lossy()
-}
-
-fn assert_script(context: &mut Context, source: &str) {
-    assert_eq!(eval_string(context, source), "ok");
-}
+use crate::engine::test_support::assert_script;
+use crate::engine::test_support::test_context;
 
 fn eval_object(context: &mut Context, source: &str, description: &str) -> ObjectRef {
     let Value::Object(object) = context.eval(source).unwrap_or_else(|error| {
@@ -24,8 +15,7 @@ fn eval_object(context: &mut Context, source: &str, description: &str) -> Object
 
 #[test]
 fn join_and_to_locale_string_publish_quickjs_surface() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
 
     assert_script(
         &mut context,
@@ -125,8 +115,7 @@ fn join_and_to_locale_string_publish_quickjs_surface() {
 
 #[test]
 fn stringification_validates_brand_and_initial_buffer_state_before_coercion() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
 
     assert_script(
         &mut context,
@@ -206,8 +195,7 @@ fn stringification_validates_brand_and_initial_buffer_state_before_coercion() {
 
 #[test]
 fn join_observes_quickjs_separator_resize_snapshot_contract() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
 
     assert_script(
         &mut context,
@@ -277,8 +265,7 @@ fn join_observes_quickjs_separator_resize_snapshot_contract() {
 
 #[test]
 fn to_locale_string_observes_live_elements_with_a_fixed_old_length() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
 
     assert_script(
         &mut context,
@@ -526,8 +513,7 @@ fn to_locale_string_uses_the_method_defining_realm() {
 
 #[test]
 fn typed_array_separator_overflow_stops_before_the_next_locale_call() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = test_context();
     let source = eval_object(
         &mut context,
         r#"(function(){

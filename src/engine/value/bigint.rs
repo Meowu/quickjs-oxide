@@ -10,6 +10,7 @@
 //! where the representation is observable (notably `BigInt.asUintN`) explicitly
 //! emulate the upstream signed-limb behavior.
 
+use super::primitive::is_ecmascript_whitespace;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
@@ -160,7 +161,9 @@ impl JsBigInt {
     /// Returns [`BigIntError::InvalidSyntax`] for malformed input and an
     /// allocation-size error for values beyond the upstream limit.
     pub fn parse_js_string(source: &str) -> Result<Self, BigIntError> {
-        let source = source.trim_matches(is_ecmascript_whitespace);
+        let source = source.trim_matches(|character: char| {
+            u16::try_from(character).is_ok_and(is_ecmascript_whitespace)
+        });
         if source.is_empty() {
             return Ok(Self::zero());
         }
@@ -260,6 +263,47 @@ impl JsBigInt {
             BigIntRepr::Heap(value) => value
                 .to_f64()
                 .expect("an arbitrary-precision integer always has an f64 image"),
+        }
+    }
+
+    /// Compare exactly with a Number, as IsLessThan requires (`None` for NaN).
+    #[must_use]
+    pub fn cmp_f64(&self, number: f64) -> Option<Ordering> {
+        const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+        if number.is_nan() {
+            return None;
+        }
+        if (-TWO_POW_63..TWO_POW_63).contains(&number) {
+            let ordering = match &self.0 {
+                BigIntRepr::Short(value) => value.cmp(&(number.trunc() as i64)),
+                // A heap value lies outside i64 and so beyond this Number.
+                BigIntRepr::Heap(value) if value.sign() == Sign::Minus => Ordering::Less,
+                BigIntRepr::Heap(_) => Ordering::Greater,
+            };
+            return Some(ordering.then(0.0.partial_cmp(&number.fract())?));
+        }
+        // |number| >= 2^63 is integral or infinite and beyond every short
+        // value; a heap value of the opposite sign is likewise decided.
+        match &self.0 {
+            BigIntRepr::Heap(value)
+                if number.is_finite() && (value.sign() == Sign::Minus) == (number < 0.0) =>
+            {
+                let number_bits = ((number.to_bits() >> 52) & 0x7ff) - 1022;
+                let magnitude = value.bits().cmp(&number_bits).then_with(|| {
+                    let number = BigUint::from_f64(number.abs()).expect("finite Number");
+                    value.magnitude().cmp(&number)
+                });
+                Some(if number < 0.0 {
+                    magnitude.reverse()
+                } else {
+                    magnitude
+                })
+            }
+            _ => Some(if number > 0.0 {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }),
         }
     }
 
@@ -822,11 +866,8 @@ impl JsBigInt {
         // of JS_LIMB_BITS. If that limb's top bit is set, normalization observes
         // a negative result even for asUintN. Preserve that release behavior.
         let interpret_as_signed = signed || bits & (BIGINT_LIMB_BITS - 1) == 0;
-        if interpret_as_signed {
-            let sign_threshold = &modulus >> 1usize;
-            if truncated >= sign_threshold {
-                truncated -= modulus;
-            }
+        if interpret_as_signed && truncated.bit(bits - 1) {
+            truncated -= modulus;
         }
         Ok(Self::normalize(truncated))
     }
@@ -898,7 +939,16 @@ impl Ord for JsBigInt {
     fn cmp(&self, other: &Self) -> Ordering {
         match (&self.0, &other.0) {
             (BigIntRepr::Short(left), BigIntRepr::Short(right)) => left.cmp(right),
-            _ => self.as_bigint().cmp(&other.as_bigint()),
+            (BigIntRepr::Heap(left), BigIntRepr::Heap(right)) => left.cmp(right),
+            // A normalized heap value lies outside i64, so its sign decides.
+            (BigIntRepr::Short(_), BigIntRepr::Heap(heap)) => match heap.sign() {
+                Sign::Minus => Ordering::Greater,
+                _ => Ordering::Less,
+            },
+            (BigIntRepr::Heap(heap), BigIntRepr::Short(_)) => match heap.sign() {
+                Sign::Minus => Ordering::Less,
+                _ => Ordering::Greater,
+            },
         }
     }
 }
@@ -1023,35 +1073,19 @@ fn signed_limb_len(value: &BigInt) -> u64 {
     let signed_bits = match value.sign() {
         Sign::NoSign => 1,
         Sign::Plus => value.bits() + 1,
+        // -m needs bits(m - 1) + 1 two's-complement bits; m - 1 only loses a
+        // bit when m is a power of two, so no copy of the magnitude is needed.
         Sign::Minus => {
-            let mut below_magnitude = value.magnitude().clone();
-            below_magnitude -= 1u8;
-            below_magnitude.bits() + 1
+            let magnitude = value.magnitude();
+            let bits = magnitude.bits();
+            if magnitude.trailing_zeros() == Some(bits - 1) {
+                bits
+            } else {
+                bits + 1
+            }
         }
     };
     signed_bits.div_ceil(BIGINT_LIMB_BITS).max(1)
-}
-
-fn is_ecmascript_whitespace(character: char) -> bool {
-    matches!(
-        character,
-        '\u{0009}'
-            | '\u{000A}'
-            | '\u{000B}'
-            | '\u{000C}'
-            | '\u{000D}'
-            | '\u{0020}'
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'
-            ..='\u{200A}'
-                | '\u{2028}'
-                | '\u{2029}'
-                | '\u{202F}'
-                | '\u{205F}'
-                | '\u{3000}'
-                | '\u{FEFF}'
-    )
 }
 
 #[cfg(test)]
@@ -1073,6 +1107,8 @@ mod tests {
         let below_min = min.sub(&JsBigInt::one()).unwrap();
         assert!(!above_max.is_short());
         assert!(!below_min.is_short());
+        assert!(max < above_max && min < above_max && below_min < min && below_min < max);
+        assert!(above_max > max && below_min < above_max && max > below_min);
         assert_eq!(above_max.to_string(), "9223372036854775808");
         assert_eq!(below_min.to_string(), "-9223372036854775809");
 
@@ -1127,6 +1163,99 @@ mod tests {
             bigint("-170141183460469231731687303715884105729").signed_limb_len(),
             3
         );
+    }
+
+    #[test]
+    fn copy_free_signed_limb_len_matches_decremented_magnitude_formula() {
+        use num_bigint::{BigInt, Sign};
+        fn reference(value: &BigInt) -> u64 {
+            let bits = match value.sign() {
+                Sign::NoSign => 1,
+                Sign::Plus => value.bits() + 1,
+                Sign::Minus => (value.magnitude() - 1u8).bits() + 1,
+            };
+            bits.div_ceil(BIGINT_LIMB_BITS).max(1)
+        }
+        let mut samples = vec![BigInt::from(0)];
+        for shift in 0..300_u32 {
+            let power = BigInt::from(1) << shift;
+            samples.extend([&power - 1, power.clone(), &power + 1]);
+        }
+        let mut state = BigInt::from(0x9e37_79b9_7f4a_7c15_u64);
+        for _ in 0..200 {
+            state = (&state * 6_364_136_223_846_793_005_u64 + 1_442_695_040_888_963_407_u64)
+                % (BigInt::from(1) << 400_u32);
+            samples.push(&state >> (state.bits() % 397));
+        }
+        for magnitude in samples {
+            for value in [magnitude.clone(), -magnitude] {
+                assert_eq!(super::signed_limb_len(&value), reference(&value), "{value}");
+            }
+        }
+    }
+
+    #[test]
+    fn cmp_f64_matches_exact_arbitrary_precision_comparison() {
+        use num_bigint::BigInt;
+        use num_traits::FromPrimitive;
+        use std::cmp::Ordering;
+        fn reference(left: &JsBigInt, number: f64) -> Option<Ordering> {
+            if number.is_nan() {
+                return None;
+            }
+            if number.is_infinite() {
+                return Some(if number > 0.0 {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                });
+            }
+            let truncated = BigInt::from_f64(number.trunc()).unwrap();
+            Some(
+                left.to_bigint()
+                    .cmp(&truncated)
+                    .then(0.0.partial_cmp(&number.fract()).unwrap()),
+            )
+        }
+        let mut values = vec![JsBigInt::from(i64::MIN), JsBigInt::from(i64::MAX)];
+        for text in [
+            "0",
+            "1",
+            "9007199254740993",
+            "9223372036854775808",
+            "1000000000000000000000000000000",
+        ] {
+            for sign in ["", "-"] {
+                let value = bigint(&format!("{sign}{text}"));
+                values.extend([value.sub(&JsBigInt::one()).unwrap(), value.clone()]);
+                values.push(value.add(&JsBigInt::one()).unwrap());
+            }
+        }
+        let mut numbers = vec![
+            f64::NAN,
+            f64::INFINITY,
+            -0.0,
+            0.5,
+            1.5,
+            1e20,
+            1e30,
+            f64::MAX,
+        ];
+        numbers.extend([2f64.powi(53), 2f64.powi(63), 2f64.powi(64), 2f64.powi(99)]);
+        numbers.extend(values.iter().map(JsBigInt::to_f64));
+        for number in numbers.clone() {
+            let next = f64::from_bits(number.to_bits() + 1);
+            numbers.extend([next, f64::from_bits(number.to_bits().saturating_sub(1))]);
+        }
+        for value in &values {
+            for number in numbers.iter().flat_map(|number| [*number, -*number]) {
+                assert_eq!(
+                    value.cmp_f64(number),
+                    reference(value, number),
+                    "{value} vs {number}"
+                );
+            }
+        }
     }
 
     #[test]

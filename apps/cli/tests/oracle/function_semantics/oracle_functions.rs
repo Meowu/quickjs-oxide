@@ -1,9 +1,10 @@
+use crate::object_graph_observation::bits;
+use crate::runtime_observation::host_runtime_context;
 use quickjs_oxide::engine::api::{
     CompleteOrdinaryPropertyDescriptor, DescriptorField, OrdinaryPropertyDescriptor, Runtime,
     RuntimeError, Value,
 };
 use std::ffi::OsStr;
-use std::process::Command;
 
 const ORACLE_PROBE: &str = r#"
 var f = (0, function(a, b) {});
@@ -74,17 +75,12 @@ try { Reflect.construct(fp, []); } catch (e) { print("function-prototype-constru
 
 #[test]
 fn ordinary_function_object_kernel_matches_quickjs_oracle() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP function-object oracle differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("function-object oracle differential");
     assert_eq!(rust_observations(), oracle_observations(&oracle));
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let Value::Object(function) = context.eval("(0, function(a, b) {})").unwrap() else {
         panic!("function expression did not produce an object");
     };
@@ -632,28 +628,6 @@ fn function_name(
     name.to_utf8_lossy()
 }
 
-fn bits(writable: bool, enumerable: bool, configurable: bool) -> String {
-    format!(
-        "{},{},{}",
-        u8::from(writable),
-        u8::from(enumerable),
-        u8::from(configurable)
-    )
-}
-
 fn oracle_observations(oracle: &OsStr) -> Vec<String> {
-    let output = Command::new(oracle)
-        .args(["-e", ORACLE_PROBE])
-        .output()
-        .expect("run QuickJS function-object oracle");
-    assert!(
-        output.status.success(),
-        "QuickJS function-object oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("QuickJS function-object oracle emitted non-UTF-8 output")
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    crate::quickjs_oracle::probe_lines(oracle, ORACLE_PROBE, "function-object")
 }

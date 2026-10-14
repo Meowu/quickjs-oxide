@@ -2,6 +2,8 @@ use crate::quickjs_raw_source_oracle::{
     RawModuleObservation, normalized_json_module_filename, observe_raw_json_module,
     raw_json_module_source,
 };
+use crate::runtime_observation::hex_bytes;
+use crate::runtime_observation::host_runtime;
 use quickjs_oxide::engine::api::{
     Context, JsString, ModuleImportAttributes, ModuleLoadResult, ModuleLoader, ModuleLoaderError,
     Runtime, RuntimeError, Value,
@@ -305,10 +307,7 @@ impl ModuleLoader for RawJsonModuleLoader {
 
 #[test]
 fn raw_json_module_bytes_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP raw JSON module byte differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("raw JSON module byte differential");
     assert!(
         CASES.len() >= 40,
         "raw JSON module differential lost its broad matrix"
@@ -348,8 +347,7 @@ fn raw_json_module_bytes_match_pinned_quickjs() {
 }
 
 fn oxide_observation(case: &Case) -> RawModuleObservation {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let registration = runtime.set_module_loader(RawJsonModuleLoader {
         source: case.authored.to_vec(),
         grammar: case.grammar,
@@ -421,12 +419,4 @@ fn oxide_exception(runtime: &Runtime, context: &mut Context, case: &Case) -> Raw
         line: u32::try_from(line).unwrap(),
         column: u32::try_from(column).unwrap(),
     }
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }

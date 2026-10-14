@@ -1,5 +1,6 @@
 use crate::quickjs_argv_completion_oracle;
 use crate::runtime_observation::primitive_value_text;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use crate::runtime_oracle::value_type;
 use quickjs_argv_completion_oracle::observe_completion_argv_trim_end as observe_oracle;
 
@@ -98,10 +99,7 @@ print('entries='+entries.join('|'));
 
 #[test]
 fn array_unscopables_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array unscopables oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array unscopables oracle self-check");
     for &(description, source) in VALUE_CASES {
         let observation = observe_oracle(&oracle, source, description);
         assert!(
@@ -114,14 +112,9 @@ fn array_unscopables_oracle_vectors_self_check() {
 
 #[test]
 fn array_unscopables_values_identity_and_mutation_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array unscopables values: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array unscopables values");
     for &(description, source) in VALUE_CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         assert_eq!(
             observe_rust_eval(&runtime, &mut context, source, description),
             observe_oracle(&oracle, source, description),
@@ -132,10 +125,7 @@ fn array_unscopables_values_identity_and_mutation_match_pinned_quickjs() {
 
 #[test]
 fn array_unscopables_graph_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array unscopables graph: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array unscopables graph");
     assert_eq!(
         rust_graph_observations(),
         oracle_graph_observations(&oracle),
@@ -145,8 +135,7 @@ fn array_unscopables_graph_matches_pinned_quickjs() {
 
 #[test]
 fn array_unscopables_are_distinct_null_prototype_objects_per_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut first = runtime.new_context().expect("create context");
     let mut second = runtime.new_context().expect("create context");
     let key = PropertyKey::from(
@@ -191,9 +180,7 @@ fn observe_rust_eval(
 }
 
 fn rust_graph_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let context = runtime.new_context().expect("create context");
+    let (runtime, context) = host_runtime_context();
     let prototype = context.array_prototype().unwrap();
     let iterator = PropertyKey::from(
         runtime
@@ -262,9 +249,9 @@ fn rust_graph_observations() -> Vec<String> {
             };
             format!(
                 "{name}:{entry}:D{}{}{}",
-                Number(writable),
-                Number(enumerable),
-                Number(configurable),
+                u8::from(writable),
+                u8::from(enumerable),
+                u8::from(configurable),
             )
         })
         .collect::<Vec<_>>();
@@ -272,9 +259,9 @@ fn rust_graph_observations() -> Vec<String> {
         format!("symbols={}:own={own_key_count}", symbols.join(",")),
         format!(
             "outer=D{}{}{}:null-proto={}:array={}",
-            Number(writable),
-            Number(enumerable),
-            Number(configurable),
+            u8::from(writable),
+            u8::from(enumerable),
+            u8::from(configurable),
             runtime.get_prototype_of(&value).unwrap().is_none(),
             runtime.is_array_object(&value).unwrap(),
         ),
@@ -308,12 +295,4 @@ fn bool_property(runtime: &Runtime, context: &mut Context, object: &ObjectRef, n
         panic!("{name} was not a boolean property");
     };
     value
-}
-
-struct Number(bool);
-
-impl std::fmt::Display for Number {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(if self.0 { "1" } else { "0" })
-    }
 }

@@ -1,27 +1,11 @@
-use quickjs_oxide::engine::api::{Context, Runtime, RuntimeError, Value};
+use crate::object_graph_observation::context_global_value as global_value;
+use crate::runtime_observation::eval;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
+use quickjs_oxide::engine::api::{Context, Value};
 
 const FIXTURE: &str = include_str!("../../fixtures/inputs/r3q_promise_aggregates.js");
 const EXPECTED: &str =
     include_str!("../../fixtures/expected/r3q_promise_aggregates.quickjs-2026-06-04.txt");
-
-fn eval(context: &mut Context, source: &str) -> Value {
-    context.eval(source).unwrap_or_else(|error| {
-        if error == RuntimeError::Exception {
-            panic!(
-                "unexpected JavaScript exception: {:?}",
-                context.take_exception()
-            );
-        }
-        panic!("unexpected engine error: {error}");
-    })
-}
-
-fn global_value(context: &mut Context, name: &str) -> Value {
-    let runtime = context.runtime();
-    let key = runtime.intern_property_key(name).unwrap();
-    let global = context.global_object().unwrap();
-    context.get_property(&global, &key).unwrap()
-}
 
 fn global_object(context: &mut Context, name: &str) -> quickjs_oxide::engine::api::ObjectRef {
     let Value::Object(object) = global_value(context, name) else {
@@ -32,9 +16,7 @@ fn global_object(context: &mut Context, name: &str) -> quickjs_oxide::engine::ap
 
 #[test]
 fn promise_all_settled_and_any_match_pinned_quickjs() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
 
     drop(eval(&mut context, FIXTURE));
     runtime.run_gc().unwrap();
@@ -52,8 +34,7 @@ fn promise_all_settled_and_any_match_pinned_quickjs() {
 
 #[test]
 fn promise_aggregate_internal_values_follow_quickjs_context_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
 

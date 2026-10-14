@@ -4,25 +4,22 @@
 use crate::quickjs_oracle;
 
 mod support {
+    use crate::runtime_observation::host_runtime_context;
     pub(super) use crate::runtime_observation::{
         error_string_property, primitive_value_text,
         property_callable_with_read_context as property_callable, take_exception_object,
     };
+    pub(super) use crate::runtime_oracle::{eval_callable, eval_object, value_type};
     use quickjs_oxide::engine::api::{
         CompleteOrdinaryPropertyDescriptor, Context, ObjectRef, Runtime, RuntimeError, Value,
     };
     use std::ffi::OsStr;
 
     pub(super) fn compare_value_cases(group: &str, cases: &[(&str, &str)]) {
-        let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-            eprintln!("SKIP {group} differential: set QJS_ORACLE to upstream qjs");
-            return;
-        };
+        let oracle = require_qjs_oracle!("{group} differential");
         for &(description, source) in cases {
             let expected = observe_oracle(&oracle, source, description);
-            let runtime =
-                Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-            let mut context = runtime.new_context().expect("create context");
+            let (runtime, mut context) = host_runtime_context();
             assert_eq!(
                 observe_rust_eval(&runtime, &mut context, source, description),
                 expected,
@@ -83,9 +80,9 @@ mod support {
         };
         format!(
             "D{}{}{}",
-            Number(*writable),
-            Number(*enumerable),
-            Number(*configurable),
+            u8::from(*writable),
+            u8::from(*enumerable),
+            u8::from(*configurable),
         )
     }
 
@@ -132,52 +129,15 @@ mod support {
             "{name}:{}:{}:D{}{}{}:{}:{}:{}:{}:{}",
             primitive_value_text(function_name),
             primitive_value_text(function_length),
-            Number(*writable),
-            Number(*enumerable),
-            Number(*configurable),
+            u8::from(*writable),
+            u8::from(*enumerable),
+            u8::from(*configurable),
             data_descriptor_bits(&name_descriptor),
             data_descriptor_bits(&length_descriptor),
             true,
             runtime.get_prototype_of(function).unwrap().as_ref() == Some(function_prototype),
             runtime.is_constructor(callable.as_object()).unwrap(),
         )
-    }
-
-    pub(super) fn eval_object(context: &mut Context, source: &str, description: &str) -> ObjectRef {
-        let Value::Object(object) = context
-            .eval(source)
-            .unwrap_or_else(|error| panic!("Rust rejected {description} ({source:?}): {error}"))
-        else {
-            panic!("Rust {description} did not evaluate to an object");
-        };
-        object
-    }
-
-    pub(super) fn value_type(runtime: &Runtime, value: &Value) -> &'static str {
-        match value {
-            Value::Undefined => "undefined",
-            Value::Null => "object",
-            Value::Bool(_) => "boolean",
-            Value::Int(_) | Value::Float(_) => "number",
-            Value::BigInt(_) => "bigint",
-            Value::String(_) => "string",
-            Value::Object(object) => {
-                if runtime.as_callable(object).unwrap().is_some() {
-                    "function"
-                } else {
-                    "object"
-                }
-            }
-            Value::Symbol(_) => "symbol",
-        }
-    }
-
-    pub(super) struct Number(pub(super) bool);
-
-    impl std::fmt::Display for Number {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str(if self.0 { "1" } else { "0" })
-        }
     }
 }
 

@@ -1,11 +1,12 @@
+use crate::object_graph_observation::require_object as expect_object;
+use crate::quickjs_argv_completion_oracle::observe_completion_argv_trim_end as observe_oracle;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use crate::runtime_observation::{
     primitive_value_text, property_callable_with_read_context as property_callable,
     string_property_with_read_context as string_property, take_exception_object,
 };
 use crate::runtime_oracle::{eval_object, value_type};
 use quickjs_oxide::engine::api::{Context, JsString, ObjectRef, Runtime, RuntimeError, Value};
-use std::ffi::OsStr;
-use std::process::Command;
 
 // Pins the complete QuickJS 2026-06-04 Reflect intrinsic. In particular, the
 // construct-order vectors intentionally follow `js_reflect_construct` rather
@@ -381,10 +382,7 @@ const PROPERTY_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn reflect_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Reflect oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Reflect oracle self-check");
     for &(group, cases) in &[
         ("graph", GRAPH_CASES),
         ("AutoInit", AUTO_INIT_CASES),
@@ -423,9 +421,7 @@ fn reflect_property_operations_match_pinned_quickjs() {
 
 #[test]
 fn reflect_exposes_all_thirteen_nonconstructable_methods() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let reflect = reflect_object(&runtime, &mut context);
     for &(name, expected_length) in METHODS {
         let callable = property_callable(&runtime, &mut context, &reflect, name);
@@ -453,8 +449,7 @@ fn reflect_exposes_all_thirteen_nonconstructable_methods() {
 
 #[test]
 fn reflect_cross_realm_results_native_errors_and_user_errors_use_exact_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let reflect = reflect_object(&runtime, &mut defining);
@@ -569,14 +564,9 @@ fn reflect_cross_realm_results_native_errors_and_user_errors_use_exact_realms() 
 }
 
 fn compare_cases(group: &str, cases: &[(&str, &str)]) {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP {group}: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("{group}");
     for &(description, source) in cases {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         assert_eq!(
             observe_rust_eval(&runtime, &mut context, source, description),
             observe_oracle(&oracle, source, description),
@@ -619,31 +609,6 @@ fn observe_rust_eval(
     }
 }
 
-fn observe_oracle(oracle: &OsStr, source: &str, description: &str) -> String {
-    let wrapper = r#"
-try {
-  var value=std.evalScript(scriptArgs[0]);
-  print('return|'+typeof value+'|'+String(value));
-} catch(error) {
-  if(error!==null&&typeof error==='object')print('throw|object|'+error.name+'|'+error.message);
-  else print('throw|'+typeof error+'|'+String(error));
-}
-"#;
-    let output = Command::new(oracle)
-        .args(["--std", "-e", wrapper, source])
-        .output()
-        .unwrap_or_else(|error| panic!("could not run QuickJS for {description}: {error}"));
-    assert!(
-        output.status.success(),
-        "QuickJS observer failed for {description}: {}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8(output.stdout)
-        .unwrap_or_else(|error| panic!("QuickJS output was not UTF-8 for {description}: {error}"))
-        .trim_end()
-        .to_owned()
-}
-
 fn reflect_object(runtime: &Runtime, context: &mut Context) -> ObjectRef {
     let global = context.global_object().unwrap();
     let key = runtime.intern_property_key("Reflect").unwrap();
@@ -665,11 +630,4 @@ fn number_property(
         .unwrap_or_else(|error| panic!("read numeric property {name}: {error}"))
         .as_number()
         .unwrap_or_else(|| panic!("{name} was not numeric"))
-}
-
-fn expect_object(value: Value, description: &str) -> ObjectRef {
-    let Value::Object(object) = value else {
-        panic!("{description} was not an object");
-    };
-    object
 }

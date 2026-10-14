@@ -1,6 +1,7 @@
 use super::support::*;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
-use quickjs_oxide::engine::api::{JsString, Runtime, RuntimeError, Value};
+use quickjs_oxide::engine::api::{JsString, RuntimeError, Value};
 use std::ffi::OsStr;
 
 // This target pins QuickJS 2026-06-04's `js_array_concat`, including
@@ -331,10 +332,7 @@ print('meta='+metadata('concat'));
 
 #[test]
 fn array_concat_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array.concat oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array.concat oracle self-check");
     for &(group, cases) in &[
         ("values", VALUE_CASES),
         ("spreadability", SPREAD_CASES),
@@ -380,10 +378,7 @@ fn array_concat_errors_match_pinned_quickjs() {
 
 #[test]
 fn array_concat_prototype_order_and_metadata_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array.concat graph differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array.concat graph differential");
     assert_eq!(
         rust_graph_observations(),
         oracle_graph_observations(&oracle),
@@ -393,8 +388,7 @@ fn array_concat_prototype_order_and_metadata_match_pinned_quickjs() {
 
 #[test]
 fn array_concat_species_boxing_results_and_errors_use_pinned_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_array_prototype = defining.array_prototype().unwrap();
@@ -539,9 +533,7 @@ fn array_concat_species_boxing_results_and_errors_use_pinned_realms() {
 }
 
 fn rust_graph_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let array_prototype = context.array_prototype().unwrap();
     let function_prototype = context.function_prototype().unwrap();
     let implemented = [

@@ -532,7 +532,7 @@ fn execute_admitted_in_state(
                         let value = if decoded.next_pc == pc as u32 + 1 {
                             i32::from(operand as i16)
                         } else {
-                            operand as i32
+                            operand.cast_signed()
                         };
                         cursor.commit_push(JsValue::Int(value))?;
                     }
@@ -731,7 +731,7 @@ fn execute_admitted_in_state(
                             Error::internal("published numeric region is missing")
                         })?;
                         #[cfg(test)]
-                        NUMERIC_REGION_ATTEMPTS.set(NUMERIC_REGION_ATTEMPTS.get() + 1);
+                        NUMERIC_REGION_ATTEMPTS.update(|value| value + 1);
                         #[cfg(feature = "profiling")]
                         crate::engine::api::profiling::record_execution_dispatch(
                             runtime, executable, pc, true,
@@ -1036,7 +1036,7 @@ fn execute_admitted_in_state(
                                         None,
                                     );
                                     #[cfg(test)]
-                                    NUMERIC_REGION_HITS.set(NUMERIC_REGION_HITS.get() + 1);
+                                    NUMERIC_REGION_HITS.update(|value| value + 1);
                                     let target = if decision == region.when_true {
                                         decoded.operand(1) as usize
                                     } else {
@@ -1077,12 +1077,12 @@ fn execute_admitted_in_state(
                         let _ = miss_reason;
                         if hit {
                             #[cfg(test)]
-                            NUMERIC_REGION_HITS.set(NUMERIC_REGION_HITS.get() + 1);
+                            NUMERIC_REGION_HITS.update(|value| value + 1);
                             cursor.advance(decoded.operand(1) as usize);
                             continue;
                         }
                         #[cfg(test)]
-                        NUMERIC_REGION_MISSES.set(NUMERIC_REGION_MISSES.get() + 1);
+                        NUMERIC_REGION_MISSES.update(|value| value + 1);
                         let first = match decoded.opcode {
                             Opcode::NumericArrayStoreAndLocal => {
                                 cursor.with_slots(|slots| {
@@ -1378,7 +1378,7 @@ fn execute_admitted_in_state(
                         let packed = decoded.operand(1);
                         let base_index = published_u16(packed & 0xffff);
                         let key_index = published_u16(packed >> 16);
-                        let mask = i32::from(decoded.operand(2) as u16 as i16);
+                        let mask = i32::from((decoded.operand(2) as u16).cast_signed());
                         #[cfg(feature = "profiling")]
                         crate::engine::api::profiling::record_execution_dispatch(
                             runtime, executable, pc, true,
@@ -3360,7 +3360,7 @@ fn dense_binary_rhs(slots: &FrameSlots<'_>, mode: u32, bits: u16) -> Option<Numb
         1 => slots
             .direct_value(DirectSlot::Argument(bits))
             .and_then(JsValue::as_number_repr),
-        2 => Some(Number::Int(i32::from(bits as i16))),
+        2 => Some(Number::Int(i32::from(bits.cast_signed()))),
         _ => unreachable!("published numeric source was verified"),
     }
 }
@@ -3431,10 +3431,13 @@ fn binary_number_result(opcode: Opcode, left: Number, right: Number) -> JsValue 
         Opcode::Div => number_value(left.div(right)),
         Opcode::Mod => number_value(left.rem(right)),
         Opcode::Pow => number_value(left.pow(right)),
-        Opcode::Shl => JsValue::Int(left.int32().wrapping_shl(right.int32() as u32 & 31)),
-        Opcode::Sar => JsValue::Int(left.int32() >> (right.int32() as u32 & 31)),
+        Opcode::Shl => JsValue::Int(
+            left.int32()
+                .wrapping_shl(right.int32().cast_unsigned() & 31),
+        ),
+        Opcode::Sar => JsValue::Int(left.int32() >> (right.int32().cast_unsigned() & 31)),
         Opcode::Shr => number_value(Number::compact(f64::from(
-            (left.int32() as u32) >> (right.int32() as u32 & 31),
+            left.int32().cast_unsigned() >> (right.int32().cast_unsigned() & 31),
         ))),
         Opcode::BitAnd => JsValue::Int(left.int32() & right.int32()),
         Opcode::BitOr => JsValue::Int(left.int32() | right.int32()),
@@ -3474,15 +3477,15 @@ mod specialized_tests;
 #[cfg(test)]
 mod execution_span_tests {
     use crate::engine::api::{Runtime, Value};
+    use crate::engine::test_support::assert_script_true;
+    use crate::engine::test_support::test_context;
 
     #[test]
     fn carried_call_continuation_resumes_nested_method_and_throwing_calls_once() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
-        assert_eq!(
-            context
-                .eval(
-                    r#"(() => {
+        let (_, mut context) = test_context();
+        assert_script_true(
+            &mut context,
+            r#"(() => {
             let log=[];
             function f(x){log.push(x);return x+1;}
             const obj={m(x){return f(x)+this.bias},bias:2};
@@ -3490,21 +3493,16 @@ mod execution_span_tests {
             let value=f(f(1))+tail(4);
             try{(function(){throw 7;})()}catch(e){value+=e;}
             return value===17 && log.join() === '1,2,4';
-        })()"#
-                )
-                .unwrap(),
-            Value::Bool(true)
+        })()"#,
         );
     }
 
     #[test]
     fn borrowed_this_field_handles_aliases_prototypes_accessors_and_primitives() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
-        assert_eq!(
-            context
-                .eval(
-                    r#"(() => {
+        let (runtime, mut context) = test_context();
+        assert_script_true(
+            &mut context,
+            r#"(() => {
             function read() { return this.x; }
             let proto = {x: 3}, obj = Object.create(proto), calls = 0;
             for(let i=0;i<20;i++) if(read.call(obj)!==3) return false;
@@ -3527,10 +3525,7 @@ mod execution_span_tests {
             if(read.call(null)!==42) return false;
             delete globalThis.x;
             return true;
-        })()"#
-                )
-                .unwrap(),
-            Value::Bool(true)
+        })()"#,
         );
         let Value::Object(function) = context.eval("(function(){return this.x})").unwrap() else {
             panic!("function");
@@ -3591,8 +3586,7 @@ mod execution_span_tests {
 
     #[test]
     fn strict_local_completion_preserves_all_value_kinds() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         let result = context.eval(r#"
             (() => {
                 function eq(a,b) { const materialize={}; return a === b; }
@@ -3627,8 +3621,7 @@ mod execution_span_tests {
 
     #[test]
     fn strict_local_completion_preserves_operand_effects_and_throws() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         let result = context.eval(r#"
             (() => {
                 let log='';
@@ -3649,8 +3642,7 @@ mod execution_span_tests {
 
     #[test]
     fn strict_local_completion_releases_temporary_heap_owners() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let _ = context
             .eval(
                 r#"
@@ -3671,18 +3663,14 @@ mod execution_span_tests {
             .unwrap();
         runtime.run_gc().unwrap();
         let before = runtime.heap_counts().expect("runtime state").live;
-        assert_eq!(
-            context.eval("strictTemporaryOwners()").unwrap(),
-            Value::Bool(true)
-        );
+        assert_script_true(&mut context, "strictTemporaryOwners()");
         runtime.run_gc().unwrap();
         assert_eq!(runtime.heap_counts().expect("runtime state").live, before);
     }
 
     #[test]
     fn compare_branch_guard_preserves_coercion_and_branch_result() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         let result = context
             .eval(
                 "(() => { let calls=0; function f(a,b){ if(a<b)return 1; return 2; } \
@@ -3695,8 +3683,7 @@ mod execution_span_tests {
 
     #[test]
     fn stack_compare_branch_falls_back_before_coercion_and_keeps_exception_order() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         let result = context
             .eval(
                 "(() => { let log=''; function f(o, y) { if (o.x < y) return 1; return 2; } \
@@ -3711,8 +3698,7 @@ mod execution_span_tests {
 
     #[test]
     fn discarded_local_update_preserves_postfix_and_coercion() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         let result = context
             .eval(
                 "(() => { let calls=0; function f(v) { let x=v; x++; return x; } \
@@ -3725,8 +3711,7 @@ mod execution_span_tests {
 
     #[test]
     fn dense_post_update_read_keeps_old_index_and_proxy_fallback() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         let result = context
             .eval(
                 "(() => { function f(a,i){ let value=a[i++]; return [value,i]; } \
@@ -3742,8 +3727,7 @@ mod execution_span_tests {
 
     #[test]
     fn dense_read_binary_preserves_getter_and_conversion_order_on_guard_miss() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         let result = context
             .eval(
                 "(() => { function f(a,i,x){ return a[i]+x; } \
@@ -3760,8 +3744,7 @@ mod execution_span_tests {
 
     #[test]
     fn dense_index_binary_falls_back_before_proxy_or_index_coercion() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         let result = context
             .eval(
                 "(() => { function f(a,i){ return a[i+1]; } \
@@ -3776,8 +3759,7 @@ mod execution_span_tests {
 
     #[test]
     fn dense_accumulator_index_preserves_writeback_and_guard_order() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         let result = context
             .eval(
                 "(() => { function f(a,j){let b=a,i=j,s=0; s+=b[i&3]; return s} \
@@ -3792,8 +3774,7 @@ mod execution_span_tests {
 
     #[test]
     fn field_accumulator_preserves_getter_proxy_and_conversion_order() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         let result = context
             .eval(
                 "(() => { function f(o,n){let b=o,s=0; for(let i=0;i<n;i++) s+=b.x; return s} \

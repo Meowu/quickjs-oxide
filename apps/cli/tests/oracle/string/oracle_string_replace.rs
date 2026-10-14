@@ -2,54 +2,19 @@ use crate::runtime_completion_oracle::{
     compare_read_context_eval_completion_cases_with_prelude,
     observe_quickjs_completion_with_prelude,
 };
+use crate::runtime_observation::host_runtime;
 use crate::runtime_observation::take_exception_object;
 use crate::runtime_oracle::eval_object;
 
-use quickjs_oxide::engine::api::{CallableRef, Context, JsString, Runtime, RuntimeError, Value};
+use crate::object_graph_observation::eval_optional_callable;
+use crate::runtime_completion_oracle::REGEXP_REPLACE_PRELUDE as PRELUDE;
+use crate::runtime_observation::string_value;
+use quickjs_oxide::engine::api::{RuntimeError, Value};
 
 // Differential lock for pinned QuickJS 2026-06-04 `js_string_replace`
 // (`quickjs.c` 45781-45892), including the shared GetSubstitution helper
 // (`quickjs.c` 45661-45779), String.prototype.replace, and
 // String.prototype.replaceAll.
-
-const PRELUDE: &str = r#"
-function __bit(value){return value?"1":"0"}
-function __bits(object,key){
-    var descriptor=Object.getOwnPropertyDescriptor(object,key);
-    if(descriptor===undefined)return "missing";
-    return __bit(descriptor.writable)+__bit(descriptor.enumerable)+
-        __bit(descriptor.configurable);
-}
-function __isConstructor(value){
-    try{Reflect.construct(function(){},[],value);return true}
-    catch(_error){return false}
-}
-function __show(value){
-    if(value===undefined)return "undefined";
-    if(value===null)return "null";
-    if(typeof value==="number"){
-        if(value!==value)return "NaN";
-        if(value===0)return 1/value===-Infinity?"-0":"+0";
-    }
-    return String(value);
-}
-function __completion(callback){
-    try{return "return:"+String(callback())}
-    catch(error){
-        if(error!==null&&typeof error==="object")
-            return "throw:"+error.name+":"+error.message;
-        return "throw:"+typeof error+":"+String(error);
-    }
-}
-function __units(value){
-    var string=String(value),output=[],index=0;
-    while(index<string.length){
-        output[index]=string.charCodeAt(index).toString(16);
-        index++;
-    }
-    return string.length+"["+output.join(",")+"]";
-}
-"#;
 
 const METADATA_CASES: &[(&str, &str)] = &[
     (
@@ -320,10 +285,7 @@ const RECURSION_CASES: &[(&str, &str)] = &[(
 
 #[test]
 fn string_replace_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP String replace oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("String replace oracle self-check");
     for &(group, cases) in &[
         ("metadata", METADATA_CASES),
         ("protocol", PROTOCOL_CASES),
@@ -380,8 +342,7 @@ fn string_replace_utf16_and_substitution_match_pinned_quickjs() {
 
 #[test]
 fn string_replace_intrinsics_use_their_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let Some(replace) = eval_optional_callable(
@@ -497,25 +458,4 @@ fn string_replace_recursion_matches_pinned_quickjs() {
         .unwrap()
         .join()
         .unwrap();
-}
-
-fn eval_optional_callable(
-    runtime: &Runtime,
-    context: &mut Context,
-    source: &str,
-    description: &str,
-) -> Option<CallableRef> {
-    let value = context
-        .eval(source)
-        .unwrap_or_else(|error| panic!("Rust rejected {description} ({source:?}): {error}"));
-    let Value::Object(object) = value else {
-        return None;
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap_or_else(|error| panic!("inspect {description}: {error}"))
-}
-
-fn string_value(value: &str) -> Value {
-    Value::String(JsString::try_from_utf8(value).unwrap())
 }

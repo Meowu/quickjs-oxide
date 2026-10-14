@@ -1,41 +1,10 @@
 use super::*;
-
-fn eval_string(context: &mut Context, source: &str) -> String {
-    let Value::String(value) = context.eval(source).unwrap() else {
-        panic!("TypedArray reduce test did not return a String");
-    };
-    value.to_utf8_lossy()
-}
-
-fn assert_script(context: &mut Context, source: &str) {
-    assert_eq!(eval_string(context, source), "ok");
-}
-
-fn eval_object(context: &mut Context, source: &str, description: &str) -> ObjectRef {
-    let Value::Object(object) = context
-        .eval(source)
-        .unwrap_or_else(|error| panic!("TypedArray reduce rejected {description}: {error}"))
-    else {
-        panic!("TypedArray reduce {description} was not an Object");
-    };
-    object
-}
-
-fn take_exception_object(context: &mut Context, description: &str) -> ObjectRef {
-    let Value::Object(error) = context
-        .take_exception()
-        .unwrap_or_else(|failure| panic!("take {description}: {failure}"))
-        .unwrap_or_else(|| panic!("{description} was missing"))
-    else {
-        panic!("{description} was not an Object");
-    };
-    error
-}
+use crate::engine::test_support::test_context;
+use crate::engine::test_support::{assert_script, eval_object, take_exception_object};
 
 #[test]
 fn reduce_family_matches_quickjs_accumulator_and_descriptor_contracts() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
 
     assert_script(
         &mut context,
@@ -210,8 +179,7 @@ fn reduce_family_matches_quickjs_accumulator_and_descriptor_contracts() {
 
 #[test]
 fn reduce_family_keeps_snapshot_range_but_reads_each_value_live() {
-    let runtime = Runtime::new();
-    let mut context = runtime.new_context().expect("create context");
+    let (_, mut context) = test_context();
 
     assert_script(
         &mut context,

@@ -1,9 +1,14 @@
+use crate::object_graph_observation::{
+    eval_described_object as eval_object, eval_named_callable as eval_callable,
+    require_object as expect_object,
+};
 use crate::runtime_completion_oracle::{
     compare_read_context_eval_completion_cases_with_prelude,
     observe_quickjs_completion_with_prelude,
 };
+use crate::runtime_observation::host_runtime;
 use crate::runtime_observation::string_property_with_read_context as string_property;
-use quickjs_oxide::engine::api::{CallableRef, Context, ObjectRef, Runtime, Value};
+use quickjs_oxide::engine::api::{Context, ObjectRef, Runtime, Value};
 
 // Differential lock for pinned QuickJS 2026-06-04 named RegExp captures.
 //
@@ -279,10 +284,7 @@ const CONSTRUCTION_AND_COMPILE_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn regexp_named_groups_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP RegExp named-groups oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("RegExp named-groups oracle self-check");
     for (group, cases) in case_groups() {
         for (index, &(description, source)) in cases.iter().enumerate() {
             let observation =
@@ -350,8 +352,7 @@ fn regexp_named_group_construction_and_compile_match_pinned_quickjs() {
 
 #[test]
 fn regexp_named_group_results_use_the_exec_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_array_prototype =
@@ -417,35 +418,6 @@ fn case_groups() -> [(&'static str, &'static [(&'static str, &'static str)]); 5]
         ("replacement", REPLACEMENT_CASES),
         ("construction and compile", CONSTRUCTION_AND_COMPILE_CASES),
     ]
-}
-
-fn eval_object(context: &mut Context, source: &str, description: &str) -> ObjectRef {
-    expect_object(
-        context
-            .eval(source)
-            .unwrap_or_else(|error| panic!("evaluate {description}: {error}")),
-        description,
-    )
-}
-
-fn eval_callable(
-    runtime: &Runtime,
-    context: &mut Context,
-    source: &str,
-    description: &str,
-) -> CallableRef {
-    let callable = eval_object(context, source, description);
-    runtime
-        .as_callable(&callable)
-        .unwrap()
-        .unwrap_or_else(|| panic!("{description} was not callable"))
-}
-
-fn expect_object(value: Value, description: &str) -> ObjectRef {
-    let Value::Object(value) = value else {
-        panic!("{description} was not an object");
-    };
-    value
 }
 
 fn object_property(

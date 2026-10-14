@@ -1,9 +1,14 @@
-use crate::runtime_observation::primitive_value_text;
-use crate::runtime_oracle::value_type;
-
-use quickjs_oxide::engine::api::{
-    CallableRef, Context, JsString, ObjectRef, Runtime, RuntimeError, Value,
+use crate::runtime_completion_oracle::{
+    ErrorPropertyStyle, compare_prelude_cases_collecting_failures,
 };
+use crate::runtime_observation::host_runtime;
+use crate::runtime_observation::primitive_value_text;
+
+use crate::object_graph_observation::{
+    checked_property_value as value_property, eval_described_object as eval_object,
+    eval_named_callable as eval_callable, require_object as expect_object,
+};
+use quickjs_oxide::engine::api::{Context, JsString, ObjectRef, Runtime, Value};
 use std::ffi::OsStr;
 
 // Differential lock for pinned QuickJS 2026-06-04 RegExp match indices.
@@ -192,10 +197,7 @@ const REPLACE_CASES: &[(&str, &str)] = &[(
 
 #[test]
 fn regexp_match_indices_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP RegExp match-indices oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("RegExp match-indices oracle self-check");
     for (group, cases) in case_groups() {
         for &(description, source) in cases {
             let observation = observe_oracle(&oracle, source, description);
@@ -237,8 +239,7 @@ fn regexp_match_indices_replace_callbacks_match_pinned_quickjs() {
 
 #[test]
 fn regexp_match_indices_nested_arrays_use_the_exec_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_array_prototype =
@@ -329,28 +330,13 @@ fn case_groups() -> [(&'static str, &'static [(&'static str, &'static str)]); 5]
 }
 
 fn compare_cases(group: &str, cases: &[(&str, &str)]) {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP {group}: set QJS_ORACLE to upstream qjs");
-        return;
-    };
-    let mut failures = Vec::new();
-    for &(description, source) in cases {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        let actual = observe_rust_eval(&runtime, &mut context, source, description);
-        let expected = observe_oracle(&oracle, source, description);
-        if actual != expected {
-            failures.push(format!(
-                "{description}\nsource: {source:?}\noxide: {actual:?}\noracle: {expected:?}",
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "{group} drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    compare_prelude_cases_collecting_failures(
+        PRELUDE,
+        group,
+        cases,
+        primitive_value_text,
+        ErrorPropertyStyle::CheckedValue,
+        crate::quickjs_oracle::observe_completion,
     );
 }
 
@@ -358,85 +344,9 @@ fn observed_source(source: &str) -> String {
     format!("{PRELUDE}\n{source}")
 }
 
-fn observe_rust_eval(
-    runtime: &Runtime,
-    context: &mut Context,
-    source: &str,
-    description: &str,
-) -> String {
-    let source = observed_source(source);
-    match context.eval(&source) {
-        Ok(value) => format!(
-            "return|{}|{}",
-            value_type(runtime, &value),
-            primitive_value_text(value),
-        ),
-        Err(RuntimeError::Exception) => {
-            let exception = context
-                .take_exception()
-                .unwrap_or_else(|error| panic!("take Rust exception for {description}: {error}"))
-                .unwrap_or_else(|| panic!("Rust exception was missing for {description}"));
-            match exception {
-                Value::Object(error) => format!(
-                    "throw|object|{}|{}",
-                    string_property(runtime, context, &error, "name"),
-                    string_property(runtime, context, &error, "message"),
-                ),
-                value => format!(
-                    "throw|{}|{}",
-                    value_type(runtime, &value),
-                    primitive_value_text(value),
-                ),
-            }
-        }
-        Err(error) => panic!("Rust engine failure for {description} ({source:?}): {error}"),
-    }
-}
-
 fn observe_oracle(oracle: &OsStr, source: &str, description: &str) -> String {
     let source = observed_source(source);
     super::quickjs_oracle::observe_completion(oracle, &source, description)
-}
-
-fn eval_callable(
-    runtime: &Runtime,
-    context: &mut Context,
-    source: &str,
-    description: &str,
-) -> CallableRef {
-    let callable = eval_object(context, source, description);
-    runtime
-        .as_callable(&callable)
-        .unwrap()
-        .unwrap_or_else(|| panic!("{description} was not callable"))
-}
-
-fn eval_object(context: &mut Context, source: &str, description: &str) -> ObjectRef {
-    expect_object(
-        context
-            .eval(source)
-            .unwrap_or_else(|error| panic!("evaluate {description}: {error}")),
-        description,
-    )
-}
-
-fn expect_object(value: Value, description: &str) -> ObjectRef {
-    let Value::Object(value) = value else {
-        panic!("{description} was not an object");
-    };
-    value
-}
-
-fn value_property(
-    runtime: &Runtime,
-    context: &mut Context,
-    object: &ObjectRef,
-    name: &str,
-) -> Value {
-    let key = runtime.intern_property_key(name).unwrap();
-    context
-        .get_property(object, &key)
-        .unwrap_or_else(|error| panic!("read property {name}: {error}"))
 }
 
 fn object_property(
@@ -446,16 +356,4 @@ fn object_property(
     name: &str,
 ) -> ObjectRef {
     expect_object(value_property(runtime, context, object, name), name)
-}
-
-fn string_property(
-    runtime: &Runtime,
-    context: &mut Context,
-    object: &ObjectRef,
-    name: &str,
-) -> String {
-    let Value::String(value) = value_property(runtime, context, object, name) else {
-        panic!("{name} was not a string");
-    };
-    value.to_utf8_lossy()
 }

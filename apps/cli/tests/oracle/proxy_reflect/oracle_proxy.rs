@@ -1,9 +1,10 @@
+use crate::object_graph_observation::define_global;
 use crate::runtime_observation::{
     checked_value_type as value_type, primitive_value_text_with_rust_float as primitive_text,
 };
-use quickjs_oxide::engine::api::{
-    Context, DescriptorField, ObjectRef, OrdinaryPropertyDescriptor, Runtime, RuntimeError, Value,
-};
+use crate::runtime_observation::{host_runtime, host_runtime_context};
+use crate::runtime_oracle::eval_object;
+use quickjs_oxide::engine::api::{Context, ObjectRef, Runtime, RuntimeError, Value};
 use std::ffi::OsStr;
 use std::process::Command;
 
@@ -1113,10 +1114,7 @@ const REENTRANCY_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn proxy_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Proxy oracle self-check: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("Proxy oracle self-check");
     for &(group, cases) in case_groups() {
         for &(description, source) in cases {
             let observation = observe_oracle(&oracle, source, description);
@@ -1130,9 +1128,7 @@ fn proxy_oracle_vectors_self_check() {
 
 #[test]
 fn proxy_forwarding_and_generic_consumers_have_rust_only_regressions() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     for (description, expected) in [
         (
             "empty-handler forwarding retains pinned finite stack overflow behavior",
@@ -1203,8 +1199,7 @@ fn proxy_reentrancy_matches_pinned_quickjs() {
 
 #[test]
 fn proxy_native_and_user_errors_use_their_exact_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_type_error = eval_object(
@@ -1311,9 +1306,7 @@ fn proxy_native_and_user_errors_use_their_exact_realms() {
 
 #[test]
 fn proxy_hidden_edges_survive_gc_and_revocation_is_safe_across_collection() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let record = eval_object(
         &mut context,
         r#"(function(){
@@ -1375,22 +1368,14 @@ fn case_groups() -> &'static [(&'static str, &'static [(&'static str, &'static s
 }
 
 fn compare_groups(groups: &[&str]) {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP Proxy differential for {}: set QJS_ORACLE to pinned upstream qjs",
-            groups.join(", "),
-        );
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("Proxy differential for {}", groups.join(", "));
     let mut failures = Vec::new();
     for &(group, cases) in case_groups()
         .iter()
         .filter(|(group, _)| groups.contains(group))
     {
         for &(description, source) in cases {
-            let runtime =
-                Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-            let mut context = runtime.new_context().expect("create context");
+            let (runtime, mut context) = host_runtime_context();
             let oxide = observe_rust(&runtime, &mut context, source, description);
             let quickjs = observe_oracle(&oracle, source, description);
             if oxide != quickjs {
@@ -1473,36 +1458,6 @@ try {
         .unwrap_or_else(|error| panic!("QuickJS output was not UTF-8 for {description}: {error}"))
         .trim_end()
         .to_owned()
-}
-
-fn define_global(runtime: &Runtime, context: &mut Context, name: &str, value: Value) {
-    let global = context.global_object().unwrap();
-    let key = runtime.intern_property_key(name).unwrap();
-    assert!(
-        context
-            .define_own_property(
-                &global,
-                &key,
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(true),
-                    enumerable: DescriptorField::Present(true),
-                    configurable: DescriptorField::Present(true),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap()
-    );
-}
-
-fn eval_object(context: &mut Context, source: &str, description: &str) -> ObjectRef {
-    let Value::Object(object) = context
-        .eval(source)
-        .unwrap_or_else(|error| panic!("Rust rejected {description} ({source:?}): {error}"))
-    else {
-        panic!("{description} was not an object");
-    };
-    object
 }
 
 fn object_property(

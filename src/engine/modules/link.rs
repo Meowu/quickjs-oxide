@@ -71,7 +71,7 @@ impl LinkResume {
                 let frame = frames.last_mut().ok_or(RuntimeError::Invariant(
                     "module link call stack unexpectedly became empty",
                 ))?;
-                let dependency = frame.dependencies.get(frame.next_dependency).cloned();
+                let dependency = frame.dependencies.get(frame.next_dependency).copied();
                 if dependency.is_some() {
                     frame.next_dependency += 1;
                 }
@@ -322,6 +322,7 @@ const _: () = assert!(std::mem::size_of::<LinkStep>() <= 64);
 mod quarantine_tests {
     use super::*;
     use crate::engine::heap::ModuleId;
+    use crate::engine::test_support::test_context;
     use crate::engine::value::Value;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -349,8 +350,7 @@ mod quarantine_tests {
             }
             return;
         };
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().unwrap();
+        let (runtime, mut context) = test_context();
         let module = context.compile_module("export let value = 1;").unwrap();
         runtime
             .prepare_module_instance(module.raw, context.realm)

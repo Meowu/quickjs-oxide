@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::process::{Command, Output};
 
-use quickjs_oxide::engine::api::{Runtime, Value};
+use crate::runtime_completion_oracle::rust_value_observation;
 
 const VALUE_CASES: &[(&str, &str)] = &[
     (
@@ -329,10 +329,7 @@ const SYNTAX_ERROR_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn ordinary_function_body_lexical_values_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP function-body lexical differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("function-body lexical differential");
 
     for &(description, source) in VALUE_CASES {
         assert_eq!(
@@ -353,10 +350,7 @@ fn ordinary_function_body_lexical_values_match_pinned_quickjs() {
 
 #[test]
 fn lexical_tdz_and_readonly_cli_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP lexical Error stack differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("lexical Error stack differential");
 
     for &(description, source) in BODY_SCOPE_ERROR_CASES
         .iter()
@@ -372,10 +366,7 @@ fn lexical_tdz_and_readonly_cli_stacks_match_pinned_quickjs() {
 
 #[test]
 fn nested_lexical_strip_debug_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP nested lexical StripDebug differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("nested lexical StripDebug differential");
 
     for &(description, source) in NESTED_SCOPE_ERROR_CASES {
         let rust = run_cli_with_options(
@@ -393,10 +384,7 @@ fn nested_lexical_strip_debug_stacks_match_pinned_quickjs() {
 
 #[test]
 fn lexical_parser_diagnostics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP lexical parser differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("lexical parser differential");
 
     for &(description, source) in SYNTAX_ERROR_CASES {
         let rust = run_cli(env!("CARGO_BIN_EXE_qjs").as_ref(), source, description);
@@ -404,31 +392,6 @@ fn lexical_parser_diagnostics_match_pinned_quickjs() {
         assert_eq!(rust.status.code(), quickjs.status.code(), "{description}");
         assert_eq!(rust.stdout, quickjs.stdout, "{description}");
         assert_eq!(rust.stderr, quickjs.stderr, "{description}");
-    }
-}
-
-fn rust_value_observation(source: &str, description: &str) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let value = runtime
-        .new_context()
-        .expect("create context")
-        .eval(source)
-        .unwrap_or_else(|error| panic!("Rust rejected {description} ({source:?}): {error}"));
-    normalize_rust_value(value)
-}
-
-fn normalize_rust_value(value: Value) -> String {
-    match value {
-        Value::Undefined => "undefined|undefined".to_owned(),
-        Value::Null => "object|null".to_owned(),
-        Value::Bool(value) => format!("boolean|{value}"),
-        Value::Int(value) => format!("number|{value}"),
-        Value::Float(value) => format!("number|{value}"),
-        Value::BigInt(value) => format!("bigint|{value}"),
-        Value::String(value) => format!("string|{}", value.to_utf8_lossy()),
-        Value::Object(_) => "object|<object>".to_owned(),
-        Value::Symbol(_) => "symbol|<symbol>".to_owned(),
     }
 }
 

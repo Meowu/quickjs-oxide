@@ -1,7 +1,6 @@
-use quickjs_oxide::engine::api::JsString;
-use quickjs_oxide::regexp::{CompileErrorKind, compile, execute};
-use std::ffi::OsStr;
-use std::fmt::Write as _;
+use crate::oracle_cases::{CompileCase, StartMatchCase as MatchCase};
+use crate::runtime_observation::utf16;
+use crate::support::regexp_probe_oracle::{compare_lookaround, self_check_lookaround};
 
 // Differential lock for pinned QuickJS 2026-06-04 forward lookahead.
 //
@@ -12,23 +11,6 @@ use std::fmt::Write as _;
 // input restoration, positive capture retention, rollback on every negative or
 // abandoned path, positive assertion atomicity, nesting, Annex B quantified
 // assertions, scoped modifiers, and UTF-16/code-point boundaries.
-
-#[derive(Debug)]
-struct MatchCase {
-    label: &'static str,
-    pattern: Vec<u16>,
-    flags: &'static str,
-    input: Vec<u16>,
-    start: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CompileCase {
-    label: &'static str,
-    pattern: &'static str,
-    flags: &'static str,
-    expected: &'static str,
-}
 
 const COMPILE_CASES: &[CompileCase] = &[
     CompileCase {
@@ -83,71 +65,19 @@ const COMPILE_CASES: &[CompileCase] = &[
 
 #[test]
 fn regexp_lookahead_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP RegExp lookahead oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
-
-    let cases = match_cases();
-    let observations = run_match_oracle(&oracle, &cases);
-    assert_eq!(observations.len(), cases.len());
-    for (case, observation) in cases.iter().zip(&observations) {
-        assert!(
-            observation == "N" || observation.starts_with("M|"),
-            "lookahead oracle vector had no match completion for {}: {observation:?}",
-            case.label,
-        );
-    }
-
-    let observations = run_compile_oracle(&oracle, COMPILE_CASES);
-    assert_eq!(observations.len(), COMPILE_CASES.len());
-    for (case, observation) in COMPILE_CASES.iter().zip(&observations) {
-        assert_eq!(
-            observation, case.expected,
-            "pinned QuickJS lookahead grammar changed for {}",
-            case.label,
-        );
-    }
+    let oracle = require_qjs_oracle!("RegExp lookahead oracle self-check");
+    self_check_lookaround(&oracle, "lookahead", &match_cases(), COMPILE_CASES);
 }
 
 #[test]
 fn regexp_lookahead_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP RegExp lookahead differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
-
-    let cases = match_cases();
-    let oracle_observations = run_match_oracle(&oracle, &cases);
-    assert_eq!(oracle_observations.len(), cases.len());
-
-    let mut failures = Vec::new();
-    for (index, (case, expected)) in cases.iter().zip(&oracle_observations).enumerate() {
-        let actual = observe_rust_match(case);
-        if actual != *expected {
-            failures.push(format!(
-                "match case {index}: {}\npattern: {:?}\nflags: {:?}\ninput: {:?}\nstart: {}\noxide: {actual:?}\noracle: {expected:?}",
-                case.label, case.pattern, case.flags, case.input, case.start,
-            ));
-        }
-    }
-
-    let oracle_observations = run_compile_oracle(&oracle, COMPILE_CASES);
-    for (index, (case, expected)) in COMPILE_CASES.iter().zip(&oracle_observations).enumerate() {
-        let actual = observe_rust_compile(case);
-        if actual != *expected {
-            failures.push(format!(
-                "compile case {index}: {}\npattern: {:?}\nflags: {:?}\noxide: {actual:?}\noracle: {expected:?}",
-                case.label, case.pattern, case.flags,
-            ));
-        }
-    }
-
-    assert!(
-        failures.is_empty(),
-        "RegExp forward lookahead drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    let oracle = require_qjs_oracle!("RegExp lookahead differential");
+    compare_lookaround(
+        &oracle,
+        "lookahead",
+        "RegExp forward lookahead",
+        &match_cases(),
+        COMPILE_CASES,
     );
 }
 
@@ -375,162 +305,4 @@ fn ascii(
         input: utf16(input),
         start,
     }
-}
-
-fn utf16(value: &str) -> Vec<u16> {
-    value.encode_utf16().collect()
-}
-
-fn observe_rust_match(case: &MatchCase) -> String {
-    let pattern = JsString::try_from_utf16(case.pattern.iter().copied()).unwrap();
-    let flags = JsString::try_from_utf8(case.flags).unwrap();
-    let program = match compile(&pattern, &flags) {
-        Ok(program) => program,
-        Err(error) => {
-            return format!(
-                "CompileError|{:?}|{}|{}",
-                error.kind(),
-                error.position(),
-                error.message(),
-            );
-        }
-    };
-    match execute(&program, &case.input, case.start) {
-        Ok(result) => observe_rust_result(result.as_ref(), &case.input),
-        Err(error) => format!("ExecError|{error}"),
-    }
-}
-
-fn observe_rust_compile(case: &CompileCase) -> String {
-    let pattern = JsString::try_from_utf8(case.pattern).unwrap();
-    let flags = JsString::try_from_utf8(case.flags).unwrap();
-    match compile(&pattern, &flags) {
-        Ok(_) => "ok".to_owned(),
-        Err(error) if matches!(error.kind(), CompileErrorKind::Syntax) => "SyntaxError".to_owned(),
-        Err(error) => format!("CompileError|{:?}", error.kind()),
-    }
-}
-
-fn observe_rust_result(
-    result: Option<&quickjs_oxide::regexp::RegExpMatch>,
-    input: &[u16],
-) -> String {
-    let Some(result) = result else {
-        return "N".to_owned();
-    };
-    let complete = result
-        .capture(0)
-        .expect("a successful match has capture zero");
-    let mut output = format!("M|{}|{}", complete.start, result.captures().len());
-    for capture in result.captures() {
-        match capture {
-            None => output.push_str("|U"),
-            Some(range) => {
-                write!(output, "|{},{}:", range.start, range.end).unwrap();
-                for unit in &input[range.clone()] {
-                    write!(output, "{unit:04x}").unwrap();
-                }
-            }
-        }
-    }
-    output
-}
-
-fn run_match_oracle(oracle: &OsStr, cases: &[MatchCase]) -> Vec<String> {
-    let mut source = String::from(
-        r#"
-function __qjo_hex_utf16(value) {
-    var result = "";
-    for (var i = 0; i < value.length; i++)
-        result += ("0000" + value.charCodeAt(i).toString(16)).slice(-4);
-    return result;
-}
-function __qjo_observe_lookahead(test) {
-    var flags = test.flags;
-    if (flags.indexOf("d") < 0) flags += "d";
-    if (flags.indexOf("g") < 0 && flags.indexOf("y") < 0) flags += "g";
-    var regexp = new RegExp(test.pattern, flags);
-    regexp.lastIndex = test.start;
-    var match = regexp.exec(test.input);
-    if (match === null) return "N";
-    var fields = ["M", String(match.index), String(match.length)];
-    for (var i = 0; i < match.length; i++) {
-        if (match[i] === undefined) {
-            fields.push("U");
-        } else {
-            var range = match.indices[i];
-            fields.push(String(range[0]) + "," + String(range[1]) + ":" +
-                        __qjo_hex_utf16(match[i]));
-        }
-    }
-    return fields.join("|");
-}
-var __qjo_lookahead_cases = [
-"#,
-    );
-    for case in cases {
-        writeln!(
-            source,
-            "{{pattern:{},flags:{:?},input:{},start:{}}},",
-            js_utf16(&case.pattern),
-            case.flags,
-            js_utf16(&case.input),
-            case.start,
-        )
-        .unwrap();
-    }
-    source.push_str(
-        r#"];
-for (var __qjo_i = 0; __qjo_i < __qjo_lookahead_cases.length; __qjo_i++)
-    print(__qjo_i + "|" + __qjo_observe_lookahead(__qjo_lookahead_cases[__qjo_i]));
-"#,
-    );
-    super::quickjs_indexed_oracle::eval_indexed_plain_lines(
-        oracle,
-        &source,
-        cases.len(),
-        "RegExp lookahead matching",
-    )
-}
-
-fn run_compile_oracle(oracle: &OsStr, cases: &[CompileCase]) -> Vec<String> {
-    let mut source = String::from("var __qjo_lookahead_compile_cases = [\n");
-    for case in cases {
-        writeln!(
-            source,
-            "{{pattern:{},flags:{:?}}},",
-            js_utf16(&utf16(case.pattern)),
-            case.flags,
-        )
-        .unwrap();
-    }
-    source.push_str(
-        r#"];
-for (var __qjo_i = 0; __qjo_i < __qjo_lookahead_compile_cases.length; __qjo_i++) {
-    var result = "ok";
-    try {
-        new RegExp(__qjo_lookahead_compile_cases[__qjo_i].pattern,
-                   __qjo_lookahead_compile_cases[__qjo_i].flags);
-    } catch (error) {
-        result = error.name;
-    }
-    print(__qjo_i + "|" + result);
-}
-"#,
-    );
-    super::quickjs_indexed_oracle::eval_indexed_plain_lines(
-        oracle,
-        &source,
-        cases.len(),
-        "RegExp lookahead grammar",
-    )
-}
-
-fn js_utf16(units: &[u16]) -> String {
-    let mut source = String::from("\"");
-    for unit in units {
-        write!(source, "\\u{unit:04x}").unwrap();
-    }
-    source.push('"');
-    source
 }

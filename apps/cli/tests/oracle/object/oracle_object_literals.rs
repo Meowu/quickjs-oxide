@@ -1,4 +1,5 @@
-use quickjs_oxide::engine::api::{JsString, Runtime, RuntimeError, Value};
+use crate::runtime_observation::{host_runtime, host_runtime_context};
+use quickjs_oxide::engine::api::{JsString, RuntimeError, Value};
 use std::ffi::OsStr;
 use std::process::Command;
 
@@ -113,19 +114,14 @@ const PROBE: &str = r#"
 
 #[test]
 fn object_literal_observations_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP object-literal differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("object-literal differential");
 
     assert_eq!(rust_observation(), oracle_observation(&oracle));
 }
 
 #[test]
 fn object_literal_duplicate_proto_is_an_early_error() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert!(matches!(
         context.compile("({__proto__:1,__proto__:2})"),
         Err(RuntimeError::Exception)
@@ -141,9 +137,7 @@ fn object_literal_duplicate_proto_is_an_early_error() {
 }
 
 fn rust_observation() -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     let Value::String(value) = context
         .eval(PROBE)
         .expect("Rust object-literal probe failed")
@@ -193,8 +187,7 @@ fn probe_expected_shape_is_stable_without_an_oracle() {
 
 #[test]
 fn object_literal_result_uses_the_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let function = defining

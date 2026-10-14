@@ -64,9 +64,8 @@ impl RuntimeState {
                                     }
                                 }
                             }
-                        } else {
-                            self.select_special_storage_read(object, atom)?
                         }
+                        self.select_special_storage_read(object, atom)?
                     }
                     SpecialKind::ModuleNamespace | SpecialKind::Other => {
                         self.select_special_storage_read(object, atom)?
@@ -166,7 +165,7 @@ impl RuntimeState {
 
     /// Primitive receivers keep their value representation. Their realm owns
     /// the prototype; only an indexed string's new code-unit value allocates.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn select_value_read_in_state(
         &mut self,
         poisoned: &std::cell::Cell<bool>,
@@ -198,11 +197,10 @@ impl RuntimeState {
                         .pinned_atoms
                         .get(crate::engine::atom::pinned::PinnedAtom::Length)
                 {
-                    return Ok(Some(
-                        i32::try_from(string.len())
-                            .map(JsValue::Int)
-                            .unwrap_or_else(|_| JsValue::Float(string.len() as f64)),
-                    ));
+                    return Ok(Some(i32::try_from(string.len()).map_or_else(
+                        |_| JsValue::Float(string.len() as f64),
+                        JsValue::Int,
+                    )));
                 }
                 PrimitiveKind::String
             }
@@ -234,12 +232,12 @@ impl RuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::api::{Runtime, Value};
+    use crate::engine::api::Value;
+    use crate::engine::test_support::test_context;
 
     #[test]
     fn absence_stays_distinct_from_a_getterless_accessor_for_global_resolution() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().unwrap();
+        let (runtime, mut context) = test_context();
         let Value::Object(base) = context
             .eval("Object.defineProperty(Object.create(null), 'x', {get: undefined})")
             .unwrap()
@@ -274,8 +272,7 @@ mod tests {
 
     #[test]
     fn inherited_data_keeps_only_the_result_owner_after_last_receiver_release() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().unwrap();
+        let (runtime, mut context) = test_context();
         let Value::Object(base) = context.eval("({__proto__: {x: {marker: 7}}})").unwrap() else {
             panic!("object receiver");
         };
@@ -313,8 +310,7 @@ mod tests {
 
     #[test]
     fn inherited_getter_and_proxy_are_selected_without_calling_or_retaining_them() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().unwrap();
+        let (runtime, mut context) = test_context();
         for expression in [
             "({__proto__: {get x(){throw 99}}})",
             "({__proto__: new Proxy({}, {get(){throw 98}})})",

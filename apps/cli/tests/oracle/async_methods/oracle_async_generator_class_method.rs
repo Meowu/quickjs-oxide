@@ -4,16 +4,10 @@
 //! iterator remain separate fail-closed milestones. Destructuring parameters
 //! remain outside this milestone's authenticated scope.
 
-use std::ffi::OsStr;
-use std::process::{Command, Output};
-
-use quickjs_oxide::engine::api::{Context, Runtime, RuntimeError, Value};
-
-struct SuccessCase {
-    description: &'static str,
-    source: &'static str,
-    expected_stdout: &'static str,
-}
+use crate::oracle_cases::SuccessCase;
+use crate::runtime_completion_oracle::run;
+use crate::runtime_observation::host_runtime_context;
+use crate::runtime_observation::{assert_success, eval, text};
 
 const SEMANTIC_CASES: &[SuccessCase] = &[
     SuccessCase {
@@ -488,13 +482,8 @@ const INVALID_CONTEXTUAL_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn pinned_quickjs_expectations_are_authenticated() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP async-generator class-method expectation authentication: \
-             set QJS_ORACLE to pinned upstream qjs"
-        );
-        return;
-    };
+    let oracle =
+        require_pinned_qjs_oracle!("async-generator class-method expectation authentication");
 
     for case in SEMANTIC_CASES.iter().chain(VALID_CONTEXTUAL_CASES.iter()) {
         let quickjs = run(&oracle, case.source);
@@ -547,9 +536,7 @@ fn async_generator_class_method_contextual_boundaries_match_pinned_quickjs() {
 
 #[test]
 fn suspended_class_methods_retain_home_objects_across_gc() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     drop(eval(
         &mut context,
         r#"
@@ -623,46 +610,4 @@ fn compare_success_cases(group: &str, cases: &[SuccessCase]) {
             );
         }
     }
-}
-
-fn assert_success(engine: &str, case: &SuccessCase, output: &Output) {
-    assert!(
-        output.status.success(),
-        "{engine} rejected {}: {}\nsource:\n{}",
-        case.description,
-        String::from_utf8_lossy(&output.stderr),
-        case.source
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        case.expected_stdout,
-        "{engine} output drifted for {}",
-        case.description
-    );
-}
-
-fn run(executable: &OsStr, source: &str) -> Output {
-    Command::new(executable)
-        .args(["-e", source])
-        .output()
-        .unwrap_or_else(|error| panic!("could not run {executable:?}: {error}"))
-}
-
-fn eval(context: &mut Context, source: &str) -> Value {
-    context.eval(source).unwrap_or_else(|error| {
-        if error == RuntimeError::Exception {
-            panic!(
-                "unexpected JavaScript exception: {:?}",
-                context.take_exception()
-            );
-        }
-        panic!("unexpected engine error: {error}");
-    })
-}
-
-fn text(value: Value) -> String {
-    let Value::String(value) = value else {
-        panic!("expected a string");
-    };
-    value.to_utf8_lossy()
 }

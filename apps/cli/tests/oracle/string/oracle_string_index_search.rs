@@ -1,12 +1,17 @@
 use crate::quickjs_oracle::observe_completion as observe_oracle;
 use crate::runtime_completion_oracle::compare_eval_completion_cases as compare_cases;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
+use crate::object_graph_observation::{
+    data_descriptor, define_named_builtin_data as define_data, define_to_primitive,
+    eval_source_callable as eval_callable, int_property, intrinsic_prototype,
+    oracle_lines as oracle_script_lines, own_key_names,
+};
 use crate::runtime_observation::{
     property_callable, string_property, take_error_object as take_exception_object,
 };
 use quickjs_oxide::engine::api::{
-    CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DescriptorField, JsString, ObjectRef,
-    OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError, Value, WellKnownSymbol,
+    CallableRef, Context, JsString, ObjectRef, Runtime, RuntimeError, Value,
 };
 use std::ffi::OsStr;
 
@@ -229,10 +234,7 @@ print(removed+'|'+('indexOf' in String.prototype)+'|'+String.prototype.indexOf);
 
 #[test]
 fn string_index_search_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP String index search oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("String index search oracle self-check");
     for &(group, cases) in &[
         ("values", VALUE_CASES),
         ("order", ORDER_CASES),
@@ -266,10 +268,7 @@ fn string_index_search_errors_match_pinned_quickjs() {
 
 #[test]
 fn string_index_search_graph_and_auto_init_identity_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP String index search graph: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("String index search graph");
     assert_eq!(
         rust_graph_observations(),
         oracle_graph_observations(&oracle),
@@ -279,10 +278,7 @@ fn string_index_search_graph_and_auto_init_identity_match_pinned_quickjs() {
 
 #[test]
 fn string_index_search_auto_init_can_be_deleted_before_first_get() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP String index search fresh delete: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("String index search fresh delete");
     assert_eq!(
         rust_fresh_delete_observation(),
         oracle_script_lines(&oracle, FRESH_DELETE_ORACLE, "fresh indexOf delete")
@@ -295,8 +291,7 @@ fn string_index_search_auto_init_can_be_deleted_before_first_get() {
 
 #[test]
 fn string_index_search_cross_realm_errors_and_user_throws_are_exact() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_string = defining.string_prototype().unwrap();
@@ -385,8 +380,7 @@ fn string_index_search_cross_realm_errors_and_user_throws_are_exact() {
 
 #[test]
 fn string_index_search_methods_are_per_realm_and_retain_then_release_their_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let (index_of, last_index_of) = {
         let mut first = runtime.new_context().expect("create context");
         let mut second = runtime.new_context().expect("create context");
@@ -438,9 +432,7 @@ fn string_index_search_methods_are_per_realm_and_retain_then_release_their_realm
 }
 
 fn rust_graph_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let prototype = context.string_prototype().unwrap();
     let function_prototype = context.function_prototype().unwrap();
     let selected = [
@@ -556,14 +548,8 @@ fn oracle_graph_observations(oracle: &OsStr) -> Vec<String> {
     oracle_script_lines(oracle, GRAPH_ORACLE, "String index search graph")
 }
 
-fn oracle_script_lines(oracle: &OsStr, source: &str, description: &str) -> Vec<String> {
-    super::quickjs_oracle::eval_std_lines(oracle, source, description)
-}
-
 fn rust_fresh_delete_observation() -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let prototype = context.string_prototype().unwrap();
     let key = runtime.intern_property_key("indexOf").unwrap();
     let removed = runtime.delete_property(&prototype, &key).unwrap();
@@ -574,19 +560,6 @@ fn rust_fresh_delete_observation() -> String {
         _ => "present",
     };
     format!("{removed}|{present}|{text}")
-}
-
-fn define_to_primitive(runtime: &Runtime, object: &ObjectRef, callable: CallableRef) {
-    define_data_key(
-        runtime,
-        object,
-        &PropertyKey::from(
-            runtime
-                .well_known_symbol(WellKnownSymbol::ToPrimitive)
-                .expect("well-known symbol"),
-        ),
-        Value::Object(callable.as_object().try_clone().expect("duplicate root")),
-    );
 }
 
 fn define_method(
@@ -605,119 +578,15 @@ fn define_method(
     );
 }
 
-fn define_data(runtime: &Runtime, object: &ObjectRef, name: &str, value: Value) {
-    define_data_key(
-        runtime,
-        object,
-        &runtime.intern_property_key(name).unwrap(),
-        value,
-    );
-}
-
-fn define_data_key(runtime: &Runtime, object: &ObjectRef, key: &PropertyKey, value: Value) {
-    assert!(
-        runtime
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(true),
-                    enumerable: DescriptorField::Present(false),
-                    configurable: DescriptorField::Present(true),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap()
-    );
-}
-
-fn eval_callable(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("{source:?} did not evaluate to an object");
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("{source:?} was not callable"))
-}
-
-fn intrinsic_prototype(runtime: &Runtime, context: &mut Context, name: &str) -> ObjectRef {
-    let global = context.global_object().unwrap();
-    let constructor = property_callable(runtime, context, &global, name);
-    let Value::Object(prototype) = context
-        .get_property(
-            constructor.as_object(),
-            &runtime.intern_property_key("prototype").unwrap(),
-        )
-        .unwrap()
-    else {
-        panic!("{name}.prototype was not an object");
-    };
-    prototype
-}
-
-fn int_property(runtime: &Runtime, context: &mut Context, object: &ObjectRef, name: &str) -> i32 {
-    let Value::Int(value) = context
-        .get_property(object, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-    else {
-        panic!("{name} was not an Int property");
-    };
-    value
-}
-
-fn own_key_names(runtime: &Runtime, object: &ObjectRef) -> Vec<String> {
-    runtime
-        .own_property_keys(object)
-        .unwrap()
-        .into_iter()
-        .map(|key| {
-            runtime
-                .property_key_to_js_string(&key)
-                .unwrap()
-                .to_utf8_lossy()
-        })
-        .collect()
-}
-
-fn data_descriptor(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    key: &PropertyKey,
-) -> (Value, bool, bool, bool) {
-    let CompleteOrdinaryPropertyDescriptor::Data {
-        value,
-        writable,
-        enumerable,
-        configurable,
-    } = runtime
-        .get_own_property(object, key)
-        .unwrap()
-        .expect("missing data descriptor")
-    else {
-        panic!("property was not a data descriptor");
-    };
-    (value, writable, enumerable, configurable)
-}
-
 fn descriptor_bits(descriptor: (Value, bool, bool, bool)) -> String {
     format!(
         "D:{}{}{}",
-        Number(descriptor.1),
-        Number(descriptor.2),
-        Number(descriptor.3),
+        u8::from(descriptor.1),
+        u8::from(descriptor.2),
+        u8::from(descriptor.3),
     )
 }
 
-struct Number(bool);
-
 fn js_string(value: &str) -> JsString {
     JsString::try_from_utf8(value).unwrap()
-}
-
-impl std::fmt::Display for Number {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(if self.0 { "1" } else { "0" })
-    }
 }

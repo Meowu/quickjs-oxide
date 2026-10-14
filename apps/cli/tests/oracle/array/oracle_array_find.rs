@@ -1,6 +1,7 @@
 use super::support::*;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
-use quickjs_oxide::engine::api::{CallableRef, Context, Runtime, RuntimeError, Value};
+use quickjs_oxide::engine::api::{RuntimeError, Value};
 use std::ffi::OsStr;
 
 // This target pins QuickJS 2026-06-04's shared `js_array_find` kernel. Unlike
@@ -204,10 +205,7 @@ print('meta='+metadata('findLastIndex'));
 
 #[test]
 fn array_find_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array.find oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array.find oracle self-check");
     for &(group, cases) in &[
         ("values", VALUE_CASES),
         ("order", ORDER_CASES),
@@ -247,10 +245,7 @@ fn array_find_errors_match_pinned_quickjs() {
 
 #[test]
 fn array_find_prototype_order_and_metadata_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array.find graph differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array.find graph differential");
     assert_eq!(
         rust_graph_observations(),
         oracle_graph_observations(&oracle),
@@ -260,8 +255,7 @@ fn array_find_prototype_order_and_metadata_match_pinned_quickjs() {
 
 #[test]
 fn array_find_native_errors_and_user_throws_use_pinned_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_array_prototype = defining.array_prototype().unwrap();
@@ -368,9 +362,7 @@ fn array_find_native_errors_and_user_throws_use_pinned_realms() {
 }
 
 fn rust_graph_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let array_prototype = context.array_prototype().unwrap();
     let function_prototype = context.function_prototype().unwrap();
     let implemented = [
@@ -419,17 +411,4 @@ fn rust_graph_observations() -> Vec<String> {
 
 fn oracle_graph_observations(oracle: &OsStr) -> Vec<String> {
     super::quickjs_oracle::eval_std_lines(oracle, GRAPH_ORACLE, "Array.find graph oracle")
-}
-
-fn eval_callable(
-    runtime: &Runtime,
-    context: &mut Context,
-    source: &str,
-    description: &str,
-) -> CallableRef {
-    let object = eval_object(context, source, description);
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("Rust {description} was not callable"))
 }

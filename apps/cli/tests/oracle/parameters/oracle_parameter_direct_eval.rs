@@ -1,16 +1,8 @@
 use super::quickjs_argv_completion_oracle::observe_completion_argv_trim_end as observe_oracle;
-use crate::runtime_observation::{
-    checked_value_type as value_type, primitive_value_text_with_rust_float as primitive_text,
-};
-use crate::runtime_oracle::error_string_property;
-use quickjs_oxide::engine::api::{Context, Runtime, RuntimeError, Value};
-
-struct Case {
-    group: &'static str,
-    description: &'static str,
-    source: &'static str,
-    expected: &'static str,
-}
+use crate::grouped_case_oracle::assert_grouped_cases_agree;
+use crate::oracle_cases::GroupedCase as Case;
+use crate::runtime_completion_oracle::observe_rust_with_engine_errors as observe_rust;
+use crate::runtime_observation::host_runtime_context;
 
 // Pins QuickJS 2026-06-04's separate parameter lexical environment and the
 // hidden sloppy-direct-eval variable objects conventionally named `<arg_var>`
@@ -293,111 +285,41 @@ fn parameter_direct_eval_oracle_inventory_is_stable() {
 
 #[test]
 fn parameter_direct_eval_matches_pinned_expectations() {
-    let mut failures = Vec::new();
-    for case in CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        let actual = observe_rust(&runtime, &mut context, case.source, case.description);
-        if actual != case.expected {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\noxide: {:?}\nexpected: {:?}",
-                case.group, case.description, case.source, actual, case.expected,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "parameter-direct-eval pinned expectations failed in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    assert_grouped_cases_agree(
+        CASES,
+        "parameter-direct-eval pinned expectations failed",
+        ["oxide", "expected"],
+        |case| {
+            let (runtime, mut context) = host_runtime_context();
+            observe_rust(&runtime, &mut context, case.source, case.description)
+        },
+        |case| case.expected.to_owned(),
     );
 }
 
 #[test]
 fn parameter_direct_eval_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP parameter-direct-eval oracle self-check: set QJS_ORACLE to pinned upstream qjs"
-        );
-        return;
-    };
-    let mut failures = Vec::new();
-    for case in CASES {
-        let actual = observe_oracle(&oracle, case.source, case.description);
-        if actual != case.expected {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\nactual: {:?}\nexpected: {:?}",
-                case.group, case.description, case.source, actual, case.expected,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "pinned QuickJS parameter-direct-eval vectors drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    let oracle = require_pinned_qjs_oracle!("parameter-direct-eval oracle self-check");
+    assert_grouped_cases_agree(
+        CASES,
+        "pinned QuickJS parameter-direct-eval vectors drifted",
+        ["actual", "expected"],
+        |case| observe_oracle(&oracle, case.source, case.description),
+        |case| case.expected.to_owned(),
     );
 }
 
 #[test]
 fn parameter_direct_eval_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP parameter-direct-eval differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
-    let mut failures = Vec::new();
-    for case in CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        let oxide = observe_rust(&runtime, &mut context, case.source, case.description);
-        let quickjs = observe_oracle(&oracle, case.source, case.description);
-        if oxide != quickjs {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\noxide: {:?}\nquickjs: {:?}",
-                case.group, case.description, case.source, oxide, quickjs,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "parameter-direct-eval semantics drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    let oracle = require_pinned_qjs_oracle!("parameter-direct-eval differential");
+    assert_grouped_cases_agree(
+        CASES,
+        "parameter-direct-eval semantics drifted",
+        ["oxide", "quickjs"],
+        |case| {
+            let (runtime, mut context) = host_runtime_context();
+            observe_rust(&runtime, &mut context, case.source, case.description)
+        },
+        |case| observe_oracle(&oracle, case.source, case.description),
     );
-}
-
-fn observe_rust(
-    runtime: &Runtime,
-    context: &mut Context,
-    source: &str,
-    description: &str,
-) -> String {
-    match context.eval(source) {
-        Ok(value) => format!(
-            "return|{}|{}",
-            value_type(runtime, &value),
-            primitive_text(value),
-        ),
-        Err(RuntimeError::Exception) => {
-            let exception = context
-                .take_exception()
-                .unwrap_or_else(|error| panic!("take Rust exception for {description}: {error}"))
-                .unwrap_or_else(|| panic!("Rust exception was missing for {description}"));
-            match exception {
-                Value::Object(error) => format!(
-                    "throw|object|{}|{}",
-                    error_string_property(runtime, context, &error, "name", description),
-                    error_string_property(runtime, context, &error, "message", description),
-                ),
-                value => format!(
-                    "throw|{}|{}",
-                    value_type(runtime, &value),
-                    primitive_text(value),
-                ),
-            }
-        }
-        Err(error) => format!("engine|{error}"),
-    }
 }

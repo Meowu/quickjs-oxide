@@ -73,20 +73,11 @@ impl FrameSlots<'_> {
         &mut self,
         state: &mut RuntimeState,
     ) -> Option<bool> {
-        fn edge(value: &JsValue) -> Option<Option<crate::engine::heap::ObjectId>> {
-            match value {
-                JsValue::Undefined
-                | JsValue::Null
-                | JsValue::Bool(_)
-                | JsValue::Int(_)
-                | JsValue::Float(_)
-                | JsValue::ShortBigInt(_) => Some(None),
-                JsValue::Object(id) => Some(Some(*id)),
-                _ => None,
-            }
-        }
         let (left, right) = self.store.top_pair_current(self.window)?;
-        let equal = match (edge(left)?, edge(right)?) {
+        let equal = match (
+            immediate_or_object_edge(left)?,
+            immediate_or_object_edge(right)?,
+        ) {
             (None, None) => crate::engine::object::storage::strict_equal_immediate(left, right),
             // An object never equals an immediate.
             (Some(id), None) | (None, Some(id)) => {
@@ -389,7 +380,7 @@ impl FrameSlots<'_> {
         keep_key: bool,
     ) -> Result<bool, Error> {
         let index = match self.peek(0)? {
-            JsValue::Int(index) if *index >= 0 => *index as u32,
+            JsValue::Int(index) if *index >= 0 => index.cast_unsigned(),
             JsValue::String(id) => {
                 let Some(index) = crate::engine::atom::AtomTable::canonical_array_index(
                     state.heap.string_fast(*id),
@@ -429,7 +420,7 @@ impl FrameSlots<'_> {
         poisoned: &std::cell::Cell<bool>,
     ) -> Result<bool, Error> {
         let index = match self.peek(0)? {
-            JsValue::Int(index) if *index >= 0 => *index as u32,
+            JsValue::Int(index) if *index >= 0 => index.cast_unsigned(),
             JsValue::String(id) => {
                 let Some(index) = crate::engine::atom::AtomTable::canonical_array_index(
                     state.heap.string_fast(*id),
@@ -460,7 +451,7 @@ impl FrameSlots<'_> {
         Ok(true)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(in crate::engine::vm) fn try_owned_field_write_in_state(
         &mut self,
         state: &mut RuntimeState,
@@ -584,22 +575,13 @@ impl FrameSlots<'_> {
     /// nothing changes and the caller takes its general release.
     #[inline(always)]
     fn discard_top_pair_nonfinal(&mut self, state: &mut RuntimeState) -> bool {
-        fn edge(value: &JsValue) -> Option<Option<crate::engine::heap::ObjectId>> {
-            match value {
-                JsValue::Undefined
-                | JsValue::Null
-                | JsValue::Bool(_)
-                | JsValue::Int(_)
-                | JsValue::Float(_)
-                | JsValue::ShortBigInt(_) => Some(None),
-                JsValue::Object(id) => Some(Some(*id)),
-                _ => None,
-            }
-        }
         let Some((below, top)) = self.store.top_pair_current(self.window) else {
             return false;
         };
-        let (Some(below), Some(top)) = (edge(below), edge(top)) else {
+        let (Some(below), Some(top)) = (
+            immediate_or_object_edge(below),
+            immediate_or_object_edge(top),
+        ) else {
             return false;
         };
         match (below, top) {
@@ -761,9 +743,27 @@ impl FrameSlots<'_> {
     }
 }
 
+/// Classify an operand for the in-place release fast paths: `Some(None)` for
+/// an immediate, `Some(Some(id))` for an object edge, `None` for a heap
+/// payload (string, BigInt, Symbol) that needs the general release.
+#[inline(always)]
+fn immediate_or_object_edge(value: &JsValue) -> Option<Option<crate::engine::heap::ObjectId>> {
+    match value {
+        JsValue::Undefined
+        | JsValue::Null
+        | JsValue::Bool(_)
+        | JsValue::Int(_)
+        | JsValue::Float(_)
+        | JsValue::ShortBigInt(_) => Some(None),
+        JsValue::Object(id) => Some(Some(*id)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::test_support::test_context;
     use crate::engine::{
         api::Runtime,
         code::{
@@ -784,8 +784,7 @@ mod tests {
             "(()=>{let a=[];a[0]=a;return a})()",
         ] {
             for (keep_receiver, keep_key) in [(false, false), (true, false), (true, true)] {
-                let runtime = Runtime::new();
-                let mut context = runtime.new_context().unwrap();
+                let (runtime, mut context) = test_context();
                 let base = runtime
                     .into_jsvalue(context.eval(expression).unwrap())
                     .unwrap();
@@ -871,8 +870,7 @@ mod tests {
     #[cfg(feature = "profiling")]
     #[test]
     fn dense_heap_reads_finish_without_property_driver_handoff() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().unwrap();
+        let (_, mut context) = test_context();
         let _ = context
             .eval("var denseReceiver=[{}];function readDenseValue(){return denseReceiver[0]}")
             .unwrap();
@@ -899,8 +897,7 @@ mod tests {
         // Heap handles copy through the trusted saturating retain, so the
         // retain failure is injected on a symbol element's checked atom count.
         for capacity_failure in [false, true] {
-            let runtime = Runtime::new();
-            let mut context = runtime.new_context().unwrap();
+            let (runtime, mut context) = test_context();
             let base = runtime
                 .into_jsvalue(context.eval("[Symbol('element')]").unwrap())
                 .unwrap();
@@ -1036,8 +1033,7 @@ mod tests {
 
     #[test]
     fn duplicate_failure_leaves_every_committed_prefix_owner_in_slots() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().unwrap();
+        let (runtime, mut context) = test_context();
         let mut layout = PublishedFunctionSnapshot::empty_for_test(context.realm);
         layout.metadata.max_stack = 4;
         // Objects copy through the trusted saturating retain; the symbol's

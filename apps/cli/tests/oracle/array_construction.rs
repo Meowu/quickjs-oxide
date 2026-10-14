@@ -1,8 +1,7 @@
-use crate::quickjs_argv_completion_oracle;
-use crate::runtime_completion_oracle::observe_eval_completion_with_error_context as observe_rust_eval;
-
-use crate::runtime_oracle::{eval_object, run_cli};
-use quickjs_argv_completion_oracle::observe_completion_argv_trim_end as observe_oracle;
+use crate::runtime_completion_oracle::{compare_cli, compare_value_cases};
+use crate::runtime_observation::string_units;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
+use crate::runtime_oracle::eval_object;
 use quickjs_oxide::engine::api::{
     CompleteOrdinaryPropertyDescriptor, Context, DescriptorField, JsString, ObjectRef,
     OrdinaryPropertyDescriptor, Runtime, Value, number_to_string,
@@ -270,10 +269,7 @@ fn array_runtime_errors_match_pinned_quickjs() {
 
 #[test]
 fn array_parser_diagnostics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array parser differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array parser differential");
     for &(description, source) in SYNTAX_CASES {
         compare_cli(&oracle, &[], source, description);
     }
@@ -281,10 +277,7 @@ fn array_parser_diagnostics_match_pinned_quickjs() {
 
 #[test]
 fn array_full_strip_source_and_strip_debug_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array stack differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array stack differential");
     for &(description, source) in STACK_CASES {
         compare_cli(&oracle, &[], source, description);
         compare_cli(&oracle, &["--strip-source"], source, description);
@@ -294,15 +287,10 @@ fn array_full_strip_source_and_strip_debug_stacks_match_pinned_quickjs() {
 
 #[test]
 fn array_host_own_keys_and_descriptors_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array host descriptor differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array host descriptor differential");
     for &(description, source) in HOST_SNAPSHOT_CASES {
         let expected = oracle_snapshot(&oracle, source, description);
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         let array = eval_object(&mut context, source, description);
         assert_eq!(
             array_snapshot(&runtime, &mut context, &array),
@@ -314,14 +302,9 @@ fn array_host_own_keys_and_descriptors_match_pinned_quickjs() {
 
 #[test]
 fn array_constructor_graph_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array constructor graph differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array constructor graph differential");
     let expected = oracle_constructor_graph(&oracle);
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(
         rust_constructor_graph(&runtime, &mut context),
         expected,
@@ -331,14 +314,9 @@ fn array_constructor_graph_matches_pinned_quickjs() {
 
 #[test]
 fn array_host_definitions_use_array_set_length_semantics() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array host mutation differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array host mutation differential");
     let expected = oracle_host_mutation(&oracle);
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(
         rust_host_mutation(&runtime, &mut context),
         expected,
@@ -348,8 +326,7 @@ fn array_host_definitions_use_array_set_length_semantics() {
 
 #[test]
 fn array_literal_iterator_and_errors_use_the_bytecode_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     drop(
@@ -371,24 +348,6 @@ fn array_literal_iterator_and_errors_use_the_bytecode_defining_realm() {
             .expect("execute Array probe cross realm"),
         Value::String(JsString::try_from_utf8("defining|defining").unwrap()),
     );
-}
-
-fn compare_value_cases(group: &str, cases: &[(&str, &str)]) {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP {group} differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
-    for &(description, source) in cases {
-        let expected = observe_oracle(&oracle, source, description);
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        assert_eq!(
-            observe_rust_eval(&runtime, &mut context, source, description),
-            expected,
-            "{group} drifted for {description}: {source:?}",
-        );
-    }
 }
 
 fn array_snapshot(runtime: &Runtime, context: &mut Context, array: &ObjectRef) -> String {
@@ -418,9 +377,9 @@ fn descriptor_token(descriptor: CompleteOrdinaryPropertyDescriptor) -> String {
         } => format!(
             "D:{}:{}:{}:{}",
             value_token(value),
-            Number(writable),
-            Number(enumerable),
-            Number(configurable),
+            u8::from(writable),
+            u8::from(enumerable),
+            u8::from(configurable),
         ),
         CompleteOrdinaryPropertyDescriptor::Accessor {
             get,
@@ -429,10 +388,10 @@ fn descriptor_token(descriptor: CompleteOrdinaryPropertyDescriptor) -> String {
             configurable,
         } => format!(
             "A:{}:{}:{}:{}",
-            Number(get.is_some()),
-            Number(set.is_some()),
-            Number(enumerable),
-            Number(configurable),
+            u8::from(get.is_some()),
+            u8::from(set.is_some()),
+            u8::from(enumerable),
+            u8::from(configurable),
         ),
     }
 }
@@ -676,24 +635,11 @@ fn command_stdout(oracle: &OsStr, script: &str, description: &str) -> String {
         .to_owned()
 }
 
-fn compare_cli(oracle: &OsStr, options: &[&str], source: &str, description: &str) {
-    let rust = run_cli(
-        env!("CARGO_BIN_EXE_qjs").as_ref(),
-        options,
-        source,
-        description,
-    );
-    let quickjs = run_cli(oracle, options, source, description);
-    assert_eq!(rust.status.code(), quickjs.status.code(), "{description}");
-    assert_eq!(rust.stdout, quickjs.stdout, "{description}");
-    assert_eq!(rust.stderr, quickjs.stderr, "{description}");
-}
-
 fn value_token(value: Value) -> String {
     match value {
         Value::Undefined => "u".to_owned(),
         Value::Null => "n".to_owned(),
-        Value::Bool(value) => format!("b{}", Number(value)),
+        Value::Bool(value) => format!("b{}", u8::from(value)),
         Value::Int(value) => format!("d{value}"),
         Value::Float(value) if value.is_nan() => "dNaN".to_owned(),
         Value::Float(value) if value == 0.0 && value.is_sign_negative() => "d-0".to_owned(),
@@ -702,21 +648,5 @@ fn value_token(value: Value) -> String {
         Value::String(value) => format!("s{}", string_units(&value)),
         Value::Object(_) => "o".to_owned(),
         Value::Symbol(_) => "y".to_owned(),
-    }
-}
-
-fn string_units(value: &JsString) -> String {
-    value
-        .utf16_units()
-        .map(|unit| format!("{unit:04x}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-struct Number(bool);
-
-impl std::fmt::Display for Number {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(if self.0 { "1" } else { "0" })
     }
 }

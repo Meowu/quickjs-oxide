@@ -1,8 +1,15 @@
-use crate::runtime_observation::{property_callable, take_thrown_object as take_exception_object};
+use crate::object_graph_observation::{
+    callable_int_property, callable_string_property, data_flags,
+    define_checked_builtin_data as define_data, define_checked_builtin_data_key as define_data_key,
+    eval_callable, global_callable, global_string, intrinsic_prototype,
+    joined_own_key_names as own_key_names,
+};
+use crate::runtime_observation::error_text;
+use crate::runtime_observation::take_thrown_object as take_exception_object;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use quickjs_oxide::engine::api::{
-    CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DescriptorField, EvalOptions,
-    JsBigInt, JsString, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError,
-    Value, WellKnownSymbol,
+    CallableRef, Context, EvalOptions, JsBigInt, JsString, ObjectRef, PropertyKey, Runtime,
+    RuntimeError, Value, WellKnownSymbol,
 };
 use std::ffi::OsStr;
 use std::process::Command;
@@ -299,10 +306,7 @@ const EXPECTED_OBSERVATIONS: &[&str] = &[
 
 #[test]
 fn pinned_quickjs_uri_codec_contract_is_stable() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP pinned URI codec contract: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("pinned URI codec contract");
     assert_eq!(
         oracle_observations(&oracle),
         EXPECTED_OBSERVATIONS,
@@ -318,10 +322,7 @@ fn global_uri_codecs_match_pinned_quickjs() {
         "host-side URI codec contract changed"
     );
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP URI codec differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("URI codec differential");
     assert_eq!(
         rust,
         oracle_observations(&oracle),
@@ -331,8 +332,7 @@ fn global_uri_codecs_match_pinned_quickjs() {
 
 #[test]
 fn global_uri_codec_errors_use_the_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut first = runtime.new_context().expect("create context");
     let mut second = runtime.new_context().expect("create context");
     let first_encode = global_callable(&runtime, &mut first, "encodeURI");
@@ -439,8 +439,7 @@ fn global_uri_codec_errors_use_the_defining_realm() {
 
 #[test]
 fn global_uri_codec_keeps_its_defining_realm_alive_until_collection() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let codec = {
         let mut context = runtime.new_context().expect("create context");
         global_callable(&runtime, &mut context, "encodeURIComponent")
@@ -458,10 +457,7 @@ fn global_uri_codec_keeps_its_defining_realm_alive_until_collection() {
 
 #[test]
 fn global_uri_codec_native_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP URI codec stack differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("URI codec stack differential");
 
     let cases = [
         r#"encodeURI("\ud800")"#,
@@ -495,9 +491,7 @@ fn global_uri_codec_native_stacks_match_pinned_quickjs() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let function_prototype = context.function_prototype().unwrap();
     let codecs = CODEC_NAMES
@@ -1165,127 +1159,6 @@ fn observe_call_args(
     }
 }
 
-fn global_callable(runtime: &Runtime, context: &mut Context, name: &str) -> CallableRef {
-    let global = context.global_object().unwrap();
-    property_callable(runtime, context, &global, name)
-}
-
-fn intrinsic_prototype(runtime: &Runtime, context: &mut Context, name: &str) -> ObjectRef {
-    let constructor = global_callable(runtime, context, name);
-    let prototype = runtime.intern_property_key("prototype").unwrap();
-    let Value::Object(prototype) = context
-        .get_property(constructor.as_object(), &prototype)
-        .unwrap()
-    else {
-        panic!("{name}.prototype was not an object");
-    };
-    prototype
-}
-
-fn own_key_names(runtime: &Runtime, object: &ObjectRef) -> String {
-    runtime
-        .own_property_keys(object)
-        .unwrap()
-        .iter()
-        .map(|key| {
-            runtime
-                .property_key_to_js_string(key)
-                .unwrap()
-                .to_utf8_lossy()
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn data_flags(runtime: &Runtime, object: &ObjectRef, name: &str) -> String {
-    let key = runtime.intern_property_key(name).unwrap();
-    let Some(CompleteOrdinaryPropertyDescriptor::Data {
-        writable,
-        enumerable,
-        configurable,
-        ..
-    }) = runtime.get_own_property(object, &key).unwrap()
-    else {
-        panic!("{name} was not an own data property");
-    };
-    format!(
-        "{}{}{}",
-        u8::from(writable),
-        u8::from(enumerable),
-        u8::from(configurable)
-    )
-}
-
-fn callable_int_property(
-    runtime: &Runtime,
-    context: &mut Context,
-    callable: &CallableRef,
-    name: &str,
-) -> i32 {
-    let Value::Int(value) = context
-        .get_property(
-            callable.as_object(),
-            &runtime.intern_property_key(name).unwrap(),
-        )
-        .unwrap()
-    else {
-        panic!("callable {name} was not an Int");
-    };
-    value
-}
-
-fn callable_string_property(
-    runtime: &Runtime,
-    context: &mut Context,
-    callable: &CallableRef,
-    name: &str,
-) -> String {
-    let Value::String(value) = context
-        .get_property(
-            callable.as_object(),
-            &runtime.intern_property_key(name).unwrap(),
-        )
-        .unwrap()
-    else {
-        panic!("callable {name} was not a String");
-    };
-    value.to_utf8_lossy()
-}
-
-fn define_data(runtime: &Runtime, object: &ObjectRef, name: &str, value: Value) {
-    let key = runtime.intern_property_key(name).unwrap();
-    define_data_key(runtime, object, &key, value);
-}
-
-fn define_data_key(runtime: &Runtime, object: &ObjectRef, key: &PropertyKey, value: Value) {
-    assert!(
-        runtime
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(true),
-                    enumerable: DescriptorField::Present(false),
-                    configurable: DescriptorField::Present(true),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap(),
-        "host data-property definition was rejected"
-    );
-}
-
-fn eval_callable(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("callable source did not produce an object: {source:?}");
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("source did not produce a callable: {source:?}"))
-}
-
 fn set_global_string(
     runtime: &Runtime,
     context: &mut Context,
@@ -1304,21 +1177,6 @@ fn set_global_string(
     );
 }
 
-fn global_string(
-    runtime: &Runtime,
-    context: &mut Context,
-    global: &ObjectRef,
-    name: &str,
-) -> String {
-    let Value::String(value) = context
-        .get_property(global, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-    else {
-        panic!("global {name} was not a string");
-    };
-    value.to_utf8_lossy()
-}
-
 fn global_plain_value(
     runtime: &Runtime,
     context: &mut Context,
@@ -1330,16 +1188,6 @@ fn global_plain_value(
             .get_property(global, &runtime.intern_property_key(name).unwrap())
             .unwrap(),
     )
-}
-
-fn error_text(runtime: &Runtime, context: &mut Context, error: &ObjectRef, name: &str) -> String {
-    let Value::String(value) = context
-        .get_property(error, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-    else {
-        panic!("Error.{name} was not a string");
-    };
-    value.to_utf8_lossy()
 }
 
 fn plain_value(value: Value) -> String {
@@ -1361,9 +1209,7 @@ fn plain_value(value: Value) -> String {
 }
 
 fn rust_uncaught_error(source: &str) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(
         context.eval_with_options(source, &EvalOptions::new("<cmdline>")),
         Err(RuntimeError::Exception)
@@ -1378,9 +1224,7 @@ fn rust_uncaught_error(source: &str) -> String {
 }
 
 fn rust_uncaught_error_with_symbol(source: &str) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     define_data(
         &runtime,
@@ -1418,20 +1262,7 @@ fn native_stack_prefix(stderr: &str, function_name: &str) -> String {
 }
 
 fn oracle_observations(oracle: &OsStr) -> Vec<String> {
-    let output = Command::new(oracle)
-        .args(["-e", ORACLE_PROBE])
-        .output()
-        .expect("run QuickJS URI codec oracle");
-    assert!(
-        output.status.success(),
-        "QuickJS URI codec oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("QuickJS URI codec oracle emitted non-UTF-8 output")
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    crate::quickjs_oracle::probe_lines(oracle, ORACLE_PROBE, "URI codec")
 }
 
 fn oracle_uncaught_error(oracle: &OsStr, source: &str) -> String {

@@ -1,3 +1,8 @@
+use crate::object_graph_observation::{
+    bit, complete_data_descriptor as data_descriptor, function, own_key_names as key_names,
+};
+use crate::runtime_observation::host_runtime_context;
+use crate::runtime_observation::show_exception;
 use quickjs_oxide::engine::api::{
     AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DescriptorField,
     ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError, Value,
@@ -138,19 +143,14 @@ console.log("has-instance-configurable=accepted:" + (accepted ? 1 : 0) +
 
 #[test]
 fn function_prototype_prefix_matches_quickjs_oracle() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Function.prototype prefix differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Function.prototype prefix differential");
 
     assert_eq!(rust_observations(), oracle_observations(&oracle));
 }
 
 #[test]
 fn generator_callables_do_not_receive_the_ordinary_sloppy_restricted_property_exception() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let function_prototype = context.function_prototype().unwrap();
     let restricted = ["caller", "arguments"].map(|name| {
         let key = runtime.intern_property_key(name).unwrap();
@@ -208,12 +208,7 @@ fn generator_callables_do_not_receive_the_ordinary_sloppy_restricted_property_ex
 
 #[test]
 fn lazy_function_prototype_defines_match_quickjs_oracle() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP Function.prototype lazy define differential: set QJS_ORACLE to upstream qjs"
-        );
-        return;
-    };
+    let oracle = require_qjs_oracle!("Function.prototype lazy define differential");
 
     assert_eq!(
         rust_lazy_define_observations(),
@@ -233,9 +228,7 @@ fn lazy_function_prototype_defines_match_quickjs_oracle() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let function_prototype = context.function_prototype().unwrap();
 
     let prefix = runtime
@@ -607,9 +600,7 @@ fn rust_lazy_define_observations() -> Vec<String> {
 }
 
 fn rust_call_data_define(label: &str, descriptor: OrdinaryPropertyDescriptor) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let function_prototype = context.function_prototype().unwrap();
     let call_key = runtime.intern_property_key("call").unwrap();
 
@@ -646,9 +637,7 @@ fn rust_call_data_define(label: &str, descriptor: OrdinaryPropertyDescriptor) ->
 }
 
 fn rust_call_accessor_define() -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let function_prototype = context.function_prototype().unwrap();
     let call_key = runtime.intern_property_key("call").unwrap();
     let getter = function(
@@ -697,9 +686,7 @@ fn rust_call_accessor_define() -> String {
 }
 
 fn rust_has_instance_configurable_rejection() -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let context = runtime.new_context().expect("create context");
+    let (runtime, context) = host_runtime_context();
     let function_prototype = context.function_prototype().unwrap();
     let has_instance_key = PropertyKey::from(
         runtime
@@ -737,16 +724,6 @@ fn rust_has_instance_configurable_rejection() -> String {
     )
 }
 
-fn function(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("function probe did not return an object: {source}");
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("function probe was not callable: {source}"))
-}
-
 fn accessor_descriptor(
     runtime: &Runtime,
     object: &ObjectRef,
@@ -764,23 +741,6 @@ fn accessor_descriptor(
     (get, set, enumerable, configurable)
 }
 
-fn data_descriptor(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    key: &PropertyKey,
-) -> (Value, bool, bool, bool) {
-    let Some(CompleteOrdinaryPropertyDescriptor::Data {
-        value,
-        writable,
-        enumerable,
-        configurable,
-    }) = runtime.get_own_property(object, key).unwrap()
-    else {
-        panic!("expected a complete data descriptor");
-    };
-    (value, writable, enumerable, configurable)
-}
-
 fn getter_descriptor(getter: CallableRef) -> OrdinaryPropertyDescriptor {
     OrdinaryPropertyDescriptor {
         get: DescriptorField::Present(AccessorValue::Callable(getter)),
@@ -789,20 +749,6 @@ fn getter_descriptor(getter: CallableRef) -> OrdinaryPropertyDescriptor {
         configurable: DescriptorField::Present(true),
         ..OrdinaryPropertyDescriptor::new()
     }
-}
-
-fn key_names(runtime: &Runtime, object: &ObjectRef) -> Vec<String> {
-    runtime
-        .own_property_keys(object)
-        .unwrap()
-        .into_iter()
-        .map(|key| {
-            runtime
-                .property_key_to_js_string(&key)
-                .unwrap()
-                .to_utf8_lossy()
-        })
-        .collect()
 }
 
 fn observe_call(
@@ -835,43 +781,8 @@ fn show_value(value: Value) -> String {
     }
 }
 
-fn show_exception(runtime: &Runtime, context: &mut Context, exception: Value) -> String {
-    match exception {
-        Value::String(value) => format!("throw-string:{}", value.to_utf8_lossy()),
-        Value::Object(error) if runtime.is_error_object(&error).unwrap() => {
-            let name = runtime.intern_property_key("name").unwrap();
-            let message = runtime.intern_property_key("message").unwrap();
-            let Value::String(name) = context.get_property(&error, &name).unwrap() else {
-                panic!("error name was not a string");
-            };
-            let Value::String(message) = context.get_property(&error, &message).unwrap() else {
-                panic!("error message was not a string");
-            };
-            format!("throw:{}|{}", name.to_utf8_lossy(), message.to_utf8_lossy())
-        }
-        value => panic!("unexpected thrown probe value: {value:?}"),
-    }
-}
-
-const fn bit(value: bool) -> u8 {
-    value as u8
-}
-
 fn oracle_observations(oracle: &OsStr) -> Vec<String> {
-    let output = Command::new(oracle)
-        .args(["-e", ORACLE_PROBE])
-        .output()
-        .expect("run QuickJS Function.prototype prefix oracle");
-    assert!(
-        output.status.success(),
-        "QuickJS Function.prototype prefix oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("QuickJS Function.prototype prefix oracle emitted non-UTF-8 output")
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    crate::quickjs_oracle::probe_lines(oracle, ORACLE_PROBE, "Function.prototype prefix")
 }
 
 fn oracle_observation(oracle: &OsStr, probe: &str, description: &str) -> String {

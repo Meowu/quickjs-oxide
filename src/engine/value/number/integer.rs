@@ -21,7 +21,7 @@ pub fn to_int32_sat(value: f64) -> i32 {
 /// Unlike [`to_int32_sat`], this path truncates and then reduces modulo 2^32;
 /// global `parseInt` uses it for its radix argument.
 #[must_use]
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 pub fn to_int32(value: f64) -> i32 {
     // A binary64 number already contains its integer bits. As in pinned
     // QuickJS's JS_ToInt32Free, select those bits instead of computing fmod.
@@ -38,7 +38,7 @@ pub fn to_int32(value: f64) -> i32 {
         // high bits performs modulo 2^32; dropping the low 32 truncates
         // fractional bits. Neither shift can exceed its operand width.
         let unsigned = ((significand << (exponent - (1023 + 20))) >> 32) as u32;
-        let signed = unsigned as i32;
+        let signed = unsigned.cast_signed();
         if bits >> 63 != 0 {
             signed.wrapping_neg()
         } else {

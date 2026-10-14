@@ -1,8 +1,13 @@
+use crate::runtime_completion_oracle::{
+    ErrorPropertyStyle, compare_prelude_cases_collecting_failures,
+};
+use crate::runtime_observation::string_value;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use crate::runtime_observation::{
     string_property_with_read_context as string_property, take_exception_object,
 };
-use crate::runtime_oracle::{eval_callable, eval_object, value_type};
-use quickjs_oxide::engine::api::{Context, JsString, Runtime, RuntimeError, Value};
+use crate::runtime_oracle::{eval_callable, eval_object};
+use quickjs_oxide::engine::api::{RuntimeError, Value};
 use std::ffi::OsStr;
 
 // Differential lock for pinned QuickJS 2026-06-04 `js_string_match`'s
@@ -451,10 +456,7 @@ const RECURSION_CASES: &[(&str, &str)] = &[(
 
 #[test]
 fn string_match_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP String/RegExp match oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("String/RegExp match oracle self-check");
     for &(group, cases) in &[
         ("metadata", METADATA_CASES),
         ("String dispatch", STRING_DISPATCH_CASES),
@@ -517,8 +519,7 @@ fn match_protocol_recursion_is_catchable_and_recovers_like_pinned_quickjs() {
 
 #[test]
 fn match_intrinsics_use_defining_realms_and_accept_foreign_regexp_brands() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
 
@@ -664,9 +665,7 @@ fn mixed_string_and_regexp_match_recursion_guard_is_catchable_and_recovers() {
         .name("string-regexp-match-stack-proof".into())
         .stack_size(2 * 1024 * 1024)
         .spawn(|| {
-            let runtime =
-                Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-            let mut context = runtime.new_context().expect("create context");
+            let (_runtime, mut context) = host_runtime_context();
             drop(
                 context
                     .eval(
@@ -737,28 +736,13 @@ fn mixed_string_and_regexp_match_recursion_guard_is_catchable_and_recovers() {
 }
 
 fn compare_cases(group: &str, cases: &[(&str, &str)]) {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP {group}: set QJS_ORACLE to upstream qjs");
-        return;
-    };
-    let mut failures = Vec::new();
-    for &(description, source) in cases {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        let actual = observe_rust_eval(&runtime, &mut context, source, description);
-        let expected = observe_oracle(&oracle, source, description);
-        if actual != expected {
-            failures.push(format!(
-                "{description}\nsource: {source:?}\noxide: {actual:?}\noracle: {expected:?}",
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "{group} drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    compare_prelude_cases_collecting_failures(
+        PRELUDE,
+        group,
+        cases,
+        primitive_value_text,
+        ErrorPropertyStyle::ReadContext,
+        crate::quickjs_oracle::observe_completion,
     );
 }
 
@@ -766,48 +750,9 @@ fn observed_source(source: &str) -> String {
     format!("{PRELUDE}\n{source}")
 }
 
-fn observe_rust_eval(
-    runtime: &Runtime,
-    context: &mut Context,
-    source: &str,
-    description: &str,
-) -> String {
-    let source = observed_source(source);
-    match context.eval(&source) {
-        Ok(value) => format!(
-            "return|{}|{}",
-            value_type(runtime, &value),
-            primitive_value_text(value),
-        ),
-        Err(RuntimeError::Exception) => {
-            let exception = context
-                .take_exception()
-                .unwrap_or_else(|error| panic!("take Rust exception for {description}: {error}"))
-                .unwrap_or_else(|| panic!("Rust exception was missing for {description}"));
-            match exception {
-                Value::Object(error) => format!(
-                    "throw|object|{}|{}",
-                    string_property(runtime, context, &error, "name"),
-                    string_property(runtime, context, &error, "message"),
-                ),
-                value => format!(
-                    "throw|{}|{}",
-                    value_type(runtime, &value),
-                    primitive_value_text(value),
-                ),
-            }
-        }
-        Err(error) => panic!("Rust engine failure for {description} ({source:?}): {error}"),
-    }
-}
-
 fn observe_oracle(oracle: &OsStr, source: &str, description: &str) -> String {
     let source = observed_source(source);
     super::quickjs_oracle::observe_completion(oracle, &source, description)
-}
-
-fn string_value(value: &str) -> Value {
-    Value::String(JsString::try_from_utf8(value).unwrap())
 }
 
 fn primitive_value_text(value: Value) -> String {

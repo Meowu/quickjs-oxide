@@ -455,9 +455,8 @@ impl Runtime {
         let object = ObjectRef::from_owned_handle(self.clone(), object);
         cleanup?;
         if let Some(length) = string_length {
-            let length = i32::try_from(length)
-                .map(Value::Int)
-                .unwrap_or_else(|_| Value::number(length as f64));
+            let length =
+                i32::try_from(length).map_or_else(|_| Value::number(length as f64), Value::Int);
             let key = self.pinned_property_key(crate::engine::atom::pinned::PinnedAtom::Length)?;
             let defined = self.define_own_property(
                 &object,
@@ -983,6 +982,7 @@ impl Runtime {
 #[cfg(test)]
 mod owned_callable_tests {
     use super::*;
+    use crate::engine::test_support::test_context;
     use crate::engine::vm::call::DirectCallTarget;
 
     #[test]
@@ -1038,8 +1038,7 @@ mod owned_callable_tests {
 
     #[test]
     fn owned_and_borrowed_callable_promotion_share_payload_rules() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         for source in [
             "(function(){})",
             "Math.min",
@@ -1140,8 +1139,7 @@ mod owned_callable_tests {
 
     #[test]
     fn owned_callable_promotion_keeps_the_operation_cleanup_boundary() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let Value::Object(object) = context.eval("(function(){})").unwrap() else {
             panic!("expected function");
         };
@@ -1334,7 +1332,7 @@ impl RuntimeState {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new_native_builtin(
         &mut self,
         poisoned: &Cell<bool>,

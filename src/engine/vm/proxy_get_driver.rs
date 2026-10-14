@@ -50,7 +50,7 @@ pub(super) struct PendingProxyGet {
 impl PendingProxyGet {
     // Release fields in their resident allocation rather than moving the wide
     // pending record onto the cleanup stack.
-    #[allow(clippy::boxed_local)]
+    #[expect(clippy::boxed_local)]
     pub(in crate::engine::vm) fn release(mut self: Box<Self>, runtime: &Runtime) {
         if runtime.skip_cleanup() {
             return;
@@ -353,7 +353,6 @@ pub(super) enum Progress {
     Conversion(super::conversion_driver::ConversionTask),
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn start(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -405,7 +404,6 @@ pub(super) fn start(
 }
 
 /// A super lookup retains its frozen base independently of the getter receiver.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn start_owned_read(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -452,7 +450,6 @@ pub(super) fn start_owned_read(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn start_boolean(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -713,7 +710,7 @@ pub(super) fn start_conversion(
     finish_error(runtime, realm, result)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn start_call(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -738,7 +735,7 @@ pub(super) fn start_call(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn start_callback_call(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -765,7 +762,7 @@ pub(super) fn start_callback_call(
 
 /// Enter a native target already normalized and classified by `enter_call`.
 /// Generic callback entry still performs normalization for its other callers.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn start_classified_native_call(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -796,7 +793,7 @@ pub(super) fn start_classified_native_call(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn start_native_with_classification(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -878,7 +875,7 @@ pub(super) fn start_native_with_classification(
 }
 
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn start_waitable_native_call(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -1090,7 +1087,6 @@ pub(super) fn start_apply(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn start_construct(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -1152,7 +1148,7 @@ pub(super) fn start_construct(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 #[inline(never)]
 fn start_local_array_construct(
     runtime: &Runtime,
@@ -1389,7 +1385,7 @@ fn start_proxy_call(
     finish_error(runtime, realm, result)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn start_write(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -1407,7 +1403,7 @@ pub(super) fn start_write(
     .map(super::property_driver::PropertyProgress::into_call_step)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn start_write_progress(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -1432,7 +1428,7 @@ pub(super) fn start_write_progress(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn start_receiver_write_progress(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -1448,7 +1444,7 @@ pub(super) fn start_receiver_write_progress(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn start_write_adapted(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -1514,7 +1510,6 @@ fn start_write_adapted(
 }
 
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn advance_write_pending(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -1544,7 +1539,6 @@ fn advance_write_pending(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn finish_write_action(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -1584,7 +1578,6 @@ fn finish_write_action(
 }
 
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn schedule_write_action(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -1605,7 +1598,6 @@ fn schedule_write_action(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn schedule_write(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -1865,7 +1857,6 @@ fn finish_error(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn advance(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -2016,7 +2007,7 @@ fn advance_inner(
         // Keep domain dispatch frames bounded on the existing 256 KiB host stack.
         // Each helper returns before another request category is dispatched.
         // A plain function pointer keeps the borrowed dispatch ABI explicit without a closure capture or heap transport.
-        #[allow(clippy::type_complexity)]
+        #[expect(clippy::type_complexity)]
         let dispatch: fn(
             &Runtime,
             &mut RunningExecution,
@@ -2157,7 +2148,7 @@ fn release_call_operands(runtime: &Runtime, receiver: JsValue, arguments: Vec<Js
 
 #[inline(never)]
 // Transfer the selected callable and its reply ownership directly; a bundled request would add a second transport.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn invoke(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -2475,13 +2466,13 @@ fn overflow(runtime: &Runtime, realm: crate::engine::heap::ContextId) -> Result<
 mod native_scope_tests {
     use super::*;
     use crate::engine::api::{Context, ErrorKind};
+    use crate::engine::test_support::test_context;
 
     #[cfg(feature = "profiling")]
     #[test]
     fn narrow_native_completion_keeps_pc_tail_waiting_and_cleanup_order() {
         use crate::engine::api::profiling::CostProfile;
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let profile = CostProfile::start();
         let value = context.eval(r#"(function(){
             var total=0, gets=0, values=0, traps=0, errors=0, map=new Map();
@@ -2550,8 +2541,7 @@ mod native_scope_tests {
             frame::{ReturnTarget, ReturnValue},
         };
         for cached in [false, true] {
-            let runtime = Runtime::new();
-            let mut context = runtime.new_context().expect("create context");
+            let (runtime, mut context) = test_context();
             let parent_callable = runtime
                 .callable_from_value(context.eval("(function(){return 1+2})").unwrap())
                 .unwrap();
@@ -2679,8 +2669,7 @@ mod native_scope_tests {
                 ],
             ),
         ] {
-            let runtime = Runtime::new();
-            let mut context = runtime.new_context().expect("create context");
+            let (runtime, mut context) = test_context();
             let receiver = context.eval(receiver).unwrap();
             if name == "RegExp.prototype[Symbol.replace]" || name == "String.prototype.replace" {
                 // The unchanged standard matcher predicate requires a Data
@@ -3007,7 +2996,7 @@ pub(super) fn start_iterator_next(
 /// Complete a known Array-next before allocating a generic iterator operation.
 /// The original iterator record remains live until value/done is committed.
 // The no-wait iterator path uses the existing caller facts and operands without allocating a pending request.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn start_array_next_without_pending(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -3432,7 +3421,6 @@ pub(super) fn start_object_copy(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn start_vm_call(
     runtime: &Runtime,
     execution: &mut RunningExecution,
@@ -3725,7 +3713,7 @@ pub(super) fn start_public_field(
 }
 
 // Only a selected special definition needs the wide query representation.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 #[inline(never)]
 fn start_public_field_pending(
     runtime: &Runtime,
@@ -3939,16 +3927,16 @@ pub(super) fn start_import(
 
 #[cfg(test)]
 mod write_completion_tests {
-    use super::*;
+
+    use crate::engine::test_support::assert_script_true;
+    use crate::engine::test_support::test_context;
 
     #[test]
     fn write_completion_runs_following_opcode_once_across_local_waiting_and_throw() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
-        assert_eq!(
-            context
-                .eval(
-                    r#"
+        let (runtime, mut context) = test_context();
+        assert_script_true(
+            &mut context,
+            r#"
             (() => {
                 let trace = '', calls = 0;
                 const target = {x: 0}, marker = {};
@@ -3965,10 +3953,7 @@ mod write_completion_tests {
                 }
                 return trace === 'abcdabcdabcd' && calls === 6 && target.x === 3;
             })()
-        "#
-                )
-                .unwrap(),
-            Value::Bool(true)
+        "#,
         );
         assert!(runtime.0.state.borrow().active_frames.is_empty());
     }

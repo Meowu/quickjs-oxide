@@ -1,6 +1,8 @@
 use crate::quickjs_raw_source_oracle::{
     RawScriptObservation, normalized_filename, observe_raw_script,
 };
+use crate::runtime_observation::hex_bytes;
+use crate::runtime_observation::host_runtime_context;
 use quickjs_oxide::engine::api::{
     CompileOptions, Context, EvalOptions, Runtime, RuntimeError, Value,
 };
@@ -256,10 +258,7 @@ const OBSERVER_SUFFIX: &[u8] = br#"
 
 #[test]
 fn raw_script_bytes_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP raw Script byte differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("raw Script byte differential");
     assert!(
         CASES.len() >= 18,
         "raw Script differential lost its broad matrix"
@@ -297,9 +296,7 @@ fn source_for(case: &Case) -> Vec<u8> {
 }
 
 fn oxide_observation(case: &Case, source: &[u8]) -> RawScriptObservation {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let result = match case.api {
         Api::Compile => context
             .compile_bytes(source)
@@ -375,12 +372,4 @@ fn oxide_exception(runtime: &Runtime, context: &mut Context, case: &Case) -> Raw
         line: u32::try_from(line).unwrap(),
         column: u32::try_from(column).unwrap(),
     }
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }

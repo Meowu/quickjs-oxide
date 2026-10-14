@@ -320,7 +320,7 @@ impl EvaluationResume {
                 let frame = frames.last_mut().ok_or(RuntimeError::Invariant(
                     "module evaluation call stack unexpectedly became empty",
                 ))?;
-                let dependency = frame.dependencies.get(frame.next_dependency).cloned();
+                let dependency = frame.dependencies.get(frame.next_dependency).copied();
                 if dependency.is_some() {
                     frame.next_dependency += 1;
                 }
@@ -629,6 +629,7 @@ const _: () = assert!(std::mem::size_of::<EvaluationStep>() <= 64);
 mod quarantine_tests {
     use super::*;
     use crate::engine::heap::ModuleId;
+    use crate::engine::test_support::test_context;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[test]
@@ -649,8 +650,7 @@ mod quarantine_tests {
             }
             return;
         };
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().unwrap();
+        let (runtime, mut context) = test_context();
         let module = context.compile_module("export let value = 1;").unwrap();
         runtime
             .link_module_graph(module.raw, context.realm)

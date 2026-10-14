@@ -461,7 +461,6 @@ struct HostOptions {
     dump_unhandled_promise_rejection: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn evaluate(
     source: EvaluationSource<'_>,
     filename: &str,
@@ -614,7 +613,7 @@ fn drain_pending_jobs(runtime: &Runtime, context: &mut Context) -> bool {
     loop {
         match runtime
             .execute_pending_job()
-            .map_err(|error| error.into_error())
+            .map_err(quickjs_oxide::engine::api::PendingJobError::into_error)
         {
             Ok(outcome) if outcome.executed() => {}
             Ok(_) => return true,
@@ -685,7 +684,7 @@ fn evaluate_module(
             PromiseState::Pending => {
                 if !runtime
                     .execute_pending_job()
-                    .map_err(|error| error.into_error())?
+                    .map_err(quickjs_oxide::engine::api::PendingJobError::into_error)?
                     .executed()
                 {
                     std::thread::yield_now();

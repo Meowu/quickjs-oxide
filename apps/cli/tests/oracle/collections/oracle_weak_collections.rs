@@ -1,20 +1,14 @@
-use crate::runtime_observation::{
-    primitive_value_text, property_callable, string_property, take_exception_object,
-};
-use crate::runtime_oracle::{eval_callable, eval_object, value_type};
-use quickjs_oxide::engine::api::{CallableRef, Context, ObjectRef, Runtime, RuntimeError, Value};
-use std::ffi::OsStr;
+use crate::grouped_case_oracle::{compare_prelude_case_groups, self_check_prelude_cases};
+use crate::object_graph_observation::{expect_object, global_callable};
+use crate::oracle_cases::GroupedCase as Case;
+use crate::runtime_observation::host_runtime;
+use crate::runtime_observation::{property_callable, take_exception_object};
+use crate::runtime_oracle::{eval_callable, eval_object};
+use quickjs_oxide::engine::api::{Context, Runtime, RuntimeError, Value};
 
 // Differential lock for the WeakMap and WeakSet surface exposed by pinned
 // QuickJS 2026-06-04. The vectors use only primitive ASCII observations so
 // they can be compared without sharing object identities across engines.
-
-struct Case {
-    group: &'static str,
-    description: &'static str,
-    source: &'static str,
-    expected: &'static str,
-}
 
 const PRELUDE: &str = r#"
 function __bit(value){return value?"1":"0"}
@@ -394,47 +388,32 @@ const CASES: &[Case] = &[
 
 #[test]
 fn weak_collection_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP weak collection oracle self-check: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
-    let mut failures = Vec::new();
-    for case in CASES {
-        let actual = oracle_observation(&oracle, case);
-        if actual != case.expected {
-            failures.push(format!(
-                "{} / {}\nactual: {:?}\nexpected: {:?}",
-                case.group, case.description, actual, case.expected,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "pinned QuickJS weak collection vectors drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
-    );
+    self_check_prelude_cases("weak collection", PRELUDE, CASES);
 }
 
 #[test]
 fn weak_collection_graph_core_and_symbols_match_pinned_quickjs() {
-    compare_groups(&["graph", "core", "stale-key", "symbols"]);
+    compare_prelude_case_groups(
+        "weak collection",
+        PRELUDE,
+        CASES,
+        &["graph", "core", "stale-key", "symbols"],
+    );
 }
 
 #[test]
 fn weak_collection_constructors_and_iterator_close_match_pinned_quickjs() {
-    compare_groups(&["constructor", "close"]);
+    compare_prelude_case_groups("weak collection", PRELUDE, CASES, &["constructor", "close"]);
 }
 
 #[test]
 fn weak_map_upsert_and_weak_collection_brands_match_pinned_quickjs() {
-    compare_groups(&["upsert", "brands"]);
+    compare_prelude_case_groups("weak collection", PRELUDE, CASES, &["upsert", "brands"]);
 }
 
 #[test]
 fn weak_collection_new_target_fallback_and_native_errors_use_exact_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
 
@@ -527,96 +506,4 @@ fn assert_cross_realm_collection(
         Some(defining_type_error),
         "{constructor_name} branded native error used the calling realm",
     );
-}
-
-fn compare_groups(groups: &[&str]) {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP weak collection differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
-    let mut failures = Vec::new();
-    for case in CASES.iter().filter(|case| groups.contains(&case.group)) {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        let actual = rust_observation(&runtime, &mut context, case);
-        let expected = oracle_observation(&oracle, case);
-        if actual != expected {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\noxide: {:?}\noracle: {:?}",
-                case.group, case.description, case.source, actual, expected,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "weak collection semantics drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
-    );
-}
-
-fn observed_source(source: &str) -> String {
-    format!("{PRELUDE}\n{source}")
-}
-
-fn rust_observation(runtime: &Runtime, context: &mut Context, case: &Case) -> String {
-    let source = observed_source(case.source);
-    match context.eval(&source) {
-        Ok(value) => format!(
-            "return|{}|{}",
-            value_type(runtime, &value),
-            primitive_value_text(value),
-        ),
-        Err(RuntimeError::Exception) => {
-            let exception = context
-                .take_exception()
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "take Rust exception for {} / {}: {error}",
-                        case.group, case.description,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Rust exception was missing for {} / {}",
-                        case.group, case.description,
-                    )
-                });
-            match exception {
-                Value::Object(error) => format!(
-                    "throw|object|{}|{}",
-                    string_property(runtime, context, &error, "name"),
-                    string_property(runtime, context, &error, "message"),
-                ),
-                value => format!(
-                    "throw|{}|{}",
-                    value_type(runtime, &value),
-                    primitive_value_text(value),
-                ),
-            }
-        }
-        Err(error) => panic!(
-            "Rust engine failure for {} / {} ({:?}): {error}",
-            case.group, case.description, case.source,
-        ),
-    }
-}
-
-fn oracle_observation(oracle: &OsStr, case: &Case) -> String {
-    let source = observed_source(case.source);
-    let description = format!("{} / {}", case.group, case.description);
-    super::quickjs_oracle::observe_completion(oracle, &source, &description)
-}
-
-fn global_callable(runtime: &Runtime, context: &mut Context, name: &str) -> CallableRef {
-    let global = context.global_object().unwrap();
-    property_callable(runtime, context, &global, name)
-}
-
-fn expect_object(value: Value, description: &str) -> ObjectRef {
-    let Value::Object(object) = value else {
-        panic!("{description} did not produce an object");
-    };
-    object
 }

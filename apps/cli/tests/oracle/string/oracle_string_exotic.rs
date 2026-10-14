@@ -1,6 +1,10 @@
+use crate::object_graph_observation::data_descriptor;
+use crate::object_graph_observation::eval_callable;
+use crate::object_graph_observation::expect_object;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use quickjs_oxide::engine::api::{
-    AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DescriptorField,
-    JsString, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, Runtime, Value,
+    AccessorValue, CallableRef, Context, DescriptorField, JsString, ObjectRef,
+    OrdinaryPropertyDescriptor, PropertyKey, Runtime, Value,
 };
 
 // This oracle is deliberately narrower than the future `%String%` intrinsic.
@@ -123,10 +127,7 @@ fn string_wrapper_exotic_matches_pinned_quickjs() {
         "the String exotic differential unexpectedly changed breadth"
     );
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP String exotic differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("String exotic differential");
     assert_eq!(
         rust,
         super::quickjs_oracle::eval_std_lines(&oracle, ORACLE_PROBE, "String exotic object"),
@@ -135,9 +136,7 @@ fn string_wrapper_exotic_matches_pinned_quickjs() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let payload = JsString::try_from_utf16([0x41, 0xd83d, 0xde00, 0xd800]).unwrap();
     let wrapper = box_string(&runtime, &mut context, payload.clone());
     let prototype = runtime
@@ -424,8 +423,7 @@ fn rust_observations() -> Vec<String> {
 
 #[test]
 fn sloppy_string_boxing_uses_the_bytecode_functions_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut first = runtime.new_context().expect("create context");
     let mut second = runtime.new_context().expect("create context");
     let first_boxer = eval_callable(&runtime, &mut first, "(function () { return this; })");
@@ -472,8 +470,7 @@ fn sloppy_string_boxing_uses_the_bytecode_functions_defining_realm() {
 
 #[test]
 fn rooted_string_wrapper_preserves_payload_and_final_release_collects_the_graph() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let wrapper = {
         let mut context = runtime.new_context().expect("create context");
         box_string(
@@ -516,16 +513,6 @@ fn box_string(runtime: &Runtime, context: &mut Context, value: JsString) -> Obje
     )
 }
 
-fn eval_callable(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("source did not produce a function: {source:?}");
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("source was not callable: {source:?}"))
-}
-
 fn property_callable(
     runtime: &Runtime,
     context: &mut Context,
@@ -544,13 +531,6 @@ fn property_callable(
         .unwrap_or_else(|| panic!("{name} was not callable"))
 }
 
-fn expect_object(value: Value, description: &str) -> ObjectRef {
-    let Value::Object(object) = value else {
-        panic!("{description} did not produce an object");
-    };
-    object
-}
-
 fn define_data(runtime: &Runtime, object: &ObjectRef, key: &PropertyKey, value: Value) -> bool {
     runtime
         .define_own_property(
@@ -565,26 +545,6 @@ fn define_data(runtime: &Runtime, object: &ObjectRef, key: &PropertyKey, value: 
             },
         )
         .unwrap()
-}
-
-fn data_descriptor(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    key: &PropertyKey,
-) -> (Value, bool, bool, bool) {
-    let CompleteOrdinaryPropertyDescriptor::Data {
-        value,
-        writable,
-        enumerable,
-        configurable,
-    } = runtime
-        .get_own_property(object, key)
-        .unwrap()
-        .expect("data property was absent")
-    else {
-        panic!("property was not data");
-    };
-    (value, writable, enumerable, configurable)
 }
 
 fn own_key_names(

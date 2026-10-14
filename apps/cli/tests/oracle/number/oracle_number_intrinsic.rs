@@ -1,12 +1,16 @@
+use crate::runtime_observation::host_runtime_context;
 use crate::runtime_observation::property_callable;
 use std::ffi::OsStr;
 
-use std::process::{Command, Output};
-
+use crate::object_graph_observation::{
+    define_accessor, define_accessor_key, define_data_key_with_flags as define_data_key,
+    define_data_with_flags as define_data, define_global_key as define_global, eval_callable,
+    expect_object, object_has_prototype,
+};
+use crate::support::quickjs_object_pattern_oracle::run_cli_exact as run_cli;
 use quickjs_oxide::engine::api::{
-    AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DescriptorField,
-    JsBigInt, JsString, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError,
-    Value, WellKnownSymbol,
+    CallableRef, CompleteOrdinaryPropertyDescriptor, Context, JsBigInt, JsString, ObjectRef,
+    PropertyKey, Runtime, Value, WellKnownSymbol,
 };
 
 // The oracle is intentionally broader than the source subset currently parsed
@@ -423,10 +427,7 @@ print("alias-capture=" + [
 
 #[test]
 fn number_intrinsic_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Number intrinsic differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Number intrinsic differential");
 
     let Some(rust) = rust_observations() else {
         eprintln!("SKIP Number intrinsic differential: Number is not published yet");
@@ -441,10 +442,7 @@ fn number_intrinsic_matches_pinned_quickjs() {
 
 #[test]
 fn number_native_error_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Number native stack differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Number native stack differential");
 
     for (description, source) in [
         (
@@ -476,9 +474,7 @@ fn number_native_error_stacks_match_pinned_quickjs() {
 }
 
 fn rust_observations() -> Option<Vec<String>> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let object_prototype = context.object_prototype().unwrap();
     let function_prototype = context.function_prototype().unwrap();
@@ -2129,110 +2125,6 @@ fn rust_observations() -> Option<Vec<String>> {
     Some(observations)
 }
 
-fn define_global(runtime: &Runtime, global: &ObjectRef, name: &str, value: Value) -> PropertyKey {
-    let key = runtime.intern_property_key(name).unwrap();
-    define_data_key(runtime, global, &key, value, true, true, true);
-    key
-}
-
-fn define_data(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    name: &str,
-    value: Value,
-    writable: bool,
-    enumerable: bool,
-    configurable: bool,
-) {
-    let key = runtime.intern_property_key(name).unwrap();
-    define_data_key(
-        runtime,
-        object,
-        &key,
-        value,
-        writable,
-        enumerable,
-        configurable,
-    );
-}
-
-fn define_data_key(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    key: &PropertyKey,
-    value: Value,
-    writable: bool,
-    enumerable: bool,
-    configurable: bool,
-) {
-    assert!(
-        runtime
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(writable),
-                    enumerable: DescriptorField::Present(enumerable),
-                    configurable: DescriptorField::Present(configurable),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap(),
-        "host data-property definition was rejected"
-    );
-}
-
-fn define_accessor(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    name: &str,
-    get: Option<CallableRef>,
-    set: Option<CallableRef>,
-) {
-    let key = runtime.intern_property_key(name).unwrap();
-    define_accessor_key(runtime, object, &key, get, set);
-}
-
-fn define_accessor_key(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    key: &PropertyKey,
-    get: Option<CallableRef>,
-    set: Option<CallableRef>,
-) {
-    assert!(
-        runtime
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    get: DescriptorField::Present(
-                        get.map_or(AccessorValue::Undefined, AccessorValue::Callable),
-                    ),
-                    set: DescriptorField::Present(
-                        set.map_or(AccessorValue::Undefined, AccessorValue::Callable),
-                    ),
-                    enumerable: DescriptorField::Present(false),
-                    configurable: DescriptorField::Present(true),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap(),
-        "host accessor-property definition was rejected"
-    );
-}
-
-fn eval_callable(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("callable source did not produce an object: {source:?}");
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("source did not produce a callable: {source:?}"))
-}
-
 fn global_property(
     runtime: &Runtime,
     context: &mut Context,
@@ -2246,13 +2138,6 @@ fn global_property(
 
 fn global_value(runtime: &Runtime, context: &mut Context, global: &ObjectRef, name: &str) -> Value {
     global_property(runtime, context, global, name)
-}
-
-fn expect_object(value: Value, description: &str) -> ObjectRef {
-    let Value::Object(object) = value else {
-        panic!("{description} did not produce an object");
-    };
-    object
 }
 
 fn key_names(runtime: &Runtime, keys: &[PropertyKey]) -> Vec<String> {
@@ -2325,16 +2210,6 @@ fn function_signature(runtime: &Runtime, callable: &CallableRef) -> String {
     )
 }
 
-fn object_has_prototype(runtime: &Runtime, value: &Value, prototype: &ObjectRef) -> bool {
-    let Value::Object(object) = value else {
-        return false;
-    };
-    runtime
-        .get_prototype_of(object)
-        .unwrap()
-        .is_some_and(|actual| actual == *prototype)
-}
-
 fn same_number(value: &Value, expected: f64) -> bool {
     value
         .as_number()
@@ -2364,13 +2239,7 @@ fn reciprocal(value: Value) -> Value {
 }
 
 fn observe_eval(runtime: &Runtime, context: &mut Context, source: &str) -> String {
-    match context.eval(source) {
-        Ok(value) => plain_value(value),
-        Err(RuntimeError::Exception) => take_error(runtime, context),
-        Err(error) => {
-            panic!("Rust source failed outside JavaScript completion: {source:?}: {error}")
-        }
-    }
+    crate::primitive_probe::observe_eval(runtime, context, source, plain_value)
 }
 
 fn observe_call_args(
@@ -2380,11 +2249,14 @@ fn observe_call_args(
     this_value: Value,
     arguments: &[Value],
 ) -> String {
-    match context.call(callable, this_value, arguments) {
-        Ok(value) => plain_value(value),
-        Err(RuntimeError::Exception) => take_error(runtime, context),
-        Err(error) => panic!("Rust call failed outside JavaScript completion: {error}"),
-    }
+    crate::primitive_probe::observe_call(
+        runtime,
+        context,
+        callable,
+        this_value,
+        arguments,
+        plain_value,
+    )
 }
 
 fn observe_construct_args(
@@ -2393,28 +2265,7 @@ fn observe_construct_args(
     callable: &CallableRef,
     arguments: &[Value],
 ) -> String {
-    match context.construct(callable, arguments) {
-        Ok(value) => plain_value(value),
-        Err(RuntimeError::Exception) => take_error(runtime, context),
-        Err(error) => panic!("Rust construct failed outside JavaScript completion: {error}"),
-    }
-}
-
-fn take_error(runtime: &Runtime, context: &mut Context) -> String {
-    let Value::Object(error) = context.take_exception().unwrap().unwrap() else {
-        panic!("Number operation did not throw an Error object");
-    };
-    let name = error_text(runtime, context, &error, "name");
-    let message = error_text(runtime, context, &error, "message");
-    format!("throw:{name}:{message}")
-}
-
-fn error_text(runtime: &Runtime, context: &mut Context, error: &ObjectRef, name: &str) -> String {
-    let key = runtime.intern_property_key(name).unwrap();
-    let Value::String(value) = context.get_property(error, &key).unwrap() else {
-        panic!("Error.{name} was not a string");
-    };
-    value.to_utf8_lossy()
+    crate::primitive_probe::observe_construct(runtime, context, callable, arguments, plain_value)
 }
 
 fn number_bits(value: Value) -> String {
@@ -2429,12 +2280,7 @@ fn number_bits(value: Value) -> String {
 }
 
 fn join_values(values: &[Value]) -> String {
-    values
-        .iter()
-        .map(|value| value.try_clone().expect("duplicate root"))
-        .map(plain_value)
-        .collect::<Vec<_>>()
-        .join("|")
+    crate::primitive_probe::join_values(values, plain_value)
 }
 
 fn plain_value(value: Value) -> String {
@@ -2449,25 +2295,5 @@ fn plain_value(value: Value) -> String {
 }
 
 fn oracle_observations(oracle: &OsStr) -> Vec<String> {
-    let output = Command::new(oracle)
-        .args(["-e", ORACLE_PROBE])
-        .output()
-        .expect("run QuickJS Number intrinsic oracle");
-    assert!(
-        output.status.success(),
-        "QuickJS Number intrinsic oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("QuickJS Number intrinsic oracle emitted non-UTF-8 output")
-        .lines()
-        .map(str::to_owned)
-        .collect()
-}
-
-fn run_cli(program: &OsStr, source: &str, description: &str) -> Output {
-    Command::new(program)
-        .args(["-e", source])
-        .output()
-        .unwrap_or_else(|error| panic!("could not run CLI for {description}: {error}"))
+    crate::quickjs_oracle::probe_lines(oracle, ORACLE_PROBE, "Number intrinsic")
 }

@@ -1,6 +1,8 @@
 use super::support::*;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
-use quickjs_oxide::engine::api::{Context, JsString, ObjectRef, Runtime, RuntimeError, Value};
+use crate::object_graph_observation::int_property;
+use quickjs_oxide::engine::api::{JsString, RuntimeError, Value};
 use std::ffi::OsStr;
 
 // This target pins QuickJS 2026-06-04 `js_array_slice`, its magic-selected
@@ -526,9 +528,7 @@ print('meta='+metadata('toSpliced'));
 
 #[test]
 fn array_slice_splice_basic_rust_smoke() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     assert_eq!(
         context
             .eval(
@@ -546,9 +546,7 @@ fn array_slice_splice_basic_rust_smoke() {
 
 #[test]
 fn array_slice_recursive_getter_stack_overflow_is_catchable_without_oracle() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     assert_eq!(
         context
             .eval(
@@ -568,10 +566,7 @@ fn array_slice_recursive_getter_stack_overflow_is_catchable_without_oracle() {
 
 #[test]
 fn array_slice_splice_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array slice/splice oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array slice/splice oracle self-check");
     for &(group, cases) in &[
         ("values", VALUE_CASES),
         ("order/species", ORDER_AND_SPECIES_CASES),
@@ -620,10 +615,7 @@ fn array_slice_splice_generic_limits_and_errors_match_pinned_quickjs() {
 
 #[test]
 fn array_slice_splice_prototype_order_metadata_and_constructability_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array slice/splice graph differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array slice/splice graph differential");
     assert_eq!(
         rust_graph_observations(),
         oracle_graph_observations(&oracle),
@@ -633,8 +625,7 @@ fn array_slice_splice_prototype_order_metadata_and_constructability_match_pinned
 
 #[test]
 fn array_slice_splice_results_native_errors_and_user_throws_use_pinned_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_array_prototype = defining.array_prototype().unwrap();
@@ -812,9 +803,7 @@ fn array_slice_splice_results_native_errors_and_user_throws_use_pinned_realms() 
 }
 
 fn rust_graph_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let array_prototype = context.array_prototype().unwrap();
     let function_prototype = context.function_prototype().unwrap();
     let implemented = [
@@ -885,12 +874,4 @@ fn rust_graph_observations() -> Vec<String> {
 
 fn oracle_graph_observations(oracle: &OsStr) -> Vec<String> {
     super::quickjs_oracle::eval_std_lines(oracle, GRAPH_ORACLE, "Array slice/splice graph oracle")
-}
-
-fn int_property(runtime: &Runtime, context: &mut Context, object: &ObjectRef, name: &str) -> i32 {
-    let key = runtime.intern_property_key(name).unwrap();
-    let Value::Int(value) = context.get_property(object, &key).unwrap() else {
-        panic!("{name} was not an Int property");
-    };
-    value
 }

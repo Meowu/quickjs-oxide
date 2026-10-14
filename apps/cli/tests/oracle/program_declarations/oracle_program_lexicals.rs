@@ -1,7 +1,9 @@
 use super::quickjs_argv_completion_oracle::observe_completion_argv_sequence_strip_one_lf as observe_oracle_sequence;
-use crate::runtime_oracle::{error_string_property, run_cli};
+use crate::runtime_completion_oracle::compare_cli;
+use crate::runtime_observation::host_runtime_context;
+use crate::runtime_observation::normalize_rust_value_text as normalize_value;
+use crate::runtime_oracle::error_string_property;
 use quickjs_oxide::engine::api::{Context, Runtime, RuntimeError, Value};
-use std::ffi::OsStr;
 
 const VALUE_CASES: &[(&str, &str)] = &[
     (
@@ -83,15 +85,10 @@ const SYNTAX_ERROR_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn program_lexical_values_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Program lexical differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Program lexical differential");
 
     for &(description, source) in VALUE_CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         let rust = observe_rust_eval(&runtime, &mut context, source, description);
         let quickjs = observe_oracle_sequence(&oracle, &[source], description);
         assert_eq!(rust, quickjs, "Program lexical drifted for {description}");
@@ -100,10 +97,7 @@ fn program_lexical_values_match_pinned_quickjs() {
 
 #[test]
 fn program_lexical_cross_eval_state_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Program lexical state differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Program lexical state differential");
 
     let sequences: &[(&str, &[&str])] = &[
         (
@@ -209,9 +203,7 @@ fn program_lexical_cross_eval_state_matches_pinned_quickjs() {
     ];
 
     for &(description, sources) in sequences {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         let rust = sources
             .iter()
             .map(|source| observe_rust_eval(&runtime, &mut context, source, description))
@@ -227,10 +219,7 @@ fn program_lexical_cross_eval_state_matches_pinned_quickjs() {
 
 #[test]
 fn program_lexical_full_and_strip_debug_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Program lexical stack differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Program lexical stack differential");
 
     for &(description, source) in ERROR_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -240,10 +229,7 @@ fn program_lexical_full_and_strip_debug_stacks_match_pinned_quickjs() {
 
 #[test]
 fn program_lexical_parser_diagnostics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Program lexical parser differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Program lexical parser differential");
 
     for &(description, source) in SYNTAX_ERROR_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -274,31 +260,4 @@ fn observe_rust_eval(
         }
         Err(error) => panic!("Rust engine failure for {description} ({source:?}): {error}"),
     }
-}
-
-fn normalize_value(value: Value) -> String {
-    match value {
-        Value::Undefined => "undefined|undefined".to_owned(),
-        Value::Null => "object|null".to_owned(),
-        Value::Bool(value) => format!("boolean|{value}"),
-        Value::Int(value) => format!("number|{value}"),
-        Value::Float(value) => format!("number|{value}"),
-        Value::BigInt(value) => format!("bigint|{value}"),
-        Value::String(value) => format!("string|{}", value.to_utf8_lossy()),
-        Value::Object(_) => "object|<object>".to_owned(),
-        Value::Symbol(_) => "symbol|<symbol>".to_owned(),
-    }
-}
-
-fn compare_cli(oracle: &OsStr, options: &[&str], source: &str, description: &str) {
-    let rust = run_cli(
-        env!("CARGO_BIN_EXE_qjs").as_ref(),
-        options,
-        source,
-        description,
-    );
-    let quickjs = run_cli(oracle, options, source, description);
-    assert_eq!(rust.status.code(), quickjs.status.code(), "{description}");
-    assert_eq!(rust.stdout, quickjs.stdout, "{description}");
-    assert_eq!(rust.stderr, quickjs.stderr, "{description}");
 }

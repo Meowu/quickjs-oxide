@@ -1,3 +1,6 @@
+use crate::runtime_completion_oracle::observe_rust_result as observe_rust;
+use crate::runtime_observation::from_char_code_source as js_utf16;
+use crate::runtime_observation::utf16;
 use quickjs_oxide::engine::api::JsString;
 use quickjs_oxide::regexp::{compile, execute};
 use std::ffi::OsStr;
@@ -14,10 +17,7 @@ struct Case {
 
 #[test]
 fn regexp_compiler_and_executor_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP RegExp engine differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("RegExp engine differential");
 
     let cases = cases();
     let oracle_observations = run_oracle_batch(&oracle, &cases);
@@ -182,32 +182,6 @@ fn ascii(
     }
 }
 
-fn utf16(value: &str) -> Vec<u16> {
-    value.encode_utf16().collect()
-}
-
-fn observe_rust(result: Option<&quickjs_oxide::regexp::RegExpMatch>, input: &[u16]) -> String {
-    let Some(result) = result else {
-        return "N".to_owned();
-    };
-    let complete = result
-        .capture(0)
-        .expect("a successful match has capture zero");
-    let mut output = format!("M|{}|{}", complete.start, result.captures().len());
-    for capture in result.captures() {
-        match capture {
-            None => output.push_str("|U"),
-            Some(range) => {
-                write!(output, "|{},{}:", range.start, range.end).unwrap();
-                for unit in &input[range.clone()] {
-                    write!(output, "{unit:04x}").unwrap();
-                }
-            }
-        }
-    }
-    output
-}
-
 fn run_oracle_batch(oracle: &OsStr, cases: &[Case]) -> Vec<String> {
     let mut source = String::from(
         r#"
@@ -264,13 +238,4 @@ for (var __qjo_i = 0; __qjo_i < __qjo_regexp_cases.length; __qjo_i++)
         cases.len(),
         "RegExp matching",
     )
-}
-
-fn js_utf16(units: &[u16]) -> String {
-    let values = units
-        .iter()
-        .map(|unit| format!("0x{unit:04x}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("String.fromCharCode({values})")
 }

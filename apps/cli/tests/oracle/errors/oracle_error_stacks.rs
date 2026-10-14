@@ -1,13 +1,11 @@
-use quickjs_oxide::engine::api::{Runtime, RuntimeError, Value};
+use crate::runtime_observation::host_runtime_context;
+use quickjs_oxide::engine::api::{RuntimeError, Value};
 use std::ffi::OsStr;
 use std::process::Command;
 
 #[test]
 fn implemented_error_backtraces_match_quickjs_oracle() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Error stack oracle differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Error stack oracle differential");
 
     let cases = [
         (
@@ -397,9 +395,7 @@ fn rust_stack_with_symbol(source: &str) -> String {
 }
 
 fn rust_stack_with_optional_symbol(source: &str, bind_symbol: bool) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     if bind_symbol {
         let global = context.global_object().expect("Rust global object");
         let key = runtime

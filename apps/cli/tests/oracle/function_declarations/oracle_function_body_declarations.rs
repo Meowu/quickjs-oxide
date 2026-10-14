@@ -1,10 +1,11 @@
 use super::quickjs_argv_completion_oracle::observe_completion_argv_sequence_strip_one_lf as observe_oracle_sequence;
 use crate::runtime_completion_oracle::observe_legacy_float_eval_completion as observe_rust_eval;
 use crate::runtime_observation::primitive_value_text_with_rust_float as primitive_value_text;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
-use crate::runtime_oracle::{error_string_property, run_cli};
-use quickjs_oxide::engine::api::{JsString, Runtime, RuntimeError, Value};
-use std::ffi::OsStr;
+use crate::runtime_completion_oracle::compare_cli;
+use crate::runtime_oracle::error_string_property;
+use quickjs_oxide::engine::api::{JsString, RuntimeError, Value};
 
 const VALUE_CASES: &[(&str, &str)] = &[
     (
@@ -134,15 +135,10 @@ const SYNTAX_ERROR_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn direct_function_body_declaration_values_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP function-body declaration differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("function-body declaration differential");
 
     for &(description, source) in VALUE_CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         assert_eq!(
             observe_rust_eval(&runtime, &mut context, source, description),
             observe_oracle_sequence(&oracle, &[source], description),
@@ -153,17 +149,10 @@ fn direct_function_body_declaration_values_match_pinned_quickjs() {
 
 #[test]
 fn direct_function_body_declaration_tdz_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP function-body declaration TDZ differential: set QJS_ORACLE to upstream qjs"
-        );
-        return;
-    };
+    let oracle = require_qjs_oracle!("function-body declaration TDZ differential");
 
     for &(description, source) in ERROR_OBSERVATION_CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         assert_eq!(
             observe_rust_eval(&runtime, &mut context, source, description),
             observe_oracle_sequence(&oracle, &[source], description),
@@ -174,20 +163,13 @@ fn direct_function_body_declaration_tdz_matches_pinned_quickjs() {
 
 #[test]
 fn failed_body_lexical_initializer_keeps_escaped_hoist_tdz_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP function-body failed-initializer differential: set QJS_ORACLE to upstream qjs"
-        );
-        return;
-    };
+    let oracle = require_qjs_oracle!("function-body failed-initializer differential");
     let description = "failed body lexical initializer preserves its escaped hoist cell";
     let sources = [
         "(function(){Function.savedBodyRead=readLater;let later=missingBodyInitializer;function readLater(){return later}})()",
         "Function.savedBodyRead()",
     ];
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let rust = sources
         .iter()
         .map(|source| observe_rust_eval(&runtime, &mut context, source, description))
@@ -202,12 +184,7 @@ fn failed_body_lexical_initializer_keeps_escaped_hoist_tdz_matches_pinned_quickj
 
 #[test]
 fn function_body_declaration_full_and_strip_debug_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP function-body declaration stack differential: set QJS_ORACLE to upstream qjs"
-        );
-        return;
-    };
+    let oracle = require_qjs_oracle!("function-body declaration stack differential");
 
     for &(description, source) in STACK_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -217,12 +194,7 @@ fn function_body_declaration_full_and_strip_debug_stacks_match_pinned_quickjs() 
 
 #[test]
 fn function_body_declaration_parser_diagnostics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP function-body declaration parser differential: set QJS_ORACLE to upstream qjs"
-        );
-        return;
-    };
+    let oracle = require_qjs_oracle!("function-body declaration parser differential");
 
     for &(description, source) in SYNTAX_ERROR_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -234,8 +206,7 @@ fn function_body_declaration_cross_realm_regression() {
     // These expectations are pinned from the QuickJS C API's compile-in-A,
     // execute-in-B path; the Rust API exposes the same two-context operation
     // directly, so keep it in the unconditional product regression suite.
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     drop(defining.eval("globalThis.realmTag='A'").unwrap());
@@ -373,17 +344,4 @@ fn function_body_declaration_cross_realm_regression() {
         runtime.get_prototype_of(&error).unwrap(),
         Some(reference_error_prototype_b)
     );
-}
-
-fn compare_cli(oracle: &OsStr, options: &[&str], source: &str, description: &str) {
-    let rust = run_cli(
-        env!("CARGO_BIN_EXE_qjs").as_ref(),
-        options,
-        source,
-        description,
-    );
-    let quickjs = run_cli(oracle, options, source, description);
-    assert_eq!(rust.status.code(), quickjs.status.code(), "{description}");
-    assert_eq!(rust.stdout, quickjs.stdout, "{description}");
-    assert_eq!(rust.stderr, quickjs.stderr, "{description}");
 }

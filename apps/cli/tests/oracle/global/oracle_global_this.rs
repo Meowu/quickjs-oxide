@@ -1,4 +1,8 @@
 use super::quickjs_plain_eval_oracle::eval_plain_lines;
+use crate::object_graph_observation::descriptor_bits;
+use crate::runtime_observation::error_text as error_string_property;
+use crate::runtime_observation::value_text;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use quickjs_oxide::engine::api::{
     AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DescriptorField,
     ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError, Value,
@@ -213,10 +217,7 @@ fn global_this_matches_pinned_quickjs() {
         "Rust globalThis state-machine observations changed"
     );
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP globalThis differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("globalThis differential");
     let oracle = eval_plain_lines(&oracle, ORACLE_PROBE);
     assert_eq!(
         oracle, EXPECTED_OBSERVATIONS,
@@ -230,8 +231,7 @@ fn global_this_matches_pinned_quickjs() {
 
 #[test]
 fn captured_global_this_tracks_the_defining_realm_across_property_transitions() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_global = defining.global_object().unwrap();
@@ -317,8 +317,7 @@ fn captured_global_this_tracks_the_defining_realm_across_property_transitions() 
 
 #[test]
 fn global_this_var_ref_cycle_is_collectable_after_context_drop() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     {
         let mut context = runtime.new_context().expect("create context");
         let global = context.global_object().unwrap();
@@ -354,9 +353,7 @@ fn global_this_var_ref_cycle_is_collectable_after_context_drop() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let key = runtime.intern_property_key("globalThis").unwrap();
     let tag = PropertyKey::from(
@@ -589,23 +586,6 @@ fn function(runtime: &Runtime, context: &mut Context, source: &str) -> CallableR
     runtime.as_callable(&object).unwrap().unwrap()
 }
 
-fn descriptor_bits(descriptor: &CompleteOrdinaryPropertyDescriptor) -> String {
-    match descriptor {
-        CompleteOrdinaryPropertyDescriptor::Data {
-            writable,
-            enumerable,
-            configurable,
-            ..
-        } => format!(
-            "{}{}{}",
-            u8::from(*writable),
-            u8::from(*enumerable),
-            u8::from(*configurable)
-        ),
-        CompleteOrdinaryPropertyDescriptor::Accessor { .. } => "accessor".to_owned(),
-    }
-}
-
 fn reference_error_prototype(runtime: &Runtime, context: &mut Context) -> ObjectRef {
     let global = context.global_object().unwrap();
     let constructor_key = runtime.intern_property_key("ReferenceError").unwrap();
@@ -621,33 +601,7 @@ fn reference_error_prototype(runtime: &Runtime, context: &mut Context) -> Object
     prototype
 }
 
-fn error_string_property(
-    runtime: &Runtime,
-    context: &mut Context,
-    error: &ObjectRef,
-    name: &str,
-) -> String {
-    let key = runtime.intern_property_key(name).unwrap();
-    let Value::String(value) = context.get_property(error, &key).unwrap() else {
-        panic!("Error.{name} was not a string");
-    };
-    value.to_utf8_lossy()
-}
-
 fn global_value(runtime: &Runtime, context: &mut Context, global: &ObjectRef, name: &str) -> Value {
     let key = runtime.intern_property_key(name).unwrap();
     context.get_property(global, &key).unwrap()
-}
-
-fn value_text(value: Value) -> String {
-    match value {
-        Value::Undefined => "undefined".to_owned(),
-        Value::Null => "null".to_owned(),
-        Value::Bool(value) => value.to_string(),
-        Value::Int(value) => value.to_string(),
-        Value::Float(value) => value.to_string(),
-        Value::BigInt(value) => value.to_string(),
-        Value::String(value) => value.to_utf8_lossy(),
-        Value::Object(_) | Value::Symbol(_) => panic!("unexpected scalar observation value"),
-    }
 }

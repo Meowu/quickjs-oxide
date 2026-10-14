@@ -3,7 +3,8 @@
 //! including the message text and the line:column location.
 
 use super::quickjs_syntax_diagnostic_oracle::observe_cmdline_syntax_error as oracle_observation;
-use quickjs_oxide::engine::api::{Context, Runtime, RuntimeError, Value};
+use crate::runtime_observation::host_runtime_context;
+use quickjs_oxide::engine::api::{Context, RuntimeError, Value};
 
 /// (description, source, `SyntaxError|<message>|<line>:<column>`)
 ///
@@ -116,10 +117,7 @@ fn string_escape_diagnostics_match_pinned_quickjs() {
         assert_eq!(rust_observation(source), expected, "Rust: {description}");
     }
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP string escape diagnostic differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("string escape diagnostic differential");
     for &(description, source, expected) in CASES {
         assert_eq!(
             oracle_observation(&oracle, source),
@@ -130,9 +128,7 @@ fn string_escape_diagnostics_match_pinned_quickjs() {
 }
 
 fn rust_observation(source: &str) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(
         context.eval(source),
         Err(RuntimeError::Exception),

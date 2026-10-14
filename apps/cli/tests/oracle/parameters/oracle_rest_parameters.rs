@@ -1,14 +1,8 @@
 use super::quickjs_argv_completion_oracle::observe_completion_argv_trim_end as observe_oracle;
-use crate::runtime_observation::primitive_value_text_with_rust_float as primitive_text;
+use crate::runtime_observation::host_runtime_context;
 
-use crate::runtime_oracle::{error_string_property, value_type};
-use quickjs_oxide::engine::api::{Context, Runtime, RuntimeError, Value};
-
-struct Case {
-    description: &'static str,
-    source: &'static str,
-    expected: &'static str,
-}
+use crate::oracle_cases::ExpectedCase as Case;
+use crate::runtime_completion_oracle::observe_rust;
 
 // Pins the synchronous identifier-rest subset of QuickJS 2026-06-04
 // FormalParameters. Rest BindingPatterns, defaults, destructuring, async,
@@ -154,10 +148,7 @@ const ERROR_CASES: &[Case] = &[
 
 #[test]
 fn identifier_rest_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP identifier-rest oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("identifier-rest oracle self-check");
     for case in CASES.iter().chain(ERROR_CASES) {
         assert_eq!(
             observe_oracle(&oracle, case.source, case.description),
@@ -171,9 +162,7 @@ fn identifier_rest_oracle_vectors_self_check() {
 #[test]
 fn identifier_rest_rust_smoke_runs_without_an_oracle() {
     for case in CASES.iter().chain(ERROR_CASES) {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         assert_eq!(
             observe_rust(&runtime, &mut context, case.source, case.description),
             case.expected,
@@ -185,53 +174,14 @@ fn identifier_rest_rust_smoke_runs_without_an_oracle() {
 
 #[test]
 fn identifier_rest_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP identifier-rest differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("identifier-rest differential");
     for case in CASES.iter().chain(ERROR_CASES) {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         assert_eq!(
             observe_rust(&runtime, &mut context, case.source, case.description),
             observe_oracle(&oracle, case.source, case.description),
             "identifier-rest differential drifted for {}",
             case.description,
         );
-    }
-}
-
-fn observe_rust(
-    runtime: &Runtime,
-    context: &mut Context,
-    source: &str,
-    description: &str,
-) -> String {
-    match context.eval(source) {
-        Ok(value) => format!(
-            "return|{}|{}",
-            value_type(runtime, &value),
-            primitive_text(value),
-        ),
-        Err(RuntimeError::Exception) => {
-            let exception = context
-                .take_exception()
-                .unwrap_or_else(|error| panic!("take Rust exception for {description}: {error}"))
-                .unwrap_or_else(|| panic!("Rust exception was missing for {description}"));
-            match exception {
-                Value::Object(error) => format!(
-                    "throw|object|{}|{}",
-                    error_string_property(runtime, context, &error, "name", description),
-                    error_string_property(runtime, context, &error, "message", description),
-                ),
-                value => format!(
-                    "throw|{}|{}",
-                    value_type(runtime, &value),
-                    primitive_text(value),
-                ),
-            }
-        }
-        Err(error) => panic!("Rust engine failure for {description} ({source:?}): {error}"),
     }
 }

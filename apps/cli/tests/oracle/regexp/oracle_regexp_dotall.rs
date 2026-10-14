@@ -2,9 +2,10 @@ use crate::runtime_completion_oracle::{
     compare_read_context_eval_completion_cases_with_prelude,
     observe_quickjs_completion_with_prelude,
 };
+use crate::runtime_observation::host_runtime;
 use crate::runtime_observation::take_exception_object;
 use crate::runtime_oracle::{eval_callable, eval_object};
-use quickjs_oxide::engine::api::{Runtime, RuntimeError, Value};
+use quickjs_oxide::engine::api::{RuntimeError, Value};
 
 // Differential lock for pinned QuickJS 2026-06-04 RegExp dotAll semantics.
 // QuickJS carries `s` through `LRE_FLAG_DOTALL`: `libregexp.c` selects
@@ -167,10 +168,7 @@ const SPECIES_CASES: &[(&str, &str)] = &[(
 
 #[test]
 fn regexp_dotall_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP RegExp dotAll oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("RegExp dotAll oracle self-check");
     for (group, cases) in case_groups() {
         for &(description, source) in cases {
             let observation =
@@ -221,8 +219,7 @@ fn regexp_dotall_species_flags_match_pinned_quickjs() {
 
 #[test]
 fn regexp_dotall_getter_cross_realm_brand_and_errors_use_exact_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
 

@@ -1,9 +1,14 @@
+use crate::object_graph_observation::{
+    define_context_accessor as define_accessor, define_context_data_with_flags as define_data,
+    define_global_flagged as define_global, function_probe as function, global_value, set_global,
+    string_global,
+};
+use crate::runtime_observation::host_runtime_context;
+use crate::runtime_observation::show;
 use quickjs_oxide::engine::api::{
-    AccessorValue, CallableRef, Context, DescriptorField, JsString, ObjectRef,
-    OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError, Value, WellKnownSymbol,
+    AccessorValue, Context, JsString, PropertyKey, Runtime, RuntimeError, Value, WellKnownSymbol,
 };
 use std::ffi::OsStr;
-use std::process::Command;
 
 const PROBE: &str = r#"
 function show(value) {
@@ -401,17 +406,12 @@ print("primitive-delete=" + [show(delete "abc"[0]), show(delete "abc"[9]),
 
 #[test]
 fn source_member_assignment_and_delete_match_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP member-write differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("member-write differential");
     assert_eq!(rust_observations(), oracle_observations(&oracle));
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     define_global(
         &runtime,
         &mut context,
@@ -1982,88 +1982,6 @@ fn rust_observations() -> Vec<String> {
     output
 }
 
-fn function(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("function probe did not return an object: {source}");
-    };
-    runtime.as_callable(&object).unwrap().unwrap()
-}
-
-fn define_global(runtime: &Runtime, context: &mut Context, name: &str, value: Value) {
-    let global = context.global_object().unwrap();
-    let key = runtime.intern_property_key(name).unwrap();
-    define_data(context, &global, &key, value, true, true);
-}
-
-fn set_global(runtime: &Runtime, context: &mut Context, name: &str, value: Value) {
-    let global = context.global_object().unwrap();
-    let key = runtime.intern_property_key(name).unwrap();
-    assert!(context.set_property(&global, &key, value).unwrap());
-}
-
-fn global_value(runtime: &Runtime, context: &mut Context, name: &str) -> Value {
-    let global = context.global_object().unwrap();
-    let key = runtime.intern_property_key(name).unwrap();
-    context.get_property(&global, &key).unwrap()
-}
-
-fn string_global(runtime: &Runtime, context: &mut Context, name: &str) -> String {
-    let Value::String(value) = global_value(runtime, context, name) else {
-        panic!("global {name} was not a string");
-    };
-    value.to_utf8_lossy()
-}
-
-fn define_data(
-    context: &mut Context,
-    object: &ObjectRef,
-    key: &PropertyKey,
-    value: Value,
-    writable: bool,
-    configurable: bool,
-) {
-    assert!(
-        context
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(writable),
-                    enumerable: DescriptorField::Present(true),
-                    configurable: DescriptorField::Present(configurable),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap()
-    );
-}
-
-fn define_accessor(
-    context: &mut Context,
-    object: &ObjectRef,
-    key: &PropertyKey,
-    get: AccessorValue,
-    set: AccessorValue,
-    configurable: bool,
-) {
-    assert!(
-        context
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    get: DescriptorField::Present(get),
-                    set: DescriptorField::Present(set),
-                    enumerable: DescriptorField::Present(true),
-                    configurable: DescriptorField::Present(configurable),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap()
-    );
-}
-
 fn observe(runtime: &Runtime, context: &mut Context, source: &str) -> String {
     match context.eval(source) {
         Ok(value) => show(value),
@@ -2085,33 +2003,6 @@ fn observe(runtime: &Runtime, context: &mut Context, source: &str) -> String {
     }
 }
 
-fn show(value: Value) -> String {
-    match value {
-        Value::Undefined => "undefined:undefined".to_owned(),
-        Value::Null => "object:null".to_owned(),
-        Value::Bool(value) => format!("boolean:{value}"),
-        Value::Int(value) => format!("number:{value}"),
-        Value::Float(value) => format!("number:{value}"),
-        Value::BigInt(value) => format!("bigint:{value}"),
-        Value::String(value) => format!("string:{}", value.to_utf8_lossy()),
-        Value::Symbol(_) => "symbol:<symbol>".to_owned(),
-        Value::Object(_) => "object:<object>".to_owned(),
-    }
-}
-
 fn oracle_observations(oracle: &OsStr) -> Vec<String> {
-    let output = Command::new(oracle)
-        .args(["-e", PROBE])
-        .output()
-        .unwrap_or_else(|error| panic!("could not run QuickJS member-write oracle: {error}"));
-    assert!(
-        output.status.success(),
-        "QuickJS member-write oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .unwrap_or_else(|error| panic!("QuickJS emitted non-UTF-8 stdout: {error}"))
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    crate::quickjs_oracle::probe_lines(oracle, PROBE, "member-write")
 }

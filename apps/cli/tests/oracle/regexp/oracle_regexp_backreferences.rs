@@ -1,3 +1,6 @@
+use crate::runtime_completion_oracle::observe_rust_result as observe_rust;
+use crate::runtime_observation::utf16;
+use crate::support::regexp_probe_oracle::{MatchProbe, run_match_probes};
 use quickjs_oxide::engine::api::JsString;
 use quickjs_oxide::regexp::{CompileErrorKind, compile, execute};
 use std::ffi::OsStr;
@@ -13,10 +16,7 @@ struct MatchCase {
 
 #[test]
 fn regexp_backreferences_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP RegExp backreference differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("RegExp backreference differential");
 
     let cases = match_cases();
     let oracle_observations = run_match_oracle(&oracle, &cases);
@@ -48,10 +48,7 @@ fn regexp_backreferences_match_pinned_quickjs() {
 
 #[test]
 fn unicode_decimal_escape_errors_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP RegExp decimal syntax differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("RegExp decimal syntax differential");
 
     let cases = [
         (r"\1", "u"),
@@ -277,86 +274,17 @@ fn ascii_owned(
     }
 }
 
-fn utf16(value: &str) -> Vec<u16> {
-    value.encode_utf16().collect()
-}
-
-fn observe_rust(result: Option<&quickjs_oxide::regexp::RegExpMatch>, input: &[u16]) -> String {
-    let Some(result) = result else {
-        return "N".to_owned();
-    };
-    let complete = result
-        .capture(0)
-        .expect("a successful match has capture zero");
-    let mut output = format!("M|{}|{}", complete.start, result.captures().len());
-    for capture in result.captures() {
-        match capture {
-            None => output.push_str("|U"),
-            Some(range) => {
-                write!(output, "|{},{}:", range.start, range.end).unwrap();
-                for unit in &input[range.clone()] {
-                    write!(output, "{unit:04x}").unwrap();
-                }
-            }
-        }
-    }
-    output
-}
-
 fn run_match_oracle(oracle: &OsStr, cases: &[MatchCase]) -> Vec<String> {
-    let mut source = String::from(
-        r#"
-function __qjo_hex_utf16(value) {
-    var result = "";
-    for (var i = 0; i < value.length; i++)
-        result += ("0000" + value.charCodeAt(i).toString(16)).slice(-4);
-    return result;
-}
-function __qjo_observe(test) {
-    var flags = test.flags;
-    if (flags.indexOf("d") < 0) flags += "d";
-    if (flags.indexOf("g") < 0 && flags.indexOf("y") < 0) flags += "g";
-    var regexp = new RegExp(test.pattern, flags);
-    var match = regexp.exec(test.input);
-    if (match === null) return "N";
-    var fields = ["M", String(match.index), String(match.length)];
-    for (var i = 0; i < match.length; i++) {
-        if (match[i] === undefined) {
-            fields.push("U");
-        } else {
-            var range = match.indices[i];
-            fields.push(String(range[0]) + "," + String(range[1]) + ":" +
-                        __qjo_hex_utf16(match[i]));
-        }
-    }
-    return fields.join("|");
-}
-var __qjo_cases = [
-"#,
-    );
-    for case in cases {
-        writeln!(
-            source,
-            "{{pattern:{},flags:{:?},input:{}}},",
-            js_utf16(&case.pattern),
-            case.flags,
-            js_utf16(&case.input),
-        )
-        .unwrap();
-    }
-    source.push_str(
-        r#"];
-for (var __qjo_i = 0; __qjo_i < __qjo_cases.length; __qjo_i++)
-    print(__qjo_i + "|" + __qjo_observe(__qjo_cases[__qjo_i]));
-"#,
-    );
-
-    super::quickjs_indexed_oracle::eval_indexed_plain_lines(
-        oracle,
-        &source,
-        cases.len(),
-        "RegExp backreference",
-    )
+    let probes = cases
+        .iter()
+        .map(|case| MatchProbe {
+            pattern: &case.pattern,
+            flags: case.flags,
+            input: &case.input,
+            start: None,
+        })
+        .collect::<Vec<_>>();
+    run_match_probes(oracle, "", &probes, "RegExp backreference")
 }
 
 fn run_compile_oracle(oracle: &OsStr, cases: &[(&str, &str)]) -> Vec<String> {
@@ -383,13 +311,4 @@ for (var __qjo_i = 0; __qjo_i < __qjo_cases.length; __qjo_i++) {
         cases.len(),
         "RegExp decimal syntax",
     )
-}
-
-fn js_utf16(units: &[u16]) -> String {
-    let mut source = String::from("\"");
-    for unit in units {
-        write!(source, "\\u{unit:04x}").unwrap();
-    }
-    source.push('"');
-    source
 }

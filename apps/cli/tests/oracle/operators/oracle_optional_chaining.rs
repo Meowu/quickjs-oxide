@@ -1,16 +1,11 @@
+use crate::grouped_case_oracle::assert_grouped_cases_agree;
+use crate::oracle_cases::GroupedCase as Case;
+use crate::runtime_completion_oracle::oracle_script_case_name_observation as oracle_observation;
+use crate::runtime_observation::host_runtime_context;
 use crate::runtime_observation::{
     checked_value_type as value_type, primitive_value_text as primitive_text,
 };
 use quickjs_oxide::engine::api::{Context, Runtime, RuntimeError, Value};
-use std::ffi::OsStr;
-use std::process::Command;
-
-struct Case {
-    group: &'static str,
-    description: &'static str,
-    source: &'static str,
-    expected: &'static str,
-}
 
 // Pins QuickJS 2026-06-04's optional-chain lowering before the Test262 feature
 // is admitted globally. In addition to the ordinary successful paths, this
@@ -760,81 +755,43 @@ fn optional_chaining_case_table_is_reviewed() {
 
 #[test]
 fn optional_chaining_matches_pinned_expectations_without_an_oracle() {
-    let mut failures = Vec::new();
-    for case in CASES {
-        let actual = rust_observation(case);
-        if actual != case.expected {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\noxide: {:?}\nexpected: {:?}",
-                case.group, case.description, case.source, actual, case.expected,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "optional-chaining pinned expectations failed in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    assert_grouped_cases_agree(
+        CASES,
+        "optional-chaining pinned expectations failed",
+        ["oxide", "expected"],
+        rust_observation,
+        |case| case.expected.to_owned(),
     );
 }
 
 #[test]
 fn optional_chaining_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!(
-            "SKIP optional-chaining oracle self-check: set QJS_ORACLE to pinned upstream qjs"
-        );
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("optional-chaining oracle self-check");
 
-    let mut failures = Vec::new();
-    for case in CASES {
-        let actual = oracle_observation(&oracle, case);
-        if actual != case.expected {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\nactual: {:?}\nexpected: {:?}",
-                case.group, case.description, case.source, actual, case.expected,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "pinned QuickJS optional-chaining vectors drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    assert_grouped_cases_agree(
+        CASES,
+        "pinned QuickJS optional-chaining vectors drifted",
+        ["actual", "expected"],
+        |case| oracle_observation(&oracle, case),
+        |case| case.expected.to_owned(),
     );
 }
 
 #[test]
 fn optional_chaining_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP optional-chaining differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("optional-chaining differential");
 
-    let mut failures = Vec::new();
-    for case in CASES {
-        let oxide = rust_observation(case);
-        let quickjs = oracle_observation(&oracle, case);
-        if oxide != quickjs {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\noxide: {:?}\nquickjs: {:?}",
-                case.group, case.description, case.source, oxide, quickjs,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "optional-chaining semantics drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    assert_grouped_cases_agree(
+        CASES,
+        "optional-chaining semantics drifted",
+        ["oxide", "quickjs"],
+        rust_observation,
+        |case| oracle_observation(&oracle, case),
     );
 }
 
 fn rust_observation(case: &Case) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     match context.eval(case.source) {
         Ok(value) => format!(
             "return|{}|{}",
@@ -870,45 +827,6 @@ fn rust_observation(case: &Case) -> String {
         }
         Err(error) => format!("engine|{error}"),
     }
-}
-
-fn oracle_observation(oracle: &OsStr, case: &Case) -> String {
-    let wrapper = r#"
-try {
-  var value = std.evalScript(scriptArgs[0]);
-  print("return|" + typeof value + "|" + String(value));
-} catch (error) {
-  if (error !== null && typeof error === "object")
-    print("throw|object|" + error.name);
-  else
-    print("throw|" + typeof error + "|" + String(error));
-}
-"#;
-    let output = Command::new(oracle)
-        .args(["--std", "-e", wrapper, case.source])
-        .output()
-        .unwrap_or_else(|error| {
-            panic!(
-                "could not run QuickJS for {} / {}: {error}",
-                case.group, case.description,
-            )
-        });
-    assert!(
-        output.status.success(),
-        "QuickJS observer failed for {} / {}: {}",
-        case.group,
-        case.description,
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8(output.stdout)
-        .unwrap_or_else(|error| {
-            panic!(
-                "QuickJS output was not UTF-8 for {} / {}: {error}",
-                case.group, case.description,
-            )
-        })
-        .trim_end()
-        .to_owned()
 }
 
 fn error_name(

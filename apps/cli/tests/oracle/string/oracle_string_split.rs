@@ -1,5 +1,11 @@
+use crate::object_graph_observation::{int_property, intrinsic_prototype};
+use crate::runtime_completion_oracle::{
+    ErrorPropertyStyle, compare_prelude_cases_collecting_failures,
+};
+use crate::runtime_observation::host_runtime;
 use crate::runtime_observation::{property_callable, string_property};
-use quickjs_oxide::engine::api::{Context, JsString, ObjectRef, Runtime, RuntimeError, Value};
+use crate::runtime_oracle::eval_object;
+use quickjs_oxide::engine::api::{Context, JsString, ObjectRef, RuntimeError, Value};
 use std::ffi::OsStr;
 
 // Differential lock for pinned QuickJS 2026-06-04 `js_string_split`
@@ -483,10 +489,7 @@ const RECURSION_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn string_split_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP String split oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("String split oracle self-check");
     for &(group, cases) in &[
         ("graph", GRAPH_CASES),
         ("AutoInit", AUTOINIT_CASES),
@@ -549,8 +552,7 @@ fn string_split_recursion_is_catchable_and_runtime_recovers() {
 
 #[test]
 fn string_split_cross_realm_results_errors_and_user_throws_are_exact() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_string_prototype = defining.string_prototype().unwrap();
@@ -663,8 +665,7 @@ fn string_split_cross_realm_results_errors_and_user_throws_are_exact() {
 
 #[test]
 fn detached_string_split_and_result_retain_then_release_their_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let split = {
         let mut defining = runtime.new_context().expect("create context");
         let prototype = defining.string_prototype().unwrap();
@@ -709,28 +710,13 @@ fn detached_string_split_and_result_retain_then_release_their_defining_realm() {
 }
 
 fn compare_cases(group: &str, cases: &[(&str, &str)]) {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP {group}: set QJS_ORACLE to upstream qjs");
-        return;
-    };
-    let mut failures = Vec::new();
-    for &(description, source) in cases {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        let actual = observe_rust_eval(&runtime, &mut context, source, description);
-        let expected = observe_oracle(&oracle, source, description);
-        if actual != expected {
-            failures.push(format!(
-                "{description}\nsource: {source:?}\noxide: {actual:?}\noracle: {expected:?}",
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "{group} drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    compare_prelude_cases_collecting_failures(
+        PRELUDE,
+        group,
+        cases,
+        primitive_value_text,
+        ErrorPropertyStyle::Compact,
+        crate::quickjs_oracle::observe_completion,
     );
 }
 
@@ -738,73 +724,9 @@ fn observed_source(source: &str) -> String {
     format!("{PRELUDE}\n{source}")
 }
 
-fn observe_rust_eval(
-    runtime: &Runtime,
-    context: &mut Context,
-    source: &str,
-    description: &str,
-) -> String {
-    let source = observed_source(source);
-    match context.eval(&source) {
-        Ok(value) => format!(
-            "return|{}|{}",
-            value_type(runtime, &value),
-            primitive_value_text(value),
-        ),
-        Err(RuntimeError::Exception) => {
-            let exception = context
-                .take_exception()
-                .unwrap_or_else(|error| panic!("take Rust exception for {description}: {error}"))
-                .unwrap_or_else(|| panic!("Rust exception was missing for {description}"));
-            match exception {
-                Value::Object(error) => format!(
-                    "throw|object|{}|{}",
-                    string_property(runtime, context, &error, "name"),
-                    string_property(runtime, context, &error, "message"),
-                ),
-                value => format!(
-                    "throw|{}|{}",
-                    value_type(runtime, &value),
-                    primitive_value_text(value),
-                ),
-            }
-        }
-        Err(error) => panic!("Rust engine failure for {description} ({source:?}): {error}"),
-    }
-}
-
 fn observe_oracle(oracle: &OsStr, source: &str, description: &str) -> String {
     let source = observed_source(source);
     super::quickjs_oracle::observe_completion(oracle, &source, description)
-}
-
-fn intrinsic_prototype(
-    runtime: &Runtime,
-    context: &mut Context,
-    constructor_name: &str,
-) -> ObjectRef {
-    let global = context.global_object().unwrap();
-    let constructor = property_callable(runtime, context, &global, constructor_name);
-    let Value::Object(prototype) = context
-        .get_property(
-            constructor.as_object(),
-            &runtime.intern_property_key("prototype").unwrap(),
-        )
-        .unwrap()
-    else {
-        panic!("{constructor_name}.prototype was not an object");
-    };
-    prototype
-}
-
-fn eval_object(context: &mut Context, source: &str, description: &str) -> ObjectRef {
-    let Value::Object(object) = context
-        .eval(source)
-        .unwrap_or_else(|error| panic!("evaluate {description}: {error}"))
-    else {
-        panic!("{description} was not an object");
-    };
-    object
 }
 
 fn take_exception_object(context: &mut Context, description: &str) -> ObjectRef {
@@ -815,35 +737,6 @@ fn take_exception_object(context: &mut Context, description: &str) -> ObjectRef 
         panic!("{description} was not an object");
     };
     error
-}
-
-fn int_property(runtime: &Runtime, context: &mut Context, object: &ObjectRef, name: &str) -> i32 {
-    let Value::Int(value) = context
-        .get_property(object, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-    else {
-        panic!("{name} was not an Int property");
-    };
-    value
-}
-
-fn value_type(runtime: &Runtime, value: &Value) -> &'static str {
-    match value {
-        Value::Undefined => "undefined",
-        Value::Null => "object",
-        Value::Bool(_) => "boolean",
-        Value::Int(_) | Value::Float(_) => "number",
-        Value::BigInt(_) => "bigint",
-        Value::String(_) => "string",
-        Value::Symbol(_) => "symbol",
-        Value::Object(object) => {
-            if runtime.as_callable(object).unwrap().is_some() {
-                "function"
-            } else {
-                "object"
-            }
-        }
-    }
 }
 
 fn primitive_value_text(value: Value) -> String {

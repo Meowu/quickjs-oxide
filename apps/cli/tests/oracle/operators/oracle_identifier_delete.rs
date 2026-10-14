@@ -1,3 +1,5 @@
+use crate::runtime_observation::host_runtime_context;
+use crate::runtime_observation::{error_text as error_property_text, value_text};
 use quickjs_oxide::engine::api::{
     AccessorValue, CallableRef, Context, DescriptorField, ObjectRef, OrdinaryPropertyDescriptor,
     PropertyKey, Runtime, RuntimeError, Value,
@@ -109,10 +111,7 @@ print("Function-missing=" + Function("return delete __qjo_function_missing")());
 
 #[test]
 fn identifier_delete_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP identifier-delete differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("identifier-delete differential");
 
     assert_eq!(
         rust_observations(),
@@ -123,10 +122,7 @@ fn identifier_delete_matches_pinned_quickjs() {
 
 #[test]
 fn identifier_delete_errors_and_function_stack_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP identifier-delete Error differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("identifier-delete Error differential");
 
     for (description, source) in [
         ("strict direct identifier", "\"use strict\";\ndelete victim"),
@@ -148,9 +144,7 @@ fn identifier_delete_errors_and_function_stack_match_pinned_quickjs() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let mut output = Vec::new();
 
@@ -419,23 +413,8 @@ fn eval_text(context: &mut Context, source: &str) -> String {
     value_text(context.eval(source).unwrap())
 }
 
-fn value_text(value: Value) -> String {
-    match value {
-        Value::Undefined => "undefined".to_owned(),
-        Value::Null => "null".to_owned(),
-        Value::Bool(value) => value.to_string(),
-        Value::Int(value) => value.to_string(),
-        Value::Float(value) => value.to_string(),
-        Value::BigInt(value) => value.to_string(),
-        Value::String(value) => value.to_utf8_lossy(),
-        Value::Object(_) | Value::Symbol(_) => panic!("unexpected observation value"),
-    }
-}
-
 fn rust_uncaught_error(source: &str) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(
         context.eval_with_filename(source, "<cmdline>"),
         Err(RuntimeError::Exception),
@@ -453,34 +432,8 @@ fn rust_uncaught_error(source: &str) -> String {
     )
 }
 
-fn error_property_text(
-    runtime: &Runtime,
-    context: &mut Context,
-    error: &ObjectRef,
-    name: &str,
-) -> String {
-    let key = runtime.intern_property_key(name).unwrap();
-    let Value::String(value) = context.get_property(error, &key).unwrap() else {
-        panic!("Error.{name} was not a string");
-    };
-    value.to_utf8_lossy()
-}
-
 fn oracle_observations(oracle: &OsStr) -> Vec<String> {
-    let output = Command::new(oracle)
-        .args(["-e", ORACLE_PROBE])
-        .output()
-        .expect("run QuickJS identifier-delete oracle");
-    assert!(
-        output.status.success(),
-        "QuickJS identifier-delete oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("QuickJS identifier-delete oracle emitted non-UTF-8 output")
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    crate::quickjs_oracle::probe_lines(oracle, ORACLE_PROBE, "identifier-delete")
 }
 
 fn oracle_uncaught_error(oracle: &OsStr, source: &str, description: &str) -> String {

@@ -61,14 +61,12 @@ impl<'a> FrameExecution<'a> {
         execution: &'a mut crate::engine::vm::execution::RunningExecution,
         id: crate::engine::vm::frame::FrameId,
     ) -> Result<Self, Error> {
-        #[cfg(any(debug_assertions, feature = "checked-handles"))]
-        {
-            Self::admit(execution, id)
-        }
-        #[cfg(not(any(debug_assertions, feature = "checked-handles")))]
-        {
-            execution.frames.current_mut(id)?;
-            Ok(Self { execution })
+        cfg_select! {
+            any(debug_assertions, feature = "checked-handles") => Self::admit(execution, id),
+            _ => {
+                execution.frames.current_mut(id)?;
+                Ok(Self { execution })
+            }
         }
     }
 
@@ -110,7 +108,6 @@ impl<'a> FrameExecution<'a> {
         self.execution.frames.materialize_in_state(state)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::engine::vm) fn enter_ordinary(
         &mut self,
         runtime: &Runtime,
@@ -220,7 +217,6 @@ impl<'a> FrameExecution<'a> {
     /// The legacy call driver supplies a detached checked operand witness.
     /// Recheck its identity/depth within this admitted lease before invoking
     /// the same installer used by uninterrupted internal calls.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::engine::vm) fn install_ordinary(
         &mut self,
         runtime: &Runtime,
@@ -245,7 +241,7 @@ impl<'a> FrameExecution<'a> {
 
     /// Install `f.apply(thisArg, array)` as an ordinary call of `f`. The
     /// caller selected `f` and read `values` from the array in this lease.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(in crate::engine::vm) fn install_apply(
         &mut self,
         runtime: &Runtime,
@@ -285,7 +281,6 @@ impl<'a> FrameExecution<'a> {
 
     /// Sole ordinary slot installer. This method cannot be called through a
     /// raw RunningExecution or a caller-supplied current-frame identity.
-    #[allow(clippy::too_many_arguments)]
     fn install_current_ordinary(
         &mut self,
         runtime: &Runtime,
@@ -342,7 +337,6 @@ impl<'a> FrameExecution<'a> {
     /// Sole Base constructor installer under the same exclusive lease that
     /// selected its actual callee/newTarget/arguments. Receiver edges remain
     /// guarded until the common slot initializer and frame publication succeed.
-    #[allow(clippy::too_many_arguments)]
     fn install_current_constructor(
         &mut self,
         runtime: &Runtime,
@@ -650,7 +644,7 @@ impl FrameTransaction<'_> {
 
     /// Consume the selected caller lease to publish a Base constructor. No
     /// caller-supplied detached window or mutable slot access can intervene.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn install_constructor_window(
         self,
         runtime: &Runtime,
@@ -672,7 +666,7 @@ impl FrameTransaction<'_> {
             receiver,
         )
     }
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn install_apply_window(
         self,
         runtime: &Runtime,
@@ -696,7 +690,6 @@ impl FrameTransaction<'_> {
     }
     /// Consume the actual caller window before publishing its child. Only the
     /// private execution producer combines this lease with preflighted operands.
-    #[allow(clippy::too_many_arguments)]
     fn install_ordinary_window(
         self,
         runtime: &Runtime,
@@ -911,16 +904,16 @@ impl FrameSlots<'_> {
             DirectSlot::Argument(index) => (self.window.parameters(), usize::from(index)),
         };
         let source = source_range.start.checked_add(source_index)?;
-        if source >= source_range.end || source == destination {
+        if source >= source_range.end {
             return None;
         }
-        let (destination_binding, source_binding) = if destination < source {
-            let (before, after) = self.store.slots.split_at_mut(source);
-            (before.get_mut(destination)?, after.first()?.as_ref()?)
-        } else {
-            let (before, after) = self.store.slots.split_at_mut(destination);
-            (after.first_mut()?, before.get(source)?.as_ref()?)
-        };
+        // Overlap (`source == destination`) is rejected like an out-of-range slot.
+        let [destination_binding, source_binding] = self
+            .store
+            .slots
+            .get_disjoint_mut([destination, source])
+            .ok()?;
+        let source_binding = source_binding.as_ref()?;
         let FrameBinding::Direct(destination) = destination_binding.as_mut()? else {
             return None;
         };
@@ -1248,6 +1241,7 @@ mod primitive_transaction_tests {
     use crate::engine::code::function::metadata::{ClosureVariableKind, VariableDefinition};
     use crate::engine::code::region::{DirectSource, NumberSource, PublishedNumericRegion};
     use crate::engine::code::runtime::PublishedFunctionSnapshot;
+    use crate::engine::test_support::test_context;
     use crate::engine::value::Value;
     use crate::engine::vm::stack::FrameStorage;
 
@@ -1426,8 +1420,7 @@ mod primitive_transaction_tests {
                 execute::FallthroughPc,
             },
         };
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().unwrap();
+        let (runtime, mut context) = test_context();
         let child = runtime
             .into_jsvalue(context.eval("(function(){return 42})").unwrap())
             .unwrap();
@@ -1494,8 +1487,7 @@ mod primitive_transaction_tests {
             code::bytecode::Instruction,
             vm::{call::ordinary::DirectSelection, execute::FallthroughPc},
         };
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().unwrap();
+        let (runtime, mut context) = test_context();
         let child = runtime
             .into_jsvalue(context.eval("(function(){return 42})").unwrap())
             .unwrap();
@@ -1550,8 +1542,7 @@ mod primitive_transaction_tests {
     #[test]
     fn frame_execution_failed_install_preserves_current_frame_and_callee_owner() {
         use crate::engine::{code::bytecode::Instruction, vm::execute::FallthroughPc};
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().unwrap();
+        let (runtime, mut context) = test_context();
         let child = runtime
             .into_jsvalue(
                 context
@@ -1604,8 +1595,7 @@ mod primitive_transaction_tests {
 
     #[test]
     fn frame_transaction_keeps_owners_across_gc_and_partial_output_failure() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = test_context();
         let mut layout = PublishedFunctionSnapshot::empty_for_test(context.realm);
         layout.metadata.max_stack = 1;
         let mut store = SlotStore::new(8);

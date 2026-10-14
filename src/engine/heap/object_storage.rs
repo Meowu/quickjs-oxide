@@ -656,7 +656,9 @@ impl Heap {
                 "fresh Array has no physical length entry",
             ))?;
             let stored_len = match object.slots.first() {
-                Some(PropertySlot::Data(RawValue::Int(length))) if *length >= 0 => *length as u32,
+                Some(PropertySlot::Data(RawValue::Int(length))) if *length >= 0 => {
+                    length.cast_unsigned()
+                }
                 Some(PropertySlot::Data(RawValue::Float(length)))
                     if length.is_finite()
                         && *length >= 0.0
@@ -711,8 +713,7 @@ impl Heap {
             unreachable!("validated fresh Array length slot")
         };
         *length = i32::try_from(next_len)
-            .map(RawValue::Int)
-            .unwrap_or_else(|_| RawValue::Float(f64::from(next_len)));
+            .map_or_else(|_| RawValue::Float(f64::from(next_len)), RawValue::Int);
         Ok(())
     }
 
@@ -752,8 +753,7 @@ impl Heap {
             unreachable!("validated fresh Array length slot")
         };
         *length = i32::try_from(next_len)
-            .map(RawValue::Int)
-            .unwrap_or_else(|_| RawValue::Float(f64::from(next_len)));
+            .map_or_else(|_| RawValue::Float(f64::from(next_len)), RawValue::Int);
         Ok(())
     }
 
@@ -774,7 +774,9 @@ impl Heap {
             }
             let object = self.object_mut_fast(id);
             let stored_len = match object.slots.first() {
-                Some(PropertySlot::Data(RawValue::Int(length))) if *length >= 0 => *length as u32,
+                Some(PropertySlot::Data(RawValue::Int(length))) if *length >= 0 => {
+                    length.cast_unsigned()
+                }
                 Some(PropertySlot::Data(RawValue::Float(length)))
                     if length.is_finite()
                         && *length >= 0.0
@@ -1245,7 +1247,7 @@ impl Heap {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn append_unique_object_property_at_index(
         &mut self,
         id: ObjectId,
@@ -1627,7 +1629,7 @@ impl Heap {
         if let Err(slot) = object.slots.push_inline(PropertySlot::Data(value)) {
             if object.slots.try_reserve(1).is_err() {
                 let strong = &self.shapes.live_fast_mut(successor).strong;
-                strong.set(strong.get() - 1);
+                strong.update(|value| value - 1);
                 return Err(unpublished(HeapError::Allocation {
                     operation: "appending a cached shape property",
                 }));

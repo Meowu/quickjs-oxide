@@ -1,13 +1,11 @@
-use quickjs_oxide::engine::api::{Runtime, Value};
+use crate::runtime_observation::host_runtime;
+use quickjs_oxide::engine::api::Value;
 use std::ffi::OsStr;
 use std::process::Command;
 
 #[test]
 fn source_member_reads_and_intrinsic_method_calls_match_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP member-read differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("member-read differential");
 
     let cases = [
         ("fixed global field", "Function.name"),
@@ -45,8 +43,7 @@ fn source_member_reads_and_intrinsic_method_calls_match_quickjs() {
 }
 
 fn rust_observation(source: &str) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let value = runtime
         .new_context()
         .expect("create context")

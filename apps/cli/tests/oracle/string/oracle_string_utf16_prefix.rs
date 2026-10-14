@@ -1,8 +1,14 @@
+use crate::object_graph_observation::{
+    checked_data_flags as data_flags, define_named_builtin_data as define_data,
+    define_to_primitive, eval_callable, global_object_value as global_value, intrinsic_prototype,
+    own_key_names,
+};
+use crate::runtime_observation::hex;
+use crate::runtime_observation::take_hex_error as take_error;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use crate::runtime_observation::{property_callable, take_error_object as take_exception_object};
 use quickjs_oxide::engine::api::{
-    CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DescriptorField, JsBigInt, JsString,
-    ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError, Value,
-    WellKnownSymbol,
+    CallableRef, Context, JsBigInt, JsString, ObjectRef, Runtime, RuntimeError, Value,
 };
 
 // The global String constructor and the full prototype table are intentionally
@@ -130,10 +136,7 @@ print("errors=" + [
 
 #[test]
 fn string_utf16_prefix_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP String UTF-16 prefix differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("String UTF-16 prefix differential");
     let rust = rust_observations();
     let upstream =
         super::quickjs_oracle::eval_std_lines(&oracle, ORACLE_PROBE, "String UTF-16 prefix");
@@ -150,9 +153,7 @@ fn string_utf16_prefix_matches_pinned_quickjs() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let prototype = context.string_prototype().unwrap();
     let object_prototype = context.object_prototype().unwrap();
@@ -554,8 +555,7 @@ fn rust_observations() -> Vec<String> {
 
 #[test]
 fn string_utf16_prefix_cross_realm_and_error_realms_match_quickjs() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut first = runtime.new_context().expect("create context");
     let mut second = runtime.new_context().expect("create context");
     let first_prototype = first.string_prototype().unwrap();
@@ -611,8 +611,7 @@ fn string_utf16_prefix_cross_realm_and_error_realms_match_quickjs() {
 
 #[test]
 fn string_utf16_prefix_method_retains_then_releases_its_realm_graph() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let method = {
         let mut context = runtime.new_context().expect("create context");
         let prototype = context.string_prototype().unwrap();
@@ -626,19 +625,6 @@ fn string_utf16_prefix_method_retains_then_releases_its_realm_graph() {
     drop(method);
     runtime.run_gc().unwrap();
     assert_eq!(runtime.heap_counts().expect("runtime state").live, 0);
-}
-
-fn define_to_primitive(runtime: &Runtime, object: &ObjectRef, callable: CallableRef) {
-    define_data_key(
-        runtime,
-        object,
-        &PropertyKey::from(
-            runtime
-                .well_known_symbol(WellKnownSymbol::ToPrimitive)
-                .expect("well-known symbol"),
-        ),
-        Value::Object(callable.as_object().try_clone().expect("duplicate root")),
-    );
 }
 
 fn define_method(
@@ -699,81 +685,6 @@ fn signature(runtime: &Runtime, context: &mut Context, callable: &CallableRef) -
     )
 }
 
-fn define_data(runtime: &Runtime, object: &ObjectRef, name: &str, value: Value) {
-    let key = runtime.intern_property_key(name).unwrap();
-    define_data_key(runtime, object, &key, value);
-}
-
-fn define_data_key(runtime: &Runtime, object: &ObjectRef, key: &PropertyKey, value: Value) {
-    assert!(
-        runtime
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(true),
-                    enumerable: DescriptorField::Present(false),
-                    configurable: DescriptorField::Present(true),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap()
-    );
-}
-
-fn eval_callable(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("callable source did not produce an object: {source:?}");
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("source did not produce a callable: {source:?}"))
-}
-
-fn global_value(runtime: &Runtime, context: &mut Context, global: &ObjectRef, name: &str) -> Value {
-    context
-        .get_property(global, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-}
-
-fn own_key_names(runtime: &Runtime, object: &ObjectRef) -> Vec<String> {
-    runtime
-        .own_property_keys(object)
-        .unwrap()
-        .iter()
-        .map(|key| {
-            runtime
-                .property_key_to_js_string(key)
-                .unwrap()
-                .to_utf8_lossy()
-        })
-        .collect()
-}
-
-fn data_flags(runtime: &Runtime, object: &ObjectRef, name: &str) -> String {
-    let descriptor = runtime
-        .get_own_property(object, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-        .unwrap_or_else(|| panic!("{name} descriptor was absent"));
-    let CompleteOrdinaryPropertyDescriptor::Data {
-        writable,
-        enumerable,
-        configurable,
-        ..
-    } = descriptor
-    else {
-        panic!("{name} descriptor was not data");
-    };
-    format!(
-        "{}{}{}",
-        u8::from(writable),
-        u8::from(enumerable),
-        u8::from(configurable)
-    )
-}
-
 fn observe_call_args(
     runtime: &Runtime,
     context: &mut Context,
@@ -803,51 +714,9 @@ fn render(value: Value) -> String {
     }
 }
 
-fn take_error(runtime: &Runtime, context: &mut Context) -> String {
-    let error = take_exception_object(context);
-    let name = error_string(runtime, context, &error, "name");
-    let message = error_string(runtime, context, &error, "message");
-    format!("throw:{}:{}", hex(&name), hex(&message))
-}
-
-fn error_string(
-    runtime: &Runtime,
-    context: &mut Context,
-    error: &ObjectRef,
-    name: &str,
-) -> JsString {
-    expect_string(
-        context
-            .get_property(error, &runtime.intern_property_key(name).unwrap())
-            .unwrap(),
-    )
-}
-
-fn intrinsic_prototype(runtime: &Runtime, context: &mut Context, name: &str) -> ObjectRef {
-    let global = context.global_object().unwrap();
-    let constructor = property_callable(runtime, context, &global, name);
-    let Value::Object(prototype) = context
-        .get_property(
-            constructor.as_object(),
-            &runtime.intern_property_key("prototype").unwrap(),
-        )
-        .unwrap()
-    else {
-        panic!("{name}.prototype was not an object");
-    };
-    prototype
-}
-
 fn expect_string(value: Value) -> JsString {
     let Value::String(value) = value else {
         panic!("value was not a String");
     };
     value
-}
-
-fn hex(value: &JsString) -> String {
-    value
-        .utf16_units()
-        .map(|unit| format!("{unit:04x}"))
-        .collect()
 }

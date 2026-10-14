@@ -1,9 +1,10 @@
+use crate::object_graph_observation::{bits, own_key_names};
+use crate::runtime_observation::host_runtime_context;
 use quickjs_oxide::engine::api::{
     CallableRef, CompleteOrdinaryPropertyDescriptor, DescriptorField, JsString, ObjectRef,
     OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError, Value,
 };
 use std::ffi::OsStr;
-use std::process::Command;
 
 const ORACLE_PROBE: &str = r#"
 function bits(d) {
@@ -33,17 +34,12 @@ try { Error(Symbol()); } catch (e) { print("symbol-message=" + e.name + "|" + e.
 
 #[test]
 fn error_intrinsic_slice_matches_quickjs_oracle() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Error oracle differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Error oracle differential");
     assert_eq!(rust_observations(), oracle_observations(&oracle));
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let error = global_callable(&runtime, &mut context, "Error");
     let type_error = global_callable(&runtime, &mut context, "TypeError");
     let prototype = runtime.intern_property_key("prototype").unwrap();
@@ -348,20 +344,6 @@ fn global_callable(
     runtime.as_callable(&object).unwrap().unwrap()
 }
 
-fn own_key_names(runtime: &Runtime, object: &ObjectRef) -> Vec<String> {
-    runtime
-        .own_property_keys(object)
-        .unwrap()
-        .into_iter()
-        .map(|key| {
-            runtime
-                .property_key_to_js_string(&key)
-                .unwrap()
-                .to_utf8_lossy()
-        })
-        .collect()
-}
-
 fn object_data_value(runtime: &Runtime, object: &ObjectRef, key: &PropertyKey) -> ObjectRef {
     let CompleteOrdinaryPropertyDescriptor::Data {
         value: Value::Object(value),
@@ -400,15 +382,6 @@ fn descriptor_bits(descriptor: CompleteOrdinaryPropertyDescriptor) -> String {
             u8::from(configurable)
         ),
     }
-}
-
-fn bits(writable: bool, enumerable: bool, configurable: bool) -> String {
-    format!(
-        "{},{},{}",
-        u8::from(writable),
-        u8::from(enumerable),
-        u8::from(configurable)
-    )
 }
 
 fn define_data(
@@ -482,18 +455,5 @@ fn value_text(value: Value) -> String {
 }
 
 fn oracle_observations(oracle: &OsStr) -> Vec<String> {
-    let output = Command::new(oracle)
-        .args(["-e", ORACLE_PROBE])
-        .output()
-        .expect("run QuickJS Error oracle");
-    assert!(
-        output.status.success(),
-        "QuickJS Error oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("QuickJS Error oracle emitted non-UTF-8 output")
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    crate::quickjs_oracle::probe_lines(oracle, ORACLE_PROBE, "Error")
 }

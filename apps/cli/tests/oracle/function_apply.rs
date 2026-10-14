@@ -1,10 +1,14 @@
+use crate::object_graph_observation::{
+    bit, complete_data_descriptor as data_descriptor, define_context_data as define_data,
+    define_global_via_data as define_global, function, getter_descriptor, global_value,
+};
+use crate::runtime_observation::host_runtime_context;
+use crate::runtime_observation::show_exception;
 use quickjs_oxide::engine::api::{
-    AccessorValue, CallableRef, CompleteOrdinaryPropertyDescriptor, Context, DescriptorField,
-    JsBigInt, JsString, ObjectRef, OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError,
-    Value, WellKnownSymbol,
+    CallableRef, Context, JsBigInt, JsString, ObjectRef, PropertyKey, Runtime, RuntimeError, Value,
+    WellKnownSymbol,
 };
 use std::ffi::OsStr;
-use std::process::Command;
 
 const ORACLE_HELPERS: &str = r#"
 function bit(value) { return value ? 1 : 0; }
@@ -168,10 +172,7 @@ console.log("boundary-65535=" + observe(() => Reflect.apply(apply, target,
 
 #[test]
 fn function_prototype_apply_matches_quickjs_oracle() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Function.prototype.apply differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Function.prototype.apply differential");
 
     let rust = [
         rust_basic_observations(),
@@ -208,9 +209,7 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         let function_prototype = context.function_prototype().unwrap();
         let apply_key = runtime.intern_property_key("apply").unwrap();
         let Value::Object(apply_object) = context
@@ -664,16 +663,6 @@ fn rust_boundary_observations() -> Vec<String> {
     ]
 }
 
-fn function(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("function probe did not return an object: {source}");
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("function probe was not callable: {source}"))
-}
-
 fn array_like(runtime: &Runtime, context: &mut Context, length: Value) -> ObjectRef {
     let object = context.new_object().unwrap();
     let length_key = runtime.intern_property_key("length").unwrap();
@@ -720,69 +709,6 @@ fn define_index_getter(
     );
 }
 
-fn define_global(runtime: &Runtime, context: &mut Context, name: &str, value: Value) {
-    let global = context.global_object().unwrap();
-    let key = runtime.intern_property_key(name).unwrap();
-    define_data(runtime, context, &global, &key, value);
-}
-
-fn global_value(runtime: &Runtime, context: &mut Context, name: &str) -> Value {
-    let global = context.global_object().unwrap();
-    let key = runtime.intern_property_key(name).unwrap();
-    context.get_property(&global, &key).unwrap()
-}
-
-fn define_data(
-    _runtime: &Runtime,
-    context: &mut Context,
-    object: &ObjectRef,
-    key: &PropertyKey,
-    value: Value,
-) {
-    assert!(
-        context
-            .define_own_property(
-                object,
-                key,
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(true),
-                    enumerable: DescriptorField::Present(true),
-                    configurable: DescriptorField::Present(true),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap()
-    );
-}
-
-fn getter_descriptor(getter: CallableRef) -> OrdinaryPropertyDescriptor {
-    OrdinaryPropertyDescriptor {
-        get: DescriptorField::Present(AccessorValue::Callable(getter)),
-        set: DescriptorField::Present(AccessorValue::Undefined),
-        enumerable: DescriptorField::Present(true),
-        configurable: DescriptorField::Present(true),
-        ..OrdinaryPropertyDescriptor::new()
-    }
-}
-
-fn data_descriptor(
-    runtime: &Runtime,
-    object: &ObjectRef,
-    key: &PropertyKey,
-) -> (Value, bool, bool, bool) {
-    let Some(CompleteOrdinaryPropertyDescriptor::Data {
-        value,
-        writable,
-        enumerable,
-        configurable,
-    }) = runtime.get_own_property(object, key).unwrap()
-    else {
-        panic!("expected a complete data descriptor");
-    };
-    (value, writable, enumerable, configurable)
-}
-
 fn observe_call(
     runtime: &Runtime,
     context: &mut Context,
@@ -814,42 +740,7 @@ fn show_value(value: Value) -> String {
     }
 }
 
-fn show_exception(runtime: &Runtime, context: &mut Context, exception: Value) -> String {
-    match exception {
-        Value::String(value) => format!("throw-string:{}", value.to_utf8_lossy()),
-        Value::Object(error) if runtime.is_error_object(&error).unwrap() => {
-            let name = runtime.intern_property_key("name").unwrap();
-            let message = runtime.intern_property_key("message").unwrap();
-            let Value::String(name) = context.get_property(&error, &name).unwrap() else {
-                panic!("error name was not a string");
-            };
-            let Value::String(message) = context.get_property(&error, &message).unwrap() else {
-                panic!("error message was not a string");
-            };
-            format!("throw:{}|{}", name.to_utf8_lossy(), message.to_utf8_lossy())
-        }
-        value => panic!("unexpected thrown probe value: {value:?}"),
-    }
-}
-
-const fn bit(value: bool) -> u8 {
-    value as u8
-}
-
 fn oracle_observations(oracle: &OsStr, probe: &str, description: &str) -> Vec<String> {
     let source = format!("{ORACLE_HELPERS}\n{probe}");
-    let output = Command::new(oracle)
-        .args(["-e", &source])
-        .output()
-        .unwrap_or_else(|error| panic!("run QuickJS {description} oracle: {error}"));
-    assert!(
-        output.status.success(),
-        "QuickJS {description} oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .unwrap_or_else(|error| panic!("QuickJS {description} emitted non-UTF-8 output: {error}"))
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    crate::quickjs_oracle::probe_lines(oracle, &source, description)
 }

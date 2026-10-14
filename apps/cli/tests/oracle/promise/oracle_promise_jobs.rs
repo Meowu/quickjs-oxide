@@ -1,47 +1,14 @@
-use quickjs_oxide::engine::api::{Context, Runtime, RuntimeError, Value};
+use crate::runtime_observation::integer;
+use crate::runtime_observation::text;
+use crate::runtime_observation::{drain, eval};
+use crate::runtime_observation::{host_runtime, host_runtime_context};
+use quickjs_oxide::engine::api::RuntimeError;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-fn text(value: Value) -> String {
-    let Value::String(value) = value else {
-        panic!("expected string value");
-    };
-    value.to_utf8_lossy()
-}
-
-fn integer(value: Value) -> i32 {
-    let Value::Int(value) = value else {
-        panic!("expected integer value");
-    };
-    value
-}
-
-fn eval(context: &mut Context, source: &str) -> Value {
-    context.eval(source).unwrap_or_else(|error| {
-        if error == RuntimeError::Exception {
-            panic!(
-                "unexpected JavaScript exception: {:?}",
-                context.take_exception()
-            );
-        }
-        panic!("unexpected engine error: {error}");
-    })
-}
-
-fn drain(runtime: &Runtime) -> usize {
-    let mut count = 0;
-    while runtime.is_job_pending().expect("runtime state") {
-        assert!(runtime.execute_pending_job().unwrap().executed());
-        count += 1;
-    }
-    count
-}
-
 #[test]
 fn promise_constructor_and_internal_functions_have_quickjs_shapes() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     let facts = text(eval(
         &mut context,
         r#"
@@ -82,9 +49,7 @@ Promise.resolve.call(CustomPromise, 1);
 
 #[test]
 fn eval_does_not_drain_and_execute_pending_job_is_fifo_one_at_a_time() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(
         text(eval(
             &mut context,
@@ -114,9 +79,7 @@ order.join('|');
 
 #[test]
 fn promise_chains_thenables_rejections_and_self_resolution() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(
         text(eval(
             &mut context,
@@ -158,9 +121,7 @@ events.join('|');
 
 #[test]
 fn queued_jobs_retain_their_graph_across_gc() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     drop(eval(
         &mut context,
         r#"
@@ -177,9 +138,7 @@ var gcAnswer = 0;
 
 #[test]
 fn static_identity_catch_and_species_follow_quickjs() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(
         text(eval(
             &mut context,
@@ -219,9 +178,7 @@ var catchResult = Promise.prototype.catch.call(receiver, 'reject-handler');
 
 #[test]
 fn host_rejection_tracker_reports_unhandled_then_late_handled() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let expected_context = context.realm_id();
     let events = Rc::new(RefCell::new(Vec::new()));
     let captured = events.clone();
@@ -284,8 +241,7 @@ rejectEarly('early');
 
 #[test]
 fn pending_job_reports_its_originating_context_on_success_and_throw() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut first = runtime.new_context().expect("create context");
     let mut second = runtime.new_context().expect("create context");
     drop(eval(

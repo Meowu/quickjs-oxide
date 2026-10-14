@@ -1,4 +1,6 @@
 use super::quickjs_plain_eval_oracle::eval_plain_lines;
+use crate::object_graph_observation::descriptor_bits;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use quickjs_oxide::engine::api::{
     CallableRef, CompleteOrdinaryPropertyDescriptor, DescriptorField, JsString,
     OrdinaryPropertyDescriptor, PropertyKey, Runtime, Value, WellKnownSymbol,
@@ -133,10 +135,7 @@ fn global_to_string_tag_matches_pinned_quickjs() {
         "host-side global @@toStringTag contract changed"
     );
 
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP global @@toStringTag differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("global @@toStringTag differential");
     assert_eq!(
         eval_plain_lines(&oracle, ORACLE_PROBE),
         EXPECTED_OBSERVATIONS,
@@ -151,8 +150,7 @@ fn global_to_string_tag_matches_pinned_quickjs() {
 
 #[test]
 fn object_to_string_cross_realm_uses_receiver_tag_and_method_defining_realm() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut first = runtime.new_context().expect("create context");
     let mut second = runtime.new_context().expect("create context");
     let first_global = first.global_object().unwrap();
@@ -241,9 +239,7 @@ fn object_to_string_cross_realm_uses_receiver_tag_and_method_defining_realm() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let object_prototype = context.object_prototype().unwrap();
     let object_to_string = property_callable(&runtime, &mut context, &object_prototype, "toString");
@@ -509,23 +505,6 @@ fn call_to_string(
             )
             .unwrap(),
     )
-}
-
-fn descriptor_bits(descriptor: &CompleteOrdinaryPropertyDescriptor) -> String {
-    match descriptor {
-        CompleteOrdinaryPropertyDescriptor::Data {
-            writable,
-            enumerable,
-            configurable,
-            ..
-        } => format!(
-            "{}{}{}",
-            u8::from(*writable),
-            u8::from(*enumerable),
-            u8::from(*configurable)
-        ),
-        CompleteOrdinaryPropertyDescriptor::Accessor { .. } => "accessor".to_owned(),
-    }
 }
 
 fn descriptor_enumerable(descriptor: &CompleteOrdinaryPropertyDescriptor) -> bool {

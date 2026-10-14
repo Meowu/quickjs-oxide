@@ -1,12 +1,8 @@
 use super::quickjs_string_result_oracle::observe_string_result;
-use quickjs_oxide::engine::api::{Context, Runtime, Value};
-
-struct Case {
-    group: &'static str,
-    description: &'static str,
-    source: &'static str,
-    expected: &'static str,
-}
+use crate::grouped_case_oracle::assert_grouped_cases_agree;
+use crate::oracle_cases::GroupedCase as Case;
+use crate::runtime_completion_oracle::observe_oxide;
+use crate::runtime_observation::host_runtime_context;
 
 const ORACLE_WRAPPER: &str = r#"
 var value = std.evalScript(scriptArgs[0]);
@@ -328,88 +324,41 @@ const CASES: &[Case] = &[
 
 #[test]
 fn iterator_helpers_match_pinned_expectations() {
-    let mut failures = Vec::new();
-    for case in CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        let actual = observe_oxide(&mut context, case);
-        if actual != case.expected {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\nactual: {:?}\nexpected: {:?}",
-                case.group, case.description, case.source, actual, case.expected,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "Iterator helpers pinned expectations failed in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    assert_grouped_cases_agree(
+        CASES,
+        "Iterator helpers pinned expectations failed",
+        ["actual", "expected"],
+        |case| {
+            let (_runtime, mut context) = host_runtime_context();
+            observe_oxide(&mut context, case)
+        },
+        |case| case.expected.to_owned(),
     );
 }
 
 #[test]
 fn iterator_helpers_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Iterator helpers oracle self-check: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
-    let mut failures = Vec::new();
-    for case in CASES {
-        let actual = observe_string_result(&oracle, case.source, case.description, ORACLE_WRAPPER);
-        if actual != case.expected {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\nactual: {:?}\nexpected: {:?}",
-                case.group, case.description, case.source, actual, case.expected,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "pinned QuickJS Iterator helpers vectors drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    let oracle = require_pinned_qjs_oracle!("Iterator helpers oracle self-check");
+    assert_grouped_cases_agree(
+        CASES,
+        "pinned QuickJS Iterator helpers vectors drifted",
+        ["actual", "expected"],
+        |case| observe_string_result(&oracle, case.source, case.description, ORACLE_WRAPPER),
+        |case| case.expected.to_owned(),
     );
 }
 
 #[test]
 fn iterator_helpers_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Iterator helpers differential: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
-    let mut failures = Vec::new();
-    for case in CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
-        let oxide = observe_oxide(&mut context, case);
-        let quickjs = observe_string_result(&oracle, case.source, case.description, ORACLE_WRAPPER);
-        if oxide != quickjs {
-            failures.push(format!(
-                "{} / {}\nsource: {:?}\noxide: {:?}\nquickjs: {:?}",
-                case.group, case.description, case.source, oxide, quickjs,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "Iterator helpers semantics drifted in {} case(s):\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
+    let oracle = require_pinned_qjs_oracle!("Iterator helpers differential");
+    assert_grouped_cases_agree(
+        CASES,
+        "Iterator helpers semantics drifted",
+        ["oxide", "quickjs"],
+        |case| {
+            let (_runtime, mut context) = host_runtime_context();
+            observe_oxide(&mut context, case)
+        },
+        |case| observe_string_result(&oracle, case.source, case.description, ORACLE_WRAPPER),
     );
-}
-
-fn observe_oxide(context: &mut Context, case: &Case) -> String {
-    let value = context
-        .eval(case.source)
-        .unwrap_or_else(|error| panic!("Oxide observer failed for {}: {error}", case.description));
-    let Value::String(value) = value else {
-        panic!(
-            "Oxide observer returned a non-String for {}",
-            case.description
-        );
-    };
-    value.to_utf8_lossy()
 }

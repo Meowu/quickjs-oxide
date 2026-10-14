@@ -26,11 +26,11 @@ const SHARED_COPY_SCRATCH_BYTE_LENGTH: usize = 8 * 1024;
 static NEXT_SHARED_BACKING_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn allocate_shared_backing_store_id(source: &AtomicU64) -> Result<u64, SharedMemoryError> {
-    // Keep `u64::MAX` as an exhausted sentinel. Once reached, `fetch_update`
+    // Keep `u64::MAX` as an exhausted sentinel. Once reached, `try_update`
     // leaves the counter unchanged, so catching an allocation error can never
     // make a later backing reuse an identity that may still be live.
     source
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .map_err(|_| SharedMemoryError::Allocation)
@@ -107,7 +107,7 @@ impl SharedBackingStore {
         // slices have no structural invariant beyond their immutable length.
         self.bytes
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Maximum number of bytes committed in this backing store.

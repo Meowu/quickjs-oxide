@@ -1,11 +1,11 @@
 use super::quickjs_argv_completion_oracle::observe_completion_argv_sequence_strip_one_lf as observe_oracle_sequence;
 use crate::runtime_completion_oracle::observe_legacy_float_eval_completion as observe_rust_eval;
-use crate::runtime_oracle::run_cli;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
+use crate::runtime_completion_oracle::compare_cli;
 use quickjs_oxide::engine::api::{
-    AccessorValue, DescriptorField, JsString, OrdinaryPropertyDescriptor, Runtime, Value,
+    AccessorValue, DescriptorField, JsString, OrdinaryPropertyDescriptor, Value,
 };
-use std::ffi::OsStr;
 
 const VALUE_CASES: &[(&str, &str)] = &[
     (
@@ -286,15 +286,10 @@ const WITH_BOUNDARY_CASES: &[(&str, &str, bool)] = &[
 
 #[test]
 fn annex_b_statement_values_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Annex B statement differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Annex B statement differential");
 
     for &(description, source) in VALUE_CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         assert_eq!(
             observe_rust_eval(&runtime, &mut context, source, description),
             observe_oracle_sequence(&oracle, &[source], description),
@@ -305,15 +300,10 @@ fn annex_b_statement_values_match_pinned_quickjs() {
 
 #[test]
 fn annex_b_statement_errors_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Annex B statement error differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Annex B statement error differential");
 
     for &(description, source) in ERROR_CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         assert_eq!(
             observe_rust_eval(&runtime, &mut context, source, description),
             observe_oracle_sequence(&oracle, &[source], description),
@@ -324,19 +314,14 @@ fn annex_b_statement_errors_match_pinned_quickjs() {
 
 #[test]
 fn program_label_annex_global_state_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Program label global-state differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Program label global-state differential");
     let description = "Program labelled Annex precedes a later global lexical";
     let sources = [
         "label:function orderedLabelCollision(){};let orderedLabelCollision;",
         "typeof globalThis.orderedLabelCollision",
         "orderedLabelCollision",
     ];
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let rust = sources
         .iter()
         .map(|source| observe_rust_eval(&runtime, &mut context, source, description))
@@ -350,18 +335,13 @@ fn program_label_annex_global_state_matches_pinned_quickjs() {
 
 #[test]
 fn program_label_invokes_existing_global_setter_twice() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Program label accessor differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Program label accessor differential");
     let description = "Program labelled function performs both QuickJS global writes";
     let sources = [
         "Function.labelSetterHits=0;Function.labelSetterValue=0;Object.defineProperty(globalThis,'__qjo_label_accessor',{configurable:true,get:function(){return Function.labelSetterValue},set:function(value){Function.labelSetterHits++;Function.labelSetterValue=value}});0",
         "label:function __qjo_label_accessor(){return 17};Function.labelSetterHits+'|'+typeof __qjo_label_accessor+'|'+__qjo_label_accessor()",
     ];
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     drop(
         context
             .eval("Function.labelSetterHits=0;Function.labelSetterValue=0")
@@ -409,10 +389,7 @@ fn program_label_invokes_existing_global_setter_twice() {
 
 #[test]
 fn annex_b_statement_full_and_strip_debug_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Annex B statement stack differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Annex B statement stack differential");
 
     for &(description, source) in STACK_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -422,10 +399,7 @@ fn annex_b_statement_full_and_strip_debug_stacks_match_pinned_quickjs() {
 
 #[test]
 fn annex_b_statement_parser_diagnostics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Annex B statement parser differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Annex B statement parser differential");
 
     for &(description, source) in SYNTAX_ERROR_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -434,10 +408,7 @@ fn annex_b_statement_parser_diagnostics_match_pinned_quickjs() {
 
 #[test]
 fn with_annex_boundaries_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP with/Annex B boundaries: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("with/Annex B boundaries");
 
     for &(description, source, oracle_accepts) in WITH_BOUNDARY_CASES {
         let quickjs = observe_oracle_sequence(&oracle, &[source], description);
@@ -446,9 +417,7 @@ fn with_annex_boundaries_match_pinned_quickjs() {
             oracle_accepts,
             "pinned QuickJS changed its with/Annex B boundary: {quickjs}"
         );
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         let rust = observe_rust_eval(&runtime, &mut context, source, description);
         assert_eq!(
             rust, quickjs,
@@ -461,8 +430,7 @@ fn with_annex_boundaries_match_pinned_quickjs() {
 fn program_label_cross_realm_regression() {
     // Pinned with the QuickJS C API compile-in-A/execute-in-B path. The Rust
     // API exposes the same operation directly, so this remains unconditional.
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     drop(defining.eval("globalThis.realmTag='A'").unwrap());
@@ -496,17 +464,4 @@ fn program_label_cross_realm_regression() {
         caller.call(&callable, Value::Undefined, &[]).unwrap(),
         Value::String(JsString::try_from_utf8("B|false").unwrap())
     );
-}
-
-fn compare_cli(oracle: &OsStr, options: &[&str], source: &str, description: &str) {
-    let rust = run_cli(
-        env!("CARGO_BIN_EXE_qjs").as_ref(),
-        options,
-        source,
-        description,
-    );
-    let quickjs = run_cli(oracle, options, source, description);
-    assert_eq!(rust.status.code(), quickjs.status.code(), "{description}");
-    assert_eq!(rust.stdout, quickjs.stdout, "{description}");
-    assert_eq!(rust.stderr, quickjs.stderr, "{description}");
 }

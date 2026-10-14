@@ -1,8 +1,8 @@
-use quickjs_oxide::engine::api::{
-    CallableRef, Context, JsString, ObjectRef, Runtime, RuntimeError, Value,
-};
+use crate::object_graph_observation::{get_property as property_value, property_text};
+use crate::runtime_observation::host_runtime_context;
+use crate::runtime_observation::{string_value as string, value_text};
+use quickjs_oxide::engine::api::{CallableRef, Context, ObjectRef, Runtime, RuntimeError, Value};
 use std::ffi::OsStr;
-use std::process::Command;
 
 const ORACLE_PROBE: &str = r#"
 function frames(stack, count) {
@@ -55,10 +55,7 @@ print("strict-caller=" + (function () {
 
 #[test]
 fn update_expressions_in_function_constructor_match_quickjs_oracle() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP update Function constructor differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("update Function constructor differential");
 
     assert_eq!(
         rust_observations(),
@@ -68,9 +65,7 @@ fn update_expressions_in_function_constructor_match_quickjs_oracle() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let constructor = context.function_constructor().unwrap();
     let mut output = Vec::new();
 
@@ -211,55 +206,6 @@ fn stack_frames(
     frames.join("|")
 }
 
-fn property_text(
-    runtime: &Runtime,
-    context: &mut Context,
-    object: &ObjectRef,
-    name: &str,
-) -> String {
-    value_text(property_value(runtime, context, object, name))
-}
-
-fn property_value(
-    runtime: &Runtime,
-    context: &mut Context,
-    object: &ObjectRef,
-    name: &str,
-) -> Value {
-    let key = runtime.intern_property_key(name).unwrap();
-    context.get_property(object, &key).unwrap()
-}
-
-fn value_text(value: Value) -> String {
-    match value {
-        Value::Undefined => "undefined".to_owned(),
-        Value::Null => "null".to_owned(),
-        Value::Bool(value) => value.to_string(),
-        Value::Int(value) => value.to_string(),
-        Value::Float(value) => value.to_string(),
-        Value::BigInt(value) => value.to_string(),
-        Value::String(value) => value.to_utf8_lossy(),
-        Value::Object(_) | Value::Symbol(_) => panic!("unexpected observation value"),
-    }
-}
-
-fn string(value: &str) -> Value {
-    Value::String(JsString::try_from_utf8(value).unwrap())
-}
-
 fn oracle_observations(oracle: &OsStr) -> Vec<String> {
-    let output = Command::new(oracle)
-        .args(["-e", ORACLE_PROBE])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "QuickJS update Function constructor oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    crate::quickjs_oracle::probe_lines(oracle, ORACLE_PROBE, "update Function constructor")
 }

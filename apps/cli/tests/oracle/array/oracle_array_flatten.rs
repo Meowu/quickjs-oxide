@@ -1,6 +1,8 @@
 use super::support::*;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
-use quickjs_oxide::engine::api::{CallableRef, Context, ObjectRef, Runtime, RuntimeError, Value};
+use crate::object_graph_observation::int_property;
+use quickjs_oxide::engine::api::{RuntimeError, Value};
 use std::ffi::OsStr;
 
 // This target pins QuickJS 2026-06-04 `JS_FlattenIntoArray` and its shared
@@ -311,9 +313,7 @@ print('meta='+meta('flatMap')+'|'+meta('flat'));
 
 #[test]
 fn array_flatten_basic_rust_smoke() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     let value = context
         .eval(r#"[[1,2],[3,[4]],,5].flat().join("|")"#)
         .expect("evaluate basic Array.flat smoke");
@@ -326,9 +326,7 @@ fn array_flatten_basic_rust_smoke() {
 
 #[test]
 fn array_flatten_recursive_mapper_stack_overflow_is_catchable_without_oracle() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (_runtime, mut context) = host_runtime_context();
     // Owned callbacks consume logical frames, so the old native-stack ceiling
     // must not reject this finite chain. Keep the legacy ceiling probe below
     // for the default VM and exercise a true infinite chain for stack-vm.
@@ -366,10 +364,7 @@ fn array_flatten_recursive_mapper_stack_overflow_is_catchable_without_oracle() {
 
 #[test]
 fn array_flatten_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array flatten oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array flatten oracle self-check");
     for &(group, cases) in &[
         ("values", VALUE_CASES),
         ("order", ORDER_CASES),
@@ -411,10 +406,7 @@ fn array_flatten_recursion_guard_matches_pinned_completion_class() {
 
 #[test]
 fn array_flatten_prototype_order_and_metadata_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP Array flatten graph differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("Array flatten graph differential");
     assert_eq!(
         rust_graph_observations(),
         oracle_graph_observations(&oracle),
@@ -424,8 +416,7 @@ fn array_flatten_prototype_order_and_metadata_match_pinned_quickjs() {
 
 #[test]
 fn array_flatten_results_native_errors_and_user_throws_use_pinned_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_array_prototype = defining.array_prototype().unwrap();
@@ -515,9 +506,7 @@ fn array_flatten_results_native_errors_and_user_throws_use_pinned_realms() {
 }
 
 fn rust_graph_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let array_prototype = context.array_prototype().unwrap();
     let function_prototype = context.function_prototype().unwrap();
     let implemented = ["copyWithin", "flatMap", "flat", "values", "keys", "entries"];
@@ -557,25 +546,4 @@ fn rust_graph_observations() -> Vec<String> {
 
 fn oracle_graph_observations(oracle: &OsStr) -> Vec<String> {
     super::quickjs_oracle::eval_std_lines(oracle, GRAPH_ORACLE, "Array flatten graph oracle")
-}
-
-fn eval_callable(
-    runtime: &Runtime,
-    context: &mut Context,
-    source: &str,
-    description: &str,
-) -> CallableRef {
-    let object = eval_object(context, source, description);
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("Rust {description} was not callable"))
-}
-
-fn int_property(runtime: &Runtime, context: &mut Context, object: &ObjectRef, name: &str) -> i32 {
-    let key = runtime.intern_property_key(name).unwrap();
-    let Value::Int(value) = context.get_property(object, &key).unwrap() else {
-        panic!("{name} was not an Int property");
-    };
-    value
 }

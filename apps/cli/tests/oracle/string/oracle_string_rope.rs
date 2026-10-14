@@ -1,3 +1,6 @@
+use crate::object_graph_observation::intrinsic_prototype;
+use crate::runtime_observation::error_string;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use crate::runtime_observation::{property_callable, take_error_object as take_exception_object};
 use quickjs_oxide::engine::api::{
     Context, DescriptorField, JsString, ObjectRef, OrdinaryPropertyDescriptor, Runtime,
@@ -125,10 +128,7 @@ const RUST_SUCCESS_PROBE: &str = r#"
 
 #[test]
 fn string_rope_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP String rope differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("String rope differential");
 
     let rust = rust_observations();
     let source = format!("{ORACLE_SETUP}\nprint({PROBE});");
@@ -147,8 +147,7 @@ fn string_rope_matches_pinned_quickjs() {
 
 #[test]
 fn string_rope_overflow_uses_vm_and_native_defining_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut first = runtime.new_context().expect("create context");
     let mut second = runtime.new_context().expect("create context");
     let first_string = first.string_prototype().unwrap();
@@ -194,8 +193,7 @@ fn string_rope_overflow_uses_vm_and_native_defining_realms() {
 
 #[test]
 fn string_rope_dag_does_not_keep_its_realm_graph_alive() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let rope = near_limit_rope();
     let method = {
         let mut context = runtime.new_context().expect("create context");
@@ -223,9 +221,7 @@ fn string_rope_dag_does_not_keep_its_realm_graph_alive() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let prototype = context.string_prototype().unwrap();
     let concat = property_callable(&runtime, &mut context, &prototype, "concat");
@@ -430,21 +426,6 @@ fn define_data(runtime: &Runtime, object: &ObjectRef, name: &str, value: Value) 
     );
 }
 
-fn intrinsic_prototype(runtime: &Runtime, context: &mut Context, name: &str) -> ObjectRef {
-    let global = context.global_object().unwrap();
-    let constructor = property_callable(runtime, context, &global, name);
-    let Value::Object(prototype) = context
-        .get_property(
-            constructor.as_object(),
-            &runtime.intern_property_key("prototype").unwrap(),
-        )
-        .unwrap()
-    else {
-        panic!("{name}.prototype was not an object");
-    };
-    prototype
-}
-
 fn assert_internal_string_too_long(runtime: &Runtime, context: &mut Context, error: &ObjectRef) {
     assert_eq!(
         error_string(runtime, context, error, "name"),
@@ -466,19 +447,4 @@ fn take_error_observation(runtime: &Runtime, context: &mut Context) -> String {
 fn observe_source_exception(runtime: &Runtime, context: &mut Context, source: &str) -> String {
     assert_eq!(context.eval(source), Err(RuntimeError::Exception));
     take_error_observation(runtime, context)
-}
-
-fn error_string(
-    runtime: &Runtime,
-    context: &mut Context,
-    error: &ObjectRef,
-    name: &str,
-) -> JsString {
-    let Value::String(value) = context
-        .get_property(error, &runtime.intern_property_key(name).unwrap())
-        .unwrap()
-    else {
-        panic!("Error.{name} was not a String");
-    };
-    value
 }

@@ -1,14 +1,8 @@
-use crate::runtime_observation::{checked_value_type as value_type, primitive_value_text};
-use quickjs_oxide::engine::api::{DebugInfoMode, Runtime, RuntimeError, Value};
-use std::ffi::OsStr;
-use std::process::Command;
-
-struct Case {
-    group: &'static str,
-    description: &'static str,
-    source: &'static str,
-    expected: &'static str,
-}
+use crate::oracle_cases::GroupedCase as Case;
+use crate::runtime_completion_oracle::oracle_script_case_name_observation as oracle_observation;
+use crate::runtime_completion_oracle::rust_case_name_observation as rust_observation;
+use crate::runtime_observation::host_runtime;
+use quickjs_oxide::engine::api::{DebugInfoMode, Value};
 
 // Pins the first tagged-template slice against QuickJS 2026-06-04. The
 // observer sources return primitive strings so object identity, descriptors,
@@ -451,8 +445,7 @@ fn tagged_template_rust_smoke_matches_pinned_expectation() {
 
 #[test]
 fn tagged_template_site_identity_survives_gc_in_strip_debug_mode() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     runtime
         .set_debug_info_mode(DebugInfoMode::StripDebug)
         .expect("set runtime configuration");
@@ -508,10 +501,7 @@ fn tagged_template_site_identity_survives_gc_in_strip_debug_mode() {
 
 #[test]
 fn pinned_quickjs_tagged_template_semantics_match_expectations() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP tagged-template oracle: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("tagged-template oracle");
 
     for case in CASES {
         assert_eq!(
@@ -527,10 +517,7 @@ fn pinned_quickjs_tagged_template_semantics_match_expectations() {
 
 #[test]
 fn tagged_template_semantics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP tagged-template oracle: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("tagged-template oracle");
 
     for case in CASES {
         let quickjs = oracle_observation(&oracle, case);
@@ -543,110 +530,4 @@ fn tagged_template_semantics_match_pinned_quickjs() {
             case.source,
         );
     }
-}
-
-fn rust_observation(case: &Case) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
-    match context.eval(case.source) {
-        Ok(value) => format!(
-            "return|{}|{}",
-            value_type(&runtime, &value),
-            primitive_value_text(value),
-        ),
-        Err(RuntimeError::Exception) => {
-            let exception = context
-                .take_exception()
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "take Rust exception for {} / {}: {error}",
-                        case.group, case.description,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Rust exception was missing for {} / {}",
-                        case.group, case.description,
-                    )
-                });
-            match exception {
-                Value::Object(error) => format!(
-                    "throw|object|{}",
-                    error_name(&runtime, &mut context, &error, case),
-                ),
-                value => format!(
-                    "throw|{}|{}",
-                    value_type(&runtime, &value),
-                    primitive_value_text(value),
-                ),
-            }
-        }
-        Err(error) => panic!(
-            "Rust engine failure for {} / {} ({:?}): {error}",
-            case.group, case.description, case.source,
-        ),
-    }
-}
-
-fn error_name(
-    runtime: &Runtime,
-    context: &mut quickjs_oxide::engine::api::Context,
-    error: &quickjs_oxide::engine::api::ObjectRef,
-    case: &Case,
-) -> String {
-    let key = runtime
-        .intern_property_key("name")
-        .expect("Error name property key");
-    let Value::String(value) = context.get_property(error, &key).unwrap_or_else(|failure| {
-        panic!(
-            "read Error.name for {} / {}: {failure}",
-            case.group, case.description,
-        )
-    }) else {
-        panic!(
-            "Error.name was not a string for {} / {}",
-            case.group, case.description,
-        );
-    };
-    value.to_utf8_lossy()
-}
-
-fn oracle_observation(oracle: &OsStr, case: &Case) -> String {
-    let wrapper = r#"
-try {
-  var value = std.evalScript(scriptArgs[0]);
-  print('return|' + typeof value + '|' + String(value));
-} catch (error) {
-  if (error !== null && typeof error === 'object')
-    print('throw|object|' + error.name);
-  else
-    print('throw|' + typeof error + '|' + String(error));
-}
-"#;
-    let output = Command::new(oracle)
-        .args(["--std", "-e", wrapper, case.source])
-        .output()
-        .unwrap_or_else(|error| {
-            panic!(
-                "could not run QuickJS for {} / {}: {error}",
-                case.group, case.description,
-            )
-        });
-    assert!(
-        output.status.success(),
-        "QuickJS observer failed for {} / {}: {}",
-        case.group,
-        case.description,
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8(output.stdout)
-        .unwrap_or_else(|error| {
-            panic!(
-                "QuickJS output was not UTF-8 for {} / {}: {error}",
-                case.group, case.description,
-            )
-        })
-        .trim_end()
-        .to_owned()
 }

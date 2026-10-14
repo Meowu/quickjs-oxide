@@ -1,8 +1,7 @@
 use super::quickjs_argv_completion_oracle::observe_completion_argv_trim_end as observe_oracle;
+use crate::runtime_completion_oracle::compare_cli;
 use crate::runtime_completion_oracle::observe_legacy_float_eval_completion as observe_rust_eval;
-use crate::runtime_oracle::run_cli;
-use quickjs_oxide::engine::api::Runtime;
-use std::ffi::OsStr;
+use crate::runtime_observation::host_runtime_context;
 
 // Pins QuickJS 2026-06-04's CatchParameter BindingPattern path. QuickJS
 // lowers catch patterns through the declaration destructuring machinery, but
@@ -410,10 +409,7 @@ const STACK_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn catch_destructuring_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP catch-destructuring oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("catch-destructuring oracle self-check");
 
     for &(group, cases) in &[
         ("direct/default", DIRECT_CASES),
@@ -469,9 +465,7 @@ fn catch_destructuring_iterator_close_matches_pinned_quickjs() {
 fn catch_destructuring_pinned_quirks_have_exact_results() {
     let oracle = std::env::var_os("QJS_ORACLE");
     for &(description, source, expected) in PINNED_QUIRK_CASES {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         assert_eq!(
             observe_rust_eval(&runtime, &mut context, source, description),
             expected,
@@ -489,10 +483,7 @@ fn catch_destructuring_pinned_quirks_have_exact_results() {
 
 #[test]
 fn catch_destructuring_parser_diagnostics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP catch-destructuring diagnostics: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("catch-destructuring diagnostics");
 
     for &(description, source) in DIAGNOSTIC_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -501,10 +492,7 @@ fn catch_destructuring_parser_diagnostics_match_pinned_quickjs() {
 
 #[test]
 fn catch_destructuring_exact_cli_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP catch-destructuring stack differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("catch-destructuring stack differential");
 
     for &(description, source) in STACK_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -514,32 +502,14 @@ fn catch_destructuring_exact_cli_stacks_match_pinned_quickjs() {
 }
 
 fn compare_value_cases(group: &str, cases: &[(&str, &str)]) {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP {group} differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("{group} differential");
 
     for &(description, source) in cases {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         assert_eq!(
             observe_rust_eval(&runtime, &mut context, source, description),
             observe_oracle(&oracle, source, description),
             "{group} drifted for {description}: {source:?}",
         );
     }
-}
-
-fn compare_cli(oracle: &OsStr, options: &[&str], source: &str, description: &str) {
-    let rust = run_cli(
-        env!("CARGO_BIN_EXE_qjs").as_ref(),
-        options,
-        source,
-        description,
-    );
-    let quickjs = run_cli(oracle, options, source, description);
-    assert_eq!(rust.status.code(), quickjs.status.code(), "{description}");
-    assert_eq!(rust.stdout, quickjs.stdout, "{description}");
-    assert_eq!(rust.stderr, quickjs.stderr, "{description}");
 }

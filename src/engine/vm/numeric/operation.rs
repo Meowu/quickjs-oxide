@@ -1,8 +1,8 @@
 //! Numeric operators retain ordered conversion operands across JavaScript callbacks.
 use super::{
-    NumericValue, add_primitives, bigint_error, bigint_value_payload, compare_bigint_number,
-    jsvalue_number, mixed_numeric_type_error, number_to_int32, number_to_uint32, string_payload,
-    string_to_bigint, to_number_jsvalue, to_numeric_primitive, unary_plus_primitive,
+    NumericValue, add_primitives, bigint_error, bigint_value_payload, jsvalue_number,
+    mixed_numeric_type_error, number_to_int32, number_to_uint32, string_payload, string_to_bigint,
+    to_number_jsvalue, to_numeric_primitive, unary_plus_primitive,
 };
 use crate::engine::{
     api::runtime::Runtime,
@@ -550,11 +550,9 @@ fn compare(
             to_numeric_primitive(runtime, right)?,
         ) {
             (NumericValue::BigInt(left), NumericValue::BigInt(right)) => Some(left.cmp(&right)),
-            (NumericValue::BigInt(left), NumericValue::Number(right)) => {
-                compare_bigint_number(&left, right)
-            }
+            (NumericValue::BigInt(left), NumericValue::Number(right)) => left.cmp_f64(right),
             (NumericValue::Number(left), NumericValue::BigInt(right)) => {
-                compare_bigint_number(&right, left).map(std::cmp::Ordering::reverse)
+                right.cmp_f64(left).map(std::cmp::Ordering::reverse)
             }
             (NumericValue::Number(left), NumericValue::Number(right)) => left.partial_cmp(&right),
         },
@@ -734,7 +732,7 @@ fn equality(
                     Ok(converted) => converted,
                     Err(error) => return Err(equality_error(runtime, left, right, error)),
                 };
-                let equal = compare_bigint_number(&a, number) == Some(std::cmp::Ordering::Equal);
+                let equal = a.cmp_f64(number) == Some(std::cmp::Ordering::Equal);
                 return equality_complete(runtime, kind, left, right, equal);
             }
             (JsValue::Int(_) | JsValue::Float(_), b) if b.is_bigint() => {
@@ -744,7 +742,7 @@ fn equality(
                     Ok(converted) => converted,
                     Err(error) => return Err(equality_error(runtime, left, right, error)),
                 };
-                let equal = compare_bigint_number(&b, number) == Some(std::cmp::Ordering::Equal);
+                let equal = b.cmp_f64(number) == Some(std::cmp::Ordering::Equal);
                 return equality_complete(runtime, kind, left, right, equal);
             }
             (JsValue::Bool(_), _) => {
@@ -808,11 +806,8 @@ fn equality(
 
 #[cfg(all(test, feature = "profiling"))]
 mod tests {
-    use crate::engine::{
-        api::{profiling::CostProfile, runtime::Runtime},
-        value::Value,
-        vm::Completion,
-    };
+    use crate::engine::test_support::test_context;
+    use crate::engine::{api::profiling::CostProfile, value::Value, vm::Completion};
 
     #[test]
     fn numeric_callbacks_preserve_order_abrupt_completion_and_postfix_values_without_bridges() {
@@ -826,8 +821,7 @@ mod tests {
             "(function(){var n=0,a={[Symbol.toPrimitive](h){if(h!=='default')throw 99;n++;return '42'}};return function(){return a==42&&n===1?42:0}})()",
             "(function(){var a={valueOf(){return 40n}},b={valueOf(){return 2n}};return function(){return a|b}})()",
         ] {
-            let runtime = Runtime::new();
-            let mut context = runtime.new_context().expect("create context");
+            let (runtime, mut context) = test_context();
             let callable = runtime
                 .callable_from_value(context.eval(source).unwrap())
                 .unwrap();
@@ -999,12 +993,12 @@ mod borrowed_bigint_tests {
 #[cfg(test)]
 mod nullish_equality_tests {
     use super::*;
+    use crate::engine::test_support::test_context;
     use crate::engine::value::Value;
 
     #[test]
     fn nullish_equality_preserves_proxy_identity_and_conversion_effects() {
-        let runtime = Runtime::new();
-        let mut context = runtime.new_context().expect("create context");
+        let (_, mut context) = test_context();
         let result = context.eval(r#"(() => {
             let calls = 0;
             const object = { [Symbol.toPrimitive]() { calls++; return null; } };
@@ -1085,8 +1079,7 @@ mod nullish_equality_tests {
         use crate::engine::heap::RawId;
         for source in ["({})", "'heap string'", "123456789012345678901234567890n"] {
             for count in [u32::MAX - 2, u32::MAX - 1, u32::MAX] {
-                let runtime = Runtime::new();
-                let mut context = runtime.new_context().expect("create context");
+                let (runtime, mut context) = test_context();
                 let value = runtime.into_jsvalue(context.eval(source).unwrap()).unwrap();
                 let id = match value {
                     JsValue::Object(id) => RawId::Object(id),
@@ -1132,8 +1125,7 @@ mod nullish_equality_tests {
     #[test]
     fn nullish_equality_preserves_symbol_checked_count_without_immortality() {
         for count in [u32::MAX - 2, u32::MAX - 1, u32::MAX] {
-            let runtime = Runtime::new();
-            let mut context = runtime.new_context().expect("create context");
+            let (runtime, mut context) = test_context();
             let value = runtime
                 .into_jsvalue(context.eval("Symbol('nullish')").unwrap())
                 .unwrap();

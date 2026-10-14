@@ -1,18 +1,12 @@
+use crate::oracle_cases::GroupedCase as Case;
+use crate::runtime_completion_oracle::oracle_script_case_observation as oracle_observation;
 use crate::runtime_observation::{
     checked_value_type as value_type, primitive_value_text,
     property_callable_with_read_context as property_callable, take_exception_object,
 };
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 use crate::runtime_oracle::eval_object;
 use quickjs_oxide::engine::api::{Context, JsString, ObjectRef, Runtime, RuntimeError, Value};
-use std::ffi::OsStr;
-use std::process::Command;
-
-struct Case {
-    group: &'static str,
-    description: &'static str,
-    source: &'static str,
-    expected: &'static str,
-}
 
 // Pins QuickJS 2026-06-04's `js_json_parse`, `json_parse_value`, and
 // `internalize_json_property` paths. Every observer returns a primitive string
@@ -602,10 +596,7 @@ const CASES: &[Case] = &[
 
 #[test]
 fn pinned_quickjs_json_parse_semantics_match_expectations() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP JSON.parse oracle: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("JSON.parse oracle");
 
     let mut failures = Vec::new();
     for case in CASES {
@@ -626,10 +617,7 @@ fn pinned_quickjs_json_parse_semantics_match_expectations() {
 
 #[test]
 fn json_parse_semantics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP JSON.parse oracle: set QJS_ORACLE to pinned upstream qjs");
-        return;
-    };
+    let oracle = require_pinned_qjs_oracle!("JSON.parse oracle");
 
     for case in CASES {
         let quickjs = oracle_observation(&oracle, case);
@@ -650,8 +638,7 @@ fn json_parse_allocations_and_native_errors_use_the_method_defining_realm() {
     // pins the C path directly: QuickJS stores a realm on every intrinsic C
     // function (`JS_NewCFunction3`) and switches to it before `js_json_parse`
     // allocates the parse graph, reviver contexts, wrapper, or SyntaxError.
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_object_prototype = defining.object_prototype().unwrap();
@@ -772,9 +759,7 @@ fn json_parse_allocations_and_native_errors_use_the_method_defining_realm() {
 }
 
 fn rust_observation(case: &Case) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     match context.eval(case.source) {
         Ok(value) => format!(
             "return|{}|{}",
@@ -854,43 +839,4 @@ fn object_property(
         panic!("{name} was not an object property");
     };
     value
-}
-
-fn oracle_observation(oracle: &OsStr, case: &Case) -> String {
-    let wrapper = r#"
-try {
-  var value = std.evalScript(scriptArgs[0]);
-  print('return|' + typeof value + '|' + String(value));
-} catch (error) {
-  if (error !== null && typeof error === 'object')
-    print('throw|object|' + error.name + '|' + error.message);
-  else
-    print('throw|' + typeof error + '|' + String(error));
-}
-"#;
-    let output = Command::new(oracle)
-        .args(["--std", "-e", wrapper, case.source])
-        .output()
-        .unwrap_or_else(|error| {
-            panic!(
-                "could not run QuickJS for {} / {}: {error}",
-                case.group, case.description,
-            )
-        });
-    assert!(
-        output.status.success(),
-        "QuickJS observer failed for {} / {}: {}",
-        case.group,
-        case.description,
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8(output.stdout)
-        .unwrap_or_else(|error| {
-            panic!(
-                "QuickJS output was not UTF-8 for {} / {}: {error}",
-                case.group, case.description,
-            )
-        })
-        .trim_end()
-        .to_owned()
 }

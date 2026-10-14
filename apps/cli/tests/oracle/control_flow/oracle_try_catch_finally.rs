@@ -1,9 +1,9 @@
 use super::quickjs_argv_completion_oracle::observe_completion_argv_sequence_strip_one_lf as observe_oracle_sequence;
 use crate::runtime_completion_oracle::observe_legacy_float_eval_completion as observe_rust_eval;
-use crate::runtime_oracle::run_cli;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
 
-use quickjs_oxide::engine::api::{Runtime, Value};
-use std::ffi::OsStr;
+use crate::runtime_completion_oracle::compare_cli;
+use quickjs_oxide::engine::api::Value;
 
 const CATCH_CASES: &[(&str, &str)] = &[
     ("basic primitive catch", "try{throw 7}catch(e){e}"),
@@ -260,10 +260,7 @@ fn abrupt_finally_override_cell_reuse_matches_pinned_quickjs() {
 
 #[test]
 fn try_catch_finally_full_strip_source_and_strip_debug_stacks_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP try/catch/finally stack differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("try/catch/finally stack differential");
 
     for &(description, source) in STACK_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -274,10 +271,7 @@ fn try_catch_finally_full_strip_source_and_strip_debug_stacks_match_pinned_quick
 
 #[test]
 fn try_catch_finally_parser_diagnostics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP try/catch/finally parser differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("try/catch/finally parser differential");
 
     for &(description, source) in SYNTAX_ERROR_CASES {
         compare_cli(&oracle, &[], source, description);
@@ -289,13 +283,9 @@ fn try_catch_cross_realm_regression() {
     // Pinned with the QuickJS C API compile-in-A/execute-in-B path. The Rust
     // API exposes that operation directly; QJS_ORACLE keeps this test grouped
     // with the same checksum-pinned release as the process differentials.
-    let Some(_oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP try/catch cross-realm oracle: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let _oracle = require_qjs_oracle!("try/catch cross-realm oracle");
 
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
 
@@ -346,32 +336,14 @@ fn try_catch_cross_realm_regression() {
 }
 
 fn compare_value_cases(group: &str, cases: &[(&str, &str)]) {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP {group} differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("{group} differential");
 
     for &(description, source) in cases {
-        let runtime =
-            Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-        let mut context = runtime.new_context().expect("create context");
+        let (runtime, mut context) = host_runtime_context();
         assert_eq!(
             observe_rust_eval(&runtime, &mut context, source, description),
             observe_oracle_sequence(&oracle, &[source], description),
             "{group} drifted for {description}: {source:?}",
         );
     }
-}
-
-fn compare_cli(oracle: &OsStr, options: &[&str], source: &str, description: &str) {
-    let rust = run_cli(
-        env!("CARGO_BIN_EXE_qjs").as_ref(),
-        options,
-        source,
-        description,
-    );
-    let quickjs = run_cli(oracle, options, source, description);
-    assert_eq!(rust.status.code(), quickjs.status.code(), "{description}");
-    assert_eq!(rust.stdout, quickjs.stdout, "{description}");
-    assert_eq!(rust.stderr, quickjs.stderr, "{description}");
 }

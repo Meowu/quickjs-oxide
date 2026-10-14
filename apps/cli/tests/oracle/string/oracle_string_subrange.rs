@@ -1,13 +1,13 @@
-use crate::runtime_completion_oracle::{
-    compare_eval_completion_cases_with_prelude, observe_quickjs_completion_with_prelude,
-};
+use crate::object_graph_observation::{define_builtin_data as define_data, intrinsic_prototype};
+use crate::runtime_completion_oracle::STRING_CASE_PRELUDE as CASE_PRELUDE;
+use crate::runtime_completion_oracle::compare_eval_completion_cases_with_prelude;
+use crate::runtime_completion_oracle::self_check_prelude_vectors;
+use crate::runtime_observation::assert_native_error as assert_native_type_error;
+use crate::runtime_observation::host_runtime;
 use crate::runtime_observation::{
     property_callable, take_pending_exception_object as take_exception_object,
 };
-use quickjs_oxide::engine::api::{
-    CallableRef, Context, DescriptorField, JsString, ObjectRef, OrdinaryPropertyDescriptor,
-    Runtime, RuntimeError, Value,
-};
+use quickjs_oxide::engine::api::{JsString, RuntimeError, Value};
 
 // Pins QuickJS 2026-06-04 `js_sub_string` (quickjs.c 3964-3991),
 // `js_string_substring`/`js_string_substr`/`js_string_slice` (45983-46071),
@@ -21,30 +21,6 @@ use quickjs_oxide::engine::api::{
 // slice applies that offset independently to both indices and never swaps.
 // All string observations containing unpaired surrogates are encoded as raw
 // UTF-16 code units before crossing the process stdout boundary.
-
-const CASE_PRELUDE: &str = r#"
-function __bits(object,key){
-    var descriptor=Object.getOwnPropertyDescriptor(object,key);
-    return (descriptor.writable?"1":"0")+
-           (descriptor.enumerable?"1":"0")+
-           (descriptor.configurable?"1":"0");
-}
-function __isConstructor(value){
-    try{new value();return true}catch(_){return false}
-}
-function __units(value){
-    value=String(value);
-    var output="",index=0;
-    while(index<value.length){
-        var unit=value.charCodeAt(index).toString(16);
-        while(unit.length<4)unit="0"+unit;
-        if(index)output+=",";
-        output+=unit;
-        index++;
-    }
-    return output;
-}
-"#;
 
 const GRAPH_CASES: &[(&str, &str)] = &[
     (
@@ -416,35 +392,20 @@ const STACK_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn string_subrange_oracle_vectors_self_check() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP String subrange oracle self-check: set QJS_ORACLE to upstream qjs");
-        return;
-    };
-    for &(group, cases) in &[
-        ("graph", GRAPH_CASES),
-        ("AutoInit", AUTOINIT_CASES),
-        ("values", VALUE_CASES),
-        ("UTF-16", UTF16_CASES),
-        ("order", ORDER_CASES),
-        ("stack", STACK_CASES),
-    ] {
-        for &(description, source) in cases {
-            let observation =
-                observe_quickjs_completion_with_prelude(CASE_PRELUDE, &oracle, source, description);
-            assert!(
-                observation.starts_with("return|"),
-                "{group} oracle vector unexpectedly threw for {description}: {observation:?}",
-            );
-        }
-    }
-    for &(description, source) in ERROR_CASES {
-        let observation =
-            observe_quickjs_completion_with_prelude(CASE_PRELUDE, &oracle, source, description);
-        assert!(
-            observation.starts_with("throw|"),
-            "error oracle vector unexpectedly returned for {description}: {observation:?}",
-        );
-    }
+    let oracle = require_qjs_oracle!("String subrange oracle self-check");
+    self_check_prelude_vectors(
+        &oracle,
+        CASE_PRELUDE,
+        &[
+            ("graph", GRAPH_CASES),
+            ("AutoInit", AUTOINIT_CASES),
+            ("values", VALUE_CASES),
+            ("UTF-16", UTF16_CASES),
+            ("order", ORDER_CASES),
+            ("stack", STACK_CASES),
+        ],
+        ERROR_CASES,
+    );
 }
 
 #[test]
@@ -492,8 +453,7 @@ fn string_subrange_recursion_is_catchable_and_runtime_recovers() {
 
 #[test]
 fn string_subrange_defining_realms_and_user_throw_identity_are_exact() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_prototype = defining.string_prototype().unwrap();
@@ -596,8 +556,7 @@ fn string_subrange_defining_realms_and_user_throw_identity_are_exact() {
 
 #[test]
 fn string_subrange_callables_are_per_realm_distinct_and_collectable() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let retained = {
         let mut first = runtime.new_context().expect("create context");
         let mut second = runtime.new_context().expect("create context");
@@ -640,8 +599,7 @@ fn string_subrange_callables_are_per_realm_distinct_and_collectable() {
 
 #[test]
 fn string_subrange_stack_overflow_uses_the_caller_realm_and_recovers() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut defining = runtime.new_context().expect("create context");
     let mut caller = runtime.new_context().expect("create context");
     let defining_prototype = defining.string_prototype().unwrap();
@@ -688,63 +646,5 @@ fn string_subrange_stack_overflow_uses_the_caller_realm_and_recovers() {
             )
             .unwrap(),
         Value::String(JsString::try_from_utf8("cover").unwrap()),
-    );
-}
-
-fn intrinsic_prototype(
-    runtime: &Runtime,
-    context: &mut Context,
-    constructor_name: &str,
-) -> ObjectRef {
-    let global = context.global_object().unwrap();
-    let constructor = property_callable(runtime, context, &global, constructor_name);
-    let Value::Object(prototype) = context
-        .get_property(
-            constructor.as_object(),
-            &runtime.intern_property_key("prototype").unwrap(),
-        )
-        .unwrap()
-    else {
-        panic!("{constructor_name}.prototype was not an object");
-    };
-    prototype
-}
-
-fn assert_native_type_error(
-    runtime: &Runtime,
-    context: &mut Context,
-    method: &CallableRef,
-    this_value: Value,
-    arguments: &[Value],
-    expected_prototype: &ObjectRef,
-) {
-    assert_eq!(
-        context.call(method, this_value, arguments),
-        Err(RuntimeError::Exception),
-    );
-    assert_eq!(
-        runtime
-            .get_prototype_of(&take_exception_object(context))
-            .unwrap()
-            .as_ref(),
-        Some(expected_prototype),
-    );
-}
-
-fn define_data(runtime: &Runtime, object: &ObjectRef, name: &str, value: Value) {
-    assert!(
-        runtime
-            .define_own_property(
-                object,
-                &runtime.intern_property_key(name).unwrap(),
-                &OrdinaryPropertyDescriptor {
-                    value: DescriptorField::Present(value),
-                    writable: DescriptorField::Present(true),
-                    enumerable: DescriptorField::Present(false),
-                    configurable: DescriptorField::Present(true),
-                    ..OrdinaryPropertyDescriptor::new()
-                },
-            )
-            .unwrap()
     );
 }

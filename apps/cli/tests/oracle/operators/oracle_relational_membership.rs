@@ -1,3 +1,8 @@
+use crate::object_graph_observation::object as expect_object;
+use crate::object_graph_observation::{function, get_property};
+use crate::runtime_observation::take_error_object as take_exception_object;
+use crate::runtime_observation::{host_runtime, host_runtime_context};
+use crate::runtime_observation::{show, string_value as string};
 use quickjs_oxide::engine::api::{
     AccessorValue, CallableRef, Context, DescriptorField, JsString, ObjectRef,
     OrdinaryPropertyDescriptor, PropertyKey, Runtime, RuntimeError, Value, WellKnownSymbol,
@@ -352,10 +357,7 @@ const PARSER_ERROR_CASES: &[(&str, &str)] = &[
 
 #[test]
 fn pinned_quickjs_relational_membership_contract_is_stable() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP pinned relational-membership contract: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("pinned relational-membership contract");
 
     assert_eq!(
         oracle_observations(&oracle),
@@ -366,10 +368,7 @@ fn pinned_quickjs_relational_membership_contract_is_stable() {
 
 #[test]
 fn source_relational_membership_matches_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP relational-membership differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("relational-membership differential");
 
     assert_eq!(
         rust_observations(),
@@ -380,10 +379,7 @@ fn source_relational_membership_matches_pinned_quickjs() {
 
 #[test]
 fn source_relational_membership_no_in_diagnostics_match_pinned_quickjs() {
-    let Some(oracle) = std::env::var_os("QJS_ORACLE") else {
-        eprintln!("SKIP relational-membership NoIn differential: set QJS_ORACLE to upstream qjs");
-        return;
-    };
+    let oracle = require_qjs_oracle!("relational-membership NoIn differential");
 
     for &(description, source) in NO_IN_ERROR_CASES {
         assert_eq!(
@@ -403,8 +399,7 @@ fn source_relational_membership_no_in_diagnostics_match_pinned_quickjs() {
 
 #[test]
 fn membership_errors_follow_opcode_conversion_and_method_defining_realms() {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
+    let runtime = host_runtime();
     let mut first = runtime.new_context().expect("create context");
     let mut second = runtime.new_context().expect("create context");
     let first_type_error = intrinsic_prototype(&runtime, &mut first, "TypeError");
@@ -621,9 +616,7 @@ fn membership_errors_follow_opcode_conversion_and_method_defining_realms() {
 }
 
 fn rust_observations() -> Vec<String> {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     let sentinel = context.new_object().unwrap();
     define_global(
         &runtime,
@@ -1284,16 +1277,6 @@ fn rust_observations() -> Vec<String> {
     output
 }
 
-fn function(runtime: &Runtime, context: &mut Context, source: &str) -> CallableRef {
-    let Value::Object(object) = context.eval(source).unwrap() else {
-        panic!("function probe did not return an object: {source}");
-    };
-    runtime
-        .as_callable(&object)
-        .unwrap()
-        .unwrap_or_else(|| panic!("function probe was not callable: {source}"))
-}
-
 fn property_callable(
     runtime: &Runtime,
     context: &mut Context,
@@ -1308,20 +1291,6 @@ fn property_callable(
         .as_callable(&value)
         .unwrap()
         .unwrap_or_else(|| panic!("property {name} was not callable"))
-}
-
-fn expect_object(value: Value) -> ObjectRef {
-    let Value::Object(value) = value else {
-        panic!("expected object, got {value:?}");
-    };
-    value
-}
-
-fn take_exception_object(context: &mut Context) -> ObjectRef {
-    let Value::Object(error) = context.take_exception().unwrap().unwrap() else {
-        panic!("expected an Error object exception");
-    };
-    error
 }
 
 fn intrinsic_prototype(runtime: &Runtime, context: &mut Context, name: &str) -> ObjectRef {
@@ -1455,33 +1424,10 @@ fn observe(runtime: &Runtime, context: &mut Context, sentinel: &ObjectRef, sourc
     }
 }
 
-fn show(value: Value) -> String {
-    match value {
-        Value::Undefined => "undefined:undefined".to_owned(),
-        Value::Null => "object:null".to_owned(),
-        Value::Bool(value) => format!("boolean:{value}"),
-        Value::Int(value) => format!("number:{value}"),
-        Value::Float(value) => format!("number:{value}"),
-        Value::BigInt(value) => format!("bigint:{value}"),
-        Value::String(value) => format!("string:{}", value.to_utf8_lossy()),
-        Value::Symbol(_) => "symbol:<symbol>".to_owned(),
-        Value::Object(_) => "object:<object>".to_owned(),
-    }
-}
-
-fn string(value: &str) -> Value {
-    Value::String(JsString::try_from_utf8(value).unwrap())
-}
-
 fn set_log(runtime: &Runtime, context: &mut Context, value: &str) {
     let global = context.global_object().unwrap();
     let key = runtime.intern_property_key("membershipLog").unwrap();
     assert!(context.set_property(&global, &key, string(value)).unwrap());
-}
-
-fn get_property(runtime: &Runtime, context: &mut Context, object: &ObjectRef, name: &str) -> Value {
-    let key = runtime.intern_property_key(name).unwrap();
-    context.get_property(object, &key).unwrap()
 }
 
 fn string_global(runtime: &Runtime, context: &mut Context, name: &str) -> String {
@@ -1493,26 +1439,11 @@ fn string_global(runtime: &Runtime, context: &mut Context, name: &str) -> String
 }
 
 fn oracle_observations(oracle: &OsStr) -> Vec<String> {
-    let output = Command::new(oracle)
-        .args(["-e", ORACLE_PROBE])
-        .output()
-        .expect("run QuickJS relational-membership oracle");
-    assert!(
-        output.status.success(),
-        "QuickJS relational-membership oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("QuickJS relational-membership oracle emitted non-UTF-8 output")
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    crate::quickjs_oracle::probe_lines(oracle, ORACLE_PROBE, "relational-membership")
 }
 
 fn rust_error_observation(source: &str) -> String {
-    let runtime =
-        Runtime::new_with_host_services(quickjs_oxide_host::SystemHostServices::default());
-    let mut context = runtime.new_context().expect("create context");
+    let (runtime, mut context) = host_runtime_context();
     assert_eq!(context.eval(source), Err(RuntimeError::Exception));
     let Value::Object(error) = context.take_exception().unwrap().unwrap() else {
         panic!("Rust parser did not materialize an Error object");
