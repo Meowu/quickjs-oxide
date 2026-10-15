@@ -490,8 +490,7 @@ fn execute_admitted_in_state(
     state: &mut RuntimeState,
     mut segment: FrameExecution<'_>,
 ) -> Result<VmAction, Error> {
-    #[cfg(feature = "profiling")]
-    crate::engine::api::profiling::record_owned_execution_event("core.frame_executor_entry");
+    profile!(record_owned_execution_event("core.frame_executor_entry"));
     loop {
         let action = {
             let FrameTurn {
@@ -507,20 +506,14 @@ fn execute_admitted_in_state(
                 selected_native,
                 ..
             } = segment.frame();
-            #[cfg(feature = "profiling")]
-            crate::engine::api::profiling::record_execution_static_in_state(
-                runtime, state, executable,
-            );
+            profile!(record_execution_static_in_state(runtime, state, executable));
             let mut cursor =
                 FrameCursor::new(transaction, fault_pc, resume_pc, &runtime.0.poisoned);
             // End the actual current frame projection before installing or
             // retiring a frame; all opcodes share this one dispatch loop.
             'dispatch: loop {
                 let pc = cursor.begin();
-                #[cfg(feature = "profiling")]
-                crate::engine::api::profiling::record_numeric_rejection_visit(
-                    runtime, executable, pc,
-                );
+                profile!(record_numeric_rejection_visit(runtime, executable, pc));
                 let decoded = executable
                     .exec
                     .decode_published(pc as u32)
@@ -610,8 +603,7 @@ fn execute_admitted_in_state(
                                     .then_some(JsValue::Undefined)
                                 }))
                             })?;
-                            #[cfg(feature = "profiling")]
-                            crate::engine::api::profiling::record_execution_outcome(
+                            profile!(record_execution_outcome(
                                 runtime,
                                 executable,
                                 pc,
@@ -620,14 +612,13 @@ fn execute_admitted_in_state(
                                     None
                                 } else {
                                     Some("guard")
-                                },
-                            );
+                                }
+                            ));
                             if let Some(value) = selected {
                                 cursor.commit_owned_hot(state, value)?;
-                                #[cfg(feature = "profiling")]
-                                crate::engine::api::profiling::record_owned_execution_event(
-                                    "local_completion.borrowed_this_read",
-                                );
+                                profile!(record_owned_execution_event(
+                                    "local_completion.borrowed_this_read"
+                                ));
                                 cursor.advance(decoded.operand(2) as usize);
                                 continue;
                             }
@@ -683,10 +674,7 @@ fn execute_admitted_in_state(
                     }
                     Opcode::NumberLocalInc => {
                         let index = published_u16(operand);
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, true,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, true));
                         let result = cursor.with_slots(|slots| {
                             let Some(value) = slots.immediate_local(index) else {
                                 return Ok(None);
@@ -697,26 +685,24 @@ fn execute_admitted_in_state(
                             Ok(Some(value.add(Number::Int(1))))
                         })?;
                         if let Some(value) = result {
-                            #[cfg(feature = "profiling")]
-                            crate::engine::api::profiling::record_execution_outcome(
+                            profile!(record_execution_outcome(
                                 runtime,
                                 executable,
                                 pc,
                                 "number_local_inc",
-                                None,
-                            );
+                                None
+                            ));
                             cursor.commit_push(number_value(value))?;
                             cursor.advance(next + 2);
                             continue;
                         }
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
                             "number_local_inc",
-                            Some("guard"),
-                        );
+                            Some("guard")
+                        ));
                         if let Some(action) =
                             read_local_fallback::<false>(&mut cursor, state, index)?
                         {
@@ -750,10 +736,7 @@ fn execute_admitted_in_state(
                     Opcode::UpdateLocalDiscard | Opcode::UpdateLocalDiscardCheck => {
                         let index = published_u16(operand & 0x1fff);
                         let descriptor = operand >> 13;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, true,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, true));
                         let hit = cursor.with_slots(|slots| {
                             if !slots.has_operand_capacity(if descriptor & 2 != 0 { 2 } else { 1 })
                             {
@@ -771,14 +754,13 @@ fn execute_admitted_in_state(
                             )?;
                             Ok(true)
                         })?;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
                             "update_local_discard",
-                            if hit { None } else { Some("guard") },
-                        );
+                            if hit { None } else { Some("guard") }
+                        ));
                         if hit {
                             cursor.advance(
                                 (decoded.next_pc + if descriptor & 4 != 0 { 3 } else { 2 })
@@ -800,30 +782,21 @@ fn execute_admitted_in_state(
                     }
                     Opcode::GetLocal => {
                         let index = published_u16(operand);
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, false,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, false));
                         if let Some(action) = read_local::<false>(&mut cursor, state, index)? {
                             break 'dispatch Ok(action);
                         }
                     }
                     Opcode::GetLocalCheck => {
                         let index = published_u16(operand);
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, false,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, false));
                         if let Some(action) = read_local::<true>(&mut cursor, state, index)? {
                             break 'dispatch Ok(action);
                         }
                     }
                     Opcode::NumberArgInc => {
                         let index = published_u16(operand);
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, true,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, true));
                         let result = cursor.with_slots(|slots| {
                             let Some(value) = slots.immediate_parameter(index) else {
                                 return Ok(None);
@@ -834,26 +807,24 @@ fn execute_admitted_in_state(
                             Ok(Some(value.add(Number::Int(1))))
                         })?;
                         if let Some(value) = result {
-                            #[cfg(feature = "profiling")]
-                            crate::engine::api::profiling::record_execution_outcome(
+                            profile!(record_execution_outcome(
                                 runtime,
                                 executable,
                                 pc,
                                 "number_arg_inc",
-                                None,
-                            );
+                                None
+                            ));
                             cursor.commit_push(number_value(value))?;
                             cursor.advance(next + 2);
                             continue;
                         }
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
                             "number_arg_inc",
-                            Some("guard"),
-                        );
+                            Some("guard")
+                        ));
                         if let Some(action) = read_arg_fallback(&mut cursor, state, index)? {
                             break 'dispatch Ok(action);
                         }
@@ -870,10 +841,7 @@ fn execute_admitted_in_state(
                                 | Opcode::DensePostUpdateLocalCheck
                                 | Opcode::DensePostUpdateArg
                         );
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, true,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, true));
                         let update = decoded.operand(1);
                         let update_index = published_u16(update & 0xffff);
                         let base = if matches!(
@@ -919,8 +887,7 @@ fn execute_admitted_in_state(
                             slots.commit_numeric_update_and_read(update_slot, updated, read)?;
                             Ok(true)
                         })?;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
@@ -929,8 +896,8 @@ fn execute_admitted_in_state(
                             } else {
                                 "dense_pre_update"
                             },
-                            if hit { None } else { Some("guard") },
-                        );
+                            if hit { None } else { Some("guard") }
+                        ));
                         if hit {
                             cursor.advance(decoded.operand(2) as usize);
                             continue;
@@ -961,10 +928,7 @@ fn execute_admitted_in_state(
                         let packed = decoded.operand(1);
                         let base_index = published_u16(packed & 0xffff);
                         let field_index = packed >> 16;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, true,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, true));
                         let hit = cursor.with_slots(|slots| {
                             if !slots.has_operand_capacity(2) {
                                 return Ok(false);
@@ -992,14 +956,13 @@ fn execute_admitted_in_state(
                             slots.commit_number_local_discard(accumulator, sum.add(read))?;
                             Ok(true)
                         })?;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
                             "field_acc_set_drop",
-                            if hit { None } else { Some("guard") },
-                        );
+                            if hit { None } else { Some("guard") }
+                        ));
                         if hit {
                             cursor.advance((decoded.next_pc + 5) as usize);
                             continue;
@@ -1016,10 +979,7 @@ fn execute_admitted_in_state(
                         let base_index = published_u16(packed & 0xffff);
                         let key_index = published_u16(packed >> 16);
                         let mask = i32::from((decoded.operand(2) as u16).cast_signed());
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, true,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, true));
                         let hit = cursor.with_slots(|slots| {
                             if !slots.has_operand_capacity(4) {
                                 return Ok(false);
@@ -1049,14 +1009,13 @@ fn execute_admitted_in_state(
                             slots.commit_number_local_discard(accumulator, sum.add(read))?;
                             Ok(true)
                         })?;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
                             "dense_acc_index_set_drop",
-                            if hit { None } else { Some("guard") },
-                        );
+                            if hit { None } else { Some("guard") }
+                        ));
                         if hit {
                             cursor.advance((decoded.next_pc + 8) as usize);
                             continue;
@@ -1086,23 +1045,19 @@ fn execute_admitted_in_state(
                             DirectSlot::Local(key_index)
                         };
                         let rhs_mode = (descriptor >> 11) & 3;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, true,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, true));
                         let read = cursor.with_slots(|slots| {
                             Ok(try_dense_index_binary(
                                 slots, state, base, key, rhs_mode, rhs_bits, operation,
                             ))
                         })?;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
                             "dense_index_binary",
-                            if read.is_some() { None } else { Some("guard") },
-                        );
+                            if read.is_some() { None } else { Some("guard") }
+                        ));
                         if let Some(value) = read {
                             cursor.commit_push(number_value(value))?;
                             cursor.advance((decoded.next_pc + 4) as usize);
@@ -1139,17 +1094,13 @@ fn execute_admitted_in_state(
                             DirectSlot::Local(key_index)
                         };
                         let rhs_mode = (descriptor >> 11) & 3;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, true,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, true));
                         let result = cursor.with_slots(|slots| {
                             Ok(try_dense_read_binary(
                                 slots, state, base, key, rhs_mode, rhs_index, operation,
                             ))
                         })?;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
@@ -1158,8 +1109,8 @@ fn execute_admitted_in_state(
                                 None
                             } else {
                                 Some("guard")
-                            },
-                        );
+                            }
+                        ));
                         if let Some(value) = result {
                             cursor.commit_push(value)?;
                             cursor.advance((decoded.next_pc + 4) as usize);
@@ -1179,10 +1130,7 @@ fn execute_admitted_in_state(
                     }
                     Opcode::DenseReadLocal | Opcode::DenseReadArg => {
                         let base_index = published_u16(operand);
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, true,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, true));
                         let key = decoded.operand(1);
                         let key_index = published_u16(key & 0xffff);
                         let base = if decoded.opcode == Opcode::DenseReadLocal {
@@ -1211,14 +1159,13 @@ fn execute_admitted_in_state(
                                 .direct_value(base)
                                 .and_then(|base| state.peek_dense_number(base, index)))
                         })?;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
                             "dense_read",
-                            if read.is_some() { None } else { Some("guard") },
-                        );
+                            if read.is_some() { None } else { Some("guard") }
+                        ));
                         if let Some(value) = read {
                             cursor.commit_push(number_value(value))?;
                             cursor.advance(decoded.operand(2) as usize);
@@ -1238,10 +1185,7 @@ fn execute_admitted_in_state(
                     }
                     Opcode::BorrowedFieldLocal | Opcode::BorrowedFieldArg => {
                         let base_index = published_u16(operand);
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, true,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, true));
                         let base = if decoded.opcode == Opcode::BorrowedFieldLocal {
                             DirectSlot::Local(base_index)
                         } else {
@@ -1275,8 +1219,7 @@ fn execute_admitted_in_state(
                             )
                             .then_some(JsValue::Undefined)
                         });
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
@@ -1285,14 +1228,13 @@ fn execute_admitted_in_state(
                                 None
                             } else {
                                 Some("guard")
-                            },
-                        );
+                            }
+                        ));
                         if let Some(value) = selection {
                             cursor.commit_owned_hot(state, value)?;
-                            #[cfg(feature = "profiling")]
-                            crate::engine::api::profiling::record_owned_execution_event(
-                                "local_completion.borrowed_named_read",
-                            );
+                            profile!(record_owned_execution_event(
+                                "local_completion.borrowed_named_read"
+                            ));
                             cursor.advance(decoded.operand(2) as usize);
                             continue;
                         }
@@ -1361,17 +1303,13 @@ fn execute_admitted_in_state(
                         let descriptor = operand;
                         let comparison = Opcode::from_raw((descriptor & 0x3ff) as u16)
                             .ok_or_else(|| Error::internal("invalid published comparison"))?;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, true,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, true));
                         let decision = cursor.with_slots(|slots| {
                             slots.number_pair_branch(|left, right| {
                                 compare_direct_numbers(comparison as u16, left, right)
                             })
                         })?;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
@@ -1380,8 +1318,8 @@ fn execute_admitted_in_state(
                                 None
                             } else {
                                 Some("guard")
-                            },
-                        );
+                            }
+                        ));
                         if let Some(decision) = decision {
                             cursor.advance(if decision == (descriptor & 0x400 != 0) {
                                 decoded.operand(1) as usize
@@ -1409,10 +1347,9 @@ fn execute_admitted_in_state(
                             if matches!(comparison, Opcode::StrictEq | Opcode::StrictNeq) {
                                 let decision = cursor.strict_comparison(state, active_frame)?
                                     != (comparison == Opcode::StrictNeq);
-                                #[cfg(feature = "profiling")]
-                                crate::engine::api::profiling::record_owned_execution_event(
-                                    "strict_comparison.local_branch",
-                                );
+                                profile!(record_owned_execution_event(
+                                    "strict_comparison.local_branch"
+                                ));
                                 cursor.advance(if decision == (descriptor & 0x400 != 0) {
                                     decoded.operand(1) as usize
                                 } else {
@@ -1443,10 +1380,7 @@ fn execute_admitted_in_state(
                         } else {
                             DirectSlot::Local(right_index)
                         };
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, true,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, true));
                         let decision = cursor.with_slots(|slots| {
                             if !slots.has_operand_capacity(2) {
                                 return Ok(None);
@@ -1457,8 +1391,7 @@ fn execute_admitted_in_state(
                                 .zip(right)
                                 .map(|(left, right)| left.float() < right.float()))
                         })?;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
@@ -1467,8 +1400,8 @@ fn execute_admitted_in_state(
                                 None
                             } else {
                                 Some("guard")
-                            },
-                        );
+                            }
+                        ));
                         if let Some(decision) = decision {
                             let target = if decision == (descriptor & 0x800_0000 != 0) {
                                 decoded.operand(2) as usize
@@ -1504,10 +1437,7 @@ fn execute_admitted_in_state(
                         } else {
                             DirectSlot::Local(right_index)
                         };
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, true,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, true));
                         let decision = cursor.with_slots(|slots| {
                             if !slots.has_operand_capacity(2) {
                                 return Ok(None);
@@ -1522,8 +1452,7 @@ fn execute_admitted_in_state(
                                 )
                             }))
                         })?;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
@@ -1532,8 +1461,8 @@ fn execute_admitted_in_state(
                                 None
                             } else {
                                 Some("guard")
-                            },
-                        );
+                            }
+                        ));
                         if let Some(decision) = decision {
                             let target = if decision == (descriptor & 0x800_0000 != 0) {
                                 decoded.operand(2) as usize
@@ -1570,14 +1499,13 @@ fn execute_admitted_in_state(
                             } else {
                                 None
                             };
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
                             "captured_read",
-                            if value.is_some() { None } else { Some("guard") },
-                        );
+                            if value.is_some() { None } else { Some("guard") }
+                        ));
                         if let Some(value) = value {
                             cursor.commit_owned_hot(state, value)?;
                         } else {
@@ -1606,10 +1534,7 @@ fn execute_admitted_in_state(
                                 )?
                         {
                             cursor.commit_owned_hot(state, value)?;
-                            #[cfg(feature = "profiling")]
-                            crate::engine::api::profiling::record_owned_execution_event(
-                                "global_cell.local_complete",
-                            );
+                            profile!(record_owned_execution_event("global_cell.local_complete"));
                         } else {
                             break 'dispatch Ok(VmAction::Environment(
                                 super::environment_driver::Operation::GlobalGet {
@@ -1621,10 +1546,7 @@ fn execute_admitted_in_state(
                     }
                     Opcode::GetArg => {
                         let index = published_u16(operand);
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_dispatch(
-                            runtime, executable, pc, false,
-                        );
+                        profile!(record_execution_dispatch(runtime, executable, pc, false));
                         if let Some(action) = read_arg(&mut cursor, state, index)? {
                             break 'dispatch Ok(action);
                         }
@@ -1963,10 +1885,9 @@ fn execute_admitted_in_state(
                                 cursor.commit_push(JsValue::Bool(
                                     equal != (decoded.opcode == Opcode::StrictNeq),
                                 ))?;
-                                #[cfg(feature = "profiling")]
-                                crate::engine::api::profiling::record_owned_execution_event(
-                                    "strict_comparison.local_value",
-                                );
+                                profile!(record_owned_execution_event(
+                                    "strict_comparison.local_value"
+                                ));
                                 cursor.advance(next);
                                 continue;
                             }
@@ -2074,8 +1995,7 @@ fn execute_admitted_in_state(
                         // read. Nested argument reads replace it; the native
                         // consumer also checks the actual callee identity.
                         *selected_native = native;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
@@ -2084,14 +2004,13 @@ fn execute_admitted_in_state(
                                 None
                             } else {
                                 Some("guard")
-                            },
-                        );
+                            }
+                        ));
                         match step {
                             PropertyReadProgress::Completed => {
-                                #[cfg(feature = "profiling")]
-                                crate::engine::api::profiling::record_owned_execution_event(
-                                    "local_completion.named_read",
-                                );
+                                profile!(record_owned_execution_event(
+                                    "local_completion.named_read"
+                                ));
                             }
                             PropertyReadProgress::Driver => {
                                 break 'dispatch Ok(pending.action());
@@ -2132,14 +2051,13 @@ fn execute_admitted_in_state(
                                 slots.array_read_in_state(state, &runtime.0.poisoned)
                             }
                         })?;
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_execution_outcome(
+                        profile!(record_execution_outcome(
                             runtime,
                             executable,
                             pc,
                             "dense_array_read",
-                            if hit { None } else { Some("guard") },
-                        );
+                            if hit { None } else { Some("guard") }
+                        ));
                         if !hit {
                             break 'dispatch Ok(VmAction::GetElement {
                                 keep_receiver,
@@ -2373,16 +2291,14 @@ fn execute_admitted_in_state(
                         .map_err(runtime_error_to_vm_error)?;
                     cursor.commit_owned(state, JsValue::Object(object))?;
                     cursor.advance(fallthrough.index());
-                    #[cfg(feature = "profiling")]
-                    crate::engine::api::profiling::record_owned_instruction(depth);
+                    profile!(record_owned_instruction(depth));
                 }
                 // The fresh edge belongs to the frame before collection.
                 // A rejected commit releases it and skips this checkpoint.
                 state
                     .collect_if_requested(&runtime.0.gc_pressure, &runtime.0.poisoned)
                     .map_err(runtime_error_to_vm_error)?;
-                #[cfg(feature = "profiling")]
-                crate::engine::api::profiling::record_owned_execution_event("core.internal_object");
+                profile!(record_owned_execution_event("core.internal_object"));
                 continue;
             }
             VmAction::ArrayFrom { count, fallthrough } => {
@@ -2404,10 +2320,7 @@ fn execute_admitted_in_state(
                     fallthrough,
                 )? {
                     super::driver::ordinary::Entry::Ordinary => {
-                        #[cfg(feature = "profiling")]
-                        crate::engine::api::profiling::record_owned_execution_event(
-                            "core.internal_call",
-                        );
+                        profile!(record_owned_execution_event("core.internal_call"));
                         continue;
                     }
                     super::driver::ordinary::Entry::General => return Ok(action),
@@ -2431,18 +2344,12 @@ fn execute_admitted_in_state(
                 state
                     .collect_if_requested(&runtime.0.gc_pressure, &runtime.0.poisoned)
                     .map_err(runtime_error_to_vm_error)?;
-                #[cfg(feature = "profiling")]
-                crate::engine::api::profiling::record_owned_execution_event(
-                    "core.internal_construct",
-                );
+                profile!(record_owned_execution_event("core.internal_construct"));
                 continue;
             }
             VmAction::Complete => match segment.finish_ordinary(runtime, state)? {
                 super::driver::ordinary::ReturnProgress::Returned => {
-                    #[cfg(feature = "profiling")]
-                    crate::engine::api::profiling::record_owned_execution_event(
-                        "core.internal_return",
-                    );
+                    profile!(record_owned_execution_event("core.internal_return"));
                     continue;
                 }
                 super::driver::ordinary::ReturnProgress::Declined => return Ok(action),
@@ -2486,8 +2393,7 @@ fn execute_numeric_region(
         .ok_or_else(|| Error::internal("published numeric region is missing"))?;
     #[cfg(test)]
     NUMERIC_REGION_ATTEMPTS.update(|value| value + 1);
-    #[cfg(feature = "profiling")]
-    crate::engine::api::profiling::record_execution_dispatch(runtime, executable, pc, true);
+    profile!(record_execution_dispatch(runtime, executable, pc, true));
     let mut miss_reason = None;
     let hit = match opcode {
         Opcode::NumericArrayAccumulate | Opcode::NumericArrayStoreProduct => {
@@ -2737,14 +2643,13 @@ fn execute_numeric_region(
                     .map(|left| compare_direct_numbers(region.comparison as u16, left, rhs)))
             })?;
             if let Ok(decision) = result {
-                #[cfg(feature = "profiling")]
-                crate::engine::api::profiling::record_execution_outcome(
+                profile!(record_execution_outcome(
                     runtime,
                     executable,
                     pc,
                     "numeric_array_compare_branch",
-                    None,
-                );
+                    None
+                ));
                 #[cfg(test)]
                 NUMERIC_REGION_HITS.update(|value| value + 1);
                 let target = if decision == region.when_true {
@@ -2760,8 +2665,7 @@ fn execute_numeric_region(
         }
         _ => unreachable!("numeric region opcode was already selected"),
     };
-    #[cfg(feature = "profiling")]
-    crate::engine::api::profiling::record_execution_outcome(
+    profile!(record_execution_outcome(
         runtime,
         executable,
         pc,
@@ -2779,8 +2683,8 @@ fn execute_numeric_region(
             None
         } else {
             miss_reason.map(Miss::name)
-        },
-    );
+        }
+    ));
     #[cfg(not(feature = "profiling"))]
     let _ = miss_reason;
     if hit {
