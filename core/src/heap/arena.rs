@@ -1,11 +1,16 @@
-//! `Arena<T>`: a `Vec<T>` with a free list, a side mark bitmap and a side live
-//! bitmap.
+//! `Arena<T>`: a `Vec<T>` with a side live bitmap and a side mark bitmap.
 //!
-//! The live bitmap is what sweep uses to tell free slots from dead records, so
-//! it exists in every build. Only debug and `gc-stress` builds assert liveness
-//! on access; release builds check nothing.
+//! The live bitmap is what sweep uses to tell free slots from dead records,
+//! and allocation takes the lowest clear bit at or after a cursor, so reuse is
+//! lowest index first and deterministic. Only debug and `gc-stress` builds
+//! assert liveness on access; release builds check nothing.
+//!
+//! The record vector grows by [`step_bytes`] and gives back a trailing free
+//! run of more than a quarter of its capacity after a sweep.
 
 use std::mem;
+
+use super::gc::Room;
 
 /// A record stored in an [`Arena`].
 pub trait Record {
@@ -21,18 +26,46 @@ pub trait Record {
 
 const CHECK_LIVE: bool = cfg!(any(debug_assertions, feature = "gc-stress"));
 
+/// Below this many bytes a vector doubles. The allocator keeps such blocks
+/// in its heaps, where growing one copies it and leaves the old block
+/// resident; a doubling makes that happen once per doubling. Larger blocks
+/// are each their own mapping and grow in place (`mremap`), so they grow by
+/// [`STEP`] and their slack stays below one step.
+pub const DOUBLING_LIMIT: usize = 32 << 20;
+pub const STEP: usize = 2 << 20;
+
+/// The bytes a vector of `capacity` bytes grows by.
+#[inline]
+pub fn step_bytes(capacity: usize, unit: usize) -> usize {
+    if capacity < DOUBLING_LIMIT {
+        capacity.max(4 * unit)
+    } else {
+        STEP
+    }
+}
+
+/// The capacity, in elements of `unit` bytes, after growing from `capacity`
+/// until it holds `needed`.
+pub fn grown_capacity(mut capacity: usize, needed: usize, unit: usize) -> usize {
+    while capacity < needed {
+        capacity += step_bytes(capacity * unit, unit).div_ceil(unit);
+    }
+    capacity
+}
+
 pub struct Arena<T> {
     records: Vec<T>,
     live: Vec<u64>,
     marks: Vec<u64>,
-    /// Free indices. Sweep pushes them in descending order so the lowest index
-    /// is reused first; reuse is deterministic.
-    free: Vec<u32>,
-    /// Under `gc-stress`, indices freed by a sweep are reusable only after the
+    /// Slots below `records.len()` that are free and reusable.
+    free_count: usize,
+    /// No reusable free slot lies below word `cursor` of `live`.
+    cursor: usize,
+    /// Under `gc-stress`, slots freed by a sweep are reusable only after the
     /// next sweep, so a stale index is not immediately recycled into a live
     /// record and the liveness assertion catches it.
     #[cfg(feature = "gc-stress")]
-    quarantine: Vec<u32>,
+    quarantine: Vec<u64>,
     live_count: usize,
     extra: usize,
 }
@@ -54,7 +87,8 @@ impl<T: Record> Arena<T> {
             records: Vec::new(),
             live: Vec::new(),
             marks: Vec::new(),
-            free: Vec::new(),
+            free_count: 0,
+            cursor: 0,
             #[cfg(feature = "gc-stress")]
             quarantine: Vec::new(),
             live_count: 0,
@@ -62,48 +96,84 @@ impl<T: Record> Arena<T> {
         }
     }
 
-    /// Stores `value`, reusing the free list first. Returns its index.
+    /// Stores `value` in the lowest free slot, or past the last one. Returns
+    /// its index. A growth step is charged to `room`.
     #[inline(always)]
-    pub fn alloc(&mut self, value: T) -> u32 {
+    pub fn alloc(&mut self, value: T, room: &mut Room) -> u32 {
         self.extra += value.extra_bytes();
         self.live_count += 1;
-        if let Some(index) = self.free.pop() {
+        if self.free_count != 0 {
+            let index = self.take_free();
             self.records[index as usize] = value;
-            let (word, mask) = bit(index);
-            self.live[word] |= mask;
             return index;
         }
-        self.push(value)
+        self.push(value, room)
+    }
+
+    /// The slots of word `word` that are not reusable: live, or quarantined.
+    #[inline(always)]
+    fn taken(&self, word: usize) -> u64 {
+        #[cfg(feature = "gc-stress")]
+        return self.live[word] | self.quarantine[word];
+        #[cfg(not(feature = "gc-stress"))]
+        self.live[word]
+    }
+
+    /// The lowest free slot at or after the cursor, marked live.
+    #[inline(always)]
+    fn take_free(&mut self) -> u32 {
+        let mut word = self.cursor;
+        loop {
+            let taken = self.taken(word);
+            if taken != u64::MAX {
+                let low = (!taken).trailing_zeros();
+                self.live[word] |= 1 << low;
+                self.cursor = word;
+                self.free_count -= 1;
+                let index = word as u32 * 64 + low;
+                debug_assert!((index as usize) < self.records.len());
+                return index;
+            }
+            word += 1;
+        }
     }
 
     #[inline(never)]
-    fn push(&mut self, value: T) -> u32 {
+    fn push(&mut self, value: T, room: &mut Room) -> u32 {
         let index = u32::try_from(self.records.len()).expect("arena index overflow");
         if self.records.len() == self.records.capacity() {
-            self.records.reserve_exact(self.records.capacity().max(4));
+            let before = self.bytes_without_extra();
+            let unit = mem::size_of::<T>().max(1);
+            let old = self.records.capacity();
+            let capacity = grown_capacity(old, old + 1, unit);
+            self.records.reserve_exact(capacity - old);
+            let words = self.records.capacity().div_ceil(64);
+            self.live.reserve_exact(words - self.live.len());
+            self.marks.reserve_exact(words - self.marks.len());
+            #[cfg(feature = "gc-stress")]
+            self.quarantine.reserve_exact(words - self.quarantine.len());
+            room.take(self.bytes_without_extra() - before);
         }
         self.records.push(value);
         let (word, mask) = bit(index);
         if word == self.live.len() {
             self.live.push(0);
             self.marks.push(0);
+            #[cfg(feature = "gc-stress")]
+            self.quarantine.push(0);
         }
         self.live[word] |= mask;
         index
     }
 
     /// Bytes the arena's record vector grows by if `count` records are
-    /// allocated now (zero when the free list covers them).
+    /// allocated now (zero when its free slots and capacity cover them).
     pub fn growth_bytes(&self, count: usize) -> usize {
-        let fresh = count.saturating_sub(self.free.len());
-        // Quarantined indices do not count: they are not reusable yet.
-        let needed = self.records.len() + fresh;
-        let mut capacity = self.records.capacity();
-        let old = capacity;
-        while capacity < needed {
-            capacity += capacity.max(4);
-        }
-        (capacity - old) * mem::size_of::<T>()
+        // Quarantined slots do not count: they are not reusable yet.
+        let needed = self.records.len() + count.saturating_sub(self.free_count);
+        let old = self.records.capacity();
+        let unit = mem::size_of::<T>().max(1);
+        (grown_capacity(old, needed, unit) - old) * unit
     }
 
     #[inline]
@@ -147,7 +217,8 @@ impl<T: Record> Arena<T> {
         self.live_count -= 1;
         let (word, mask) = bit(index);
         self.live[word] &= !mask;
-        self.free.push(index);
+        self.free_count += 1;
+        self.cursor = self.cursor.min(word);
         record
     }
 
@@ -165,13 +236,21 @@ impl<T: Record> Arena<T> {
         self.records.len()
     }
 
-    /// Bytes reserved by the arena: record storage, bitmaps, free list and the
-    /// records' extra bytes.
+    /// Bytes of record storage and bitmaps.
+    fn bytes_without_extra(&self) -> usize {
+        #[allow(unused_mut)]
+        let mut words = self.live.capacity() + self.marks.capacity();
+        #[cfg(feature = "gc-stress")]
+        {
+            words += self.quarantine.capacity();
+        }
+        self.records.capacity() * mem::size_of::<T>() + words * 8
+    }
+
+    /// Bytes reserved by the arena: record storage, bitmaps and the records'
+    /// extra bytes.
     pub fn bytes(&self) -> usize {
-        self.records.capacity() * mem::size_of::<T>()
-            + (self.live.capacity() + self.marks.capacity()) * 8
-            + self.free.capacity() * 4
-            + self.extra
+        self.bytes_without_extra() + self.extra
     }
 
     /// Bytes held by live records.
@@ -202,36 +281,87 @@ impl<T: Record> Arena<T> {
     }
 
     /// Frees every live, unmarked record, highest index first, passing each to
-    /// `dead`. Returns the number freed.
+    /// `dead`, then gives back a long trailing free run. Returns the number
+    /// freed.
     pub fn sweep(&mut self, mut dead: impl FnMut(u32, T)) -> usize {
         #[cfg(feature = "gc-stress")]
-        let held = {
-            let released = std::mem::take(&mut self.quarantine);
-            self.free.extend_from_slice(&released);
-            self.free.len()
-        };
+        self.release_quarantine();
         let mut freed = 0;
+        let mut lowest = self.live.len();
         for word in (0..self.live.len()).rev() {
             let mut garbage = self.live[word] & !self.marks[word];
             if garbage == 0 {
                 continue;
             }
+            lowest = word;
             self.live[word] &= !garbage;
+            #[cfg(feature = "gc-stress")]
+            {
+                self.quarantine[word] = garbage;
+            }
             while garbage != 0 {
                 let high = 63 - garbage.leading_zeros();
                 garbage &= !(1u64 << high);
                 let index = word as u32 * 64 + high;
                 let record = mem::replace(&mut self.records[index as usize], T::vacant());
                 self.extra -= record.extra_bytes();
-                self.free.push(index);
                 freed += 1;
                 dead(index, record);
             }
         }
         self.live_count -= freed;
-        #[cfg(feature = "gc-stress")]
-        self.quarantine.extend(self.free.drain(held..));
+        if !cfg!(feature = "gc-stress") {
+            self.free_count += freed;
+            self.cursor = self.cursor.min(lowest);
+        }
+        self.shrink();
         freed
+    }
+
+    /// Makes the slots the last sweep freed reusable.
+    #[cfg(feature = "gc-stress")]
+    fn release_quarantine(&mut self) {
+        for (word, bits) in self.quarantine.iter_mut().enumerate() {
+            if *bits != 0 {
+                self.free_count += bits.count_ones() as usize;
+                self.cursor = self.cursor.min(word);
+                *bits = 0;
+            }
+        }
+    }
+
+    /// Truncates a trailing free run of more than a quarter of the capacity
+    /// and returns the memory past one growth step above the rest.
+    /// Quarantined slots stay, so a stale index is not reused at once.
+    fn shrink(&mut self) {
+        let capacity = self.records.capacity();
+        let end = match (0..self.live.len())
+            .rev()
+            .find(|&word| self.taken(word) != 0)
+        {
+            Some(word) => word * 64 + 64 - self.taken(word).leading_zeros() as usize,
+            None => 0,
+        };
+        if (capacity - end) * 4 <= capacity {
+            return;
+        }
+        // Every slot past `end` is free and reusable.
+        self.free_count -= self.records.len() - end;
+        let words = end.div_ceil(64);
+        self.records.truncate(end);
+        self.live.truncate(words);
+        self.marks.truncate(words);
+        #[cfg(feature = "gc-stress")]
+        self.quarantine.truncate(words);
+        self.cursor = self.cursor.min(words);
+        let unit = mem::size_of::<T>().max(1);
+        self.records
+            .shrink_to(end + step_bytes(end * unit, unit).div_ceil(unit));
+        let words = self.records.capacity().div_ceil(64);
+        self.live.shrink_to(words);
+        self.marks.shrink_to(words);
+        #[cfg(feature = "gc-stress")]
+        self.quarantine.shrink_to(words);
     }
 
     /// Live indices in ascending order.
@@ -249,19 +379,32 @@ impl<T: Record> Arena<T> {
         })
     }
 
-    /// Free indices, including quarantined ones.
+    /// Free indices below the last slot, including quarantined ones.
     pub fn free_indices(&self) -> impl Iterator<Item = u32> + '_ {
-        let quarantine: &[u32] = {
-            #[cfg(feature = "gc-stress")]
-            {
-                &self.quarantine
-            }
-            #[cfg(not(feature = "gc-stress"))]
-            {
-                &[]
-            }
-        };
-        self.free.iter().chain(quarantine).copied()
+        (0..self.records.len() as u32).filter(|&index| !self.is_live(index))
+    }
+
+    /// Debug check: the free count and the cursor agree with the bitmap.
+    pub fn free_count_matches(&self) -> bool {
+        #[allow(unused_mut)]
+        let mut reusable = self.records.len() - self.live_count;
+        #[cfg(feature = "gc-stress")]
+        {
+            reusable -= self
+                .quarantine
+                .iter()
+                .map(|bits| bits.count_ones() as usize)
+                .sum::<usize>();
+        }
+        let below_cursor = (0..(self.cursor * 64).min(self.records.len()) as u32)
+            .filter(|&index| !self.is_live(index))
+            .count();
+        #[cfg(feature = "gc-stress")]
+        let below_cursor = below_cursor
+            - (0..self.cursor.min(self.quarantine.len()))
+                .map(|word| self.quarantine[word].count_ones() as usize)
+                .sum::<usize>();
+        reusable == self.free_count && below_cursor == 0
     }
 
     /// Debug check: the live and mark bitmaps agree.
@@ -291,10 +434,11 @@ mod tests {
     }
 
     #[test]
-    fn free_list_reuse_is_lowest_first_after_sweep() {
+    fn reuse_is_lowest_first_after_sweep() {
+        let mut room = Room::unbounded();
         let mut arena = Arena::new();
         for value in 0..10 {
-            assert_eq!(arena.alloc(Item(value)), value);
+            assert_eq!(arena.alloc(Item(value), &mut room), value);
         }
         for keep in [0, 3, 9] {
             arena.mark(keep);
@@ -313,18 +457,26 @@ mod tests {
             }
             assert_eq!(arena.sweep(|_, _| {}), 0);
         }
+        assert!(arena.free_count_matches());
         let reused = (0..7)
-            .map(|value| arena.alloc(Item(100 + value)))
+            .map(|value| arena.alloc(Item(100 + value), &mut room))
             .collect::<Vec<_>>();
         assert_eq!(reused, [1, 2, 4, 5, 6, 7, 8]);
-        assert_eq!(arena.alloc(Item(200)), 10);
+        assert_eq!(arena.alloc(Item(200), &mut room), 10);
+        arena.free(4);
+        arena.free(2);
+        assert_eq!(arena.alloc(Item(300), &mut room), 2);
+        assert_eq!(arena.alloc(Item(301), &mut room), 4);
+        assert!(arena.free_count_matches());
     }
 
     #[test]
     fn free_poisons_and_growth_is_reported() {
+        let mut room = Room::new(1 << 20, 1 << 20);
         let mut arena = Arena::new();
         assert_eq!(arena.growth_bytes(1), 4 * size_of::<Item>());
-        let index = arena.alloc(Item(7));
+        let index = arena.alloc(Item(7), &mut room);
+        assert_eq!(room.threshold(), 1 << 20);
         assert_eq!(arena.growth_bytes(3), 0);
         assert_eq!(arena.free(index), Item(7));
         assert!(!arena.is_live(index));
@@ -333,11 +485,66 @@ mod tests {
     }
 
     #[test]
+    fn growth_steps_are_bounded() {
+        assert_eq!(step_bytes(0, 24), 96);
+        assert_eq!(step_bytes(4 << 20, 24), 4 << 20);
+        assert_eq!(step_bytes(64 << 20, 24), STEP);
+        let mut room = Room::unbounded();
+        let mut arena = Arena::new();
+        for value in 0..10_000_000 {
+            arena.alloc(Item(value), &mut room);
+        }
+        let capacity = arena.records.capacity() * size_of::<Item>();
+        let used = arena.records.len() * size_of::<Item>();
+        assert!(capacity - used < STEP, "{capacity} for {used}");
+    }
+
+    #[test]
+    fn a_trailing_free_run_is_given_back() {
+        let mut room = Room::unbounded();
+        let mut arena = Arena::new();
+        for value in 0..100_000 {
+            arena.alloc(Item(value), &mut room);
+        }
+        let before = arena.bytes();
+        for keep in 0..1000 {
+            arena.mark(keep);
+        }
+        arena.sweep(|_, _| {});
+        #[cfg(feature = "gc-stress")]
+        {
+            // The quarantined slots stay until the next sweep releases them.
+            assert_eq!(arena.slot_count(), 100_000);
+            arena.clear_marks();
+            for keep in 0..1000 {
+                arena.mark(keep);
+            }
+            arena.sweep(|_, _| {});
+        }
+        assert_eq!(arena.slot_count(), 1000);
+        assert!(arena.bytes() < before / 4);
+        assert_eq!(arena.alloc(Item(5), &mut room), 1000);
+    }
+
+    #[test]
+    fn a_step_past_the_budget_zeroes_the_threshold() {
+        let mut room = Room::new(1 << 10, usize::MAX);
+        let mut arena = Arena::new();
+        let mut value = 0;
+        while room.threshold() != 0 {
+            assert!(arena.bytes() <= 1 << 10);
+            arena.alloc(Item(value), &mut room);
+            value += 1;
+        }
+        assert!(arena.bytes() > 1 << 10);
+    }
+
+    #[test]
     #[cfg(any(debug_assertions, feature = "gc-stress"))]
     #[should_panic(expected = "stale")]
     fn stale_access_panics() {
         let mut arena = Arena::new();
-        let index = arena.alloc(Item(1));
+        let index = arena.alloc(Item(1), &mut Room::unbounded());
         arena.free(index);
         let _ = arena.get(index);
     }

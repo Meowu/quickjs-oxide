@@ -39,9 +39,12 @@ impl ArenaReport {
 pub struct ValueHeapReport {
     /// Slots held by live ranges.
     pub used_slots: usize,
-    /// Free slots by size class: `free_by_class[k]` counts free ranges of
-    /// `2^k` slots.
+    /// Free ranges by size class: `free_by_class[k]` counts free ranges of
+    /// `class_size(k)` slots.
     pub free_by_class: Vec<usize>,
+    /// Free runs the class lists do not hold, and their slots.
+    pub free_runs: usize,
+    pub free_run_slots: usize,
     /// Slots allocated, used or free.
     pub capacity_slots: usize,
     pub reserved_bytes: usize,
@@ -104,6 +107,11 @@ pub struct MemoryReport {
     /// which the next one runs.
     pub allocated_since_gc: usize,
     pub threshold: usize,
+    /// The reserved-bytes budget the last collection set.
+    pub budget: usize,
+    /// Bytes of the tables beside the arenas: the ropes' halves, the atom
+    /// table and the inline caches.
+    pub table_bytes: usize,
     /// The heap cap in bytes; `usize::MAX` for none.
     pub cap: usize,
 }
@@ -134,6 +142,7 @@ impl MemoryReport {
             + self.rope_bytes
             + self.code.dynamic_bytes
             + self.code.regexp_bytes
+            + self.table_bytes
     }
 }
 
@@ -141,7 +150,7 @@ impl Heap {
     pub(crate) fn report(&self) -> MemoryReport {
         let mut free_by_class = Vec::new();
         for range in self.values.free_blocks() {
-            let class = range.len.trailing_zeros() as usize;
+            let class = super::values::class_of(range.len) as usize;
             if free_by_class.len() <= class {
                 free_by_class.resize(class + 1, 0);
             }
@@ -160,6 +169,12 @@ impl Heap {
             values: ValueHeapReport {
                 used_slots: self.values.used_slots(),
                 free_by_class,
+                free_runs: self.values.free_runs().count(),
+                free_run_slots: self
+                    .values
+                    .free_runs()
+                    .map(|(start, end)| (end - start) as usize)
+                    .sum(),
                 capacity_slots: self.values.used_slots() + self.values.free_slots(),
                 reserved_bytes: self.values.bytes(),
             },
@@ -179,7 +194,9 @@ impl Heap {
             ic_free: self.ics.free_len(),
             gc: self.gc.stats,
             allocated_since_gc: self.gc.allocated,
-            threshold: self.gc.threshold,
+            threshold: self.gc.threshold(),
+            budget: self.gc.budget(),
+            table_bytes: self.table_bytes(),
             cap: self.gc.limits.max_bytes,
         }
     }
@@ -219,21 +236,23 @@ impl fmt::Display for MemoryReport {
         )?;
         writeln!(
             f,
-            "  free value slots: {free} in {:?} by class",
-            self.values.free_by_class
+            "  free value slots: {free} in {:?} by class and {} runs of {} slots",
+            self.values.free_by_class, self.values.free_runs, self.values.free_run_slots
         )?;
         writeln!(
             f,
-            "ropes: {}; atoms: {} ({} pinned)",
+            "ropes: {}; atoms: {} ({} pinned); tables {}",
             kib(self.rope_bytes),
             self.atoms,
-            self.pinned_atoms
+            self.pinned_atoms,
+            kib(self.table_bytes)
         )?;
         writeln!(
             f,
-            "heap reserved: {}; threshold {}; cap {}",
+            "heap reserved: {}; threshold {}; budget {}; cap {}",
             kib(self.reserved_bytes()),
             kib(self.threshold),
+            kib(self.budget),
             if self.cap == usize::MAX {
                 "none".to_owned()
             } else {
