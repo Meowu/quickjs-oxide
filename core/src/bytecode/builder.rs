@@ -170,9 +170,9 @@ impl CodeBuilder {
         &self.code
     }
 
-    /// The unit, with the layout and counts the lowering decided, and its
-    /// cache sites numbered (section 2.1 of phase 3): the named-property
-    /// sites first, in instruction order, then the global and `new` sites.
+    /// The unit, with the layout and counts the lowering decided, and its cache
+    /// sites numbered: the named-property sites first, in instruction order,
+    /// then the global and `new` sites.
     pub fn finish(mut self, layout: UnitLayout) -> CodeUnit {
         let ic_count = number_sites(&mut self.code);
         CodeUnit {
@@ -194,10 +194,12 @@ impl CodeBuilder {
                 name: layout.name.into(),
                 filename: layout.filename,
                 positions: Box::new([]),
+                definition: None,
             },
             name_atom: layout.name_atom,
             length: layout.length,
             source: layout.source,
+            direct_eval_sites: Box::new([]),
         }
     }
 }
@@ -258,8 +260,10 @@ pub struct UnitLayout {
     pub name_atom: Option<crate::value::StringId>,
     /// The function's `length` property.
     pub length: u16,
-    /// The function's source text, for `Function.prototype.toString`.
-    pub source: Option<Box<str>>,
+    /// The function's source text, for `Function.prototype.toString`, in
+    /// WTF-8 (a lone surrogate of `Function` constructor source is kept as
+    /// its three-byte form, as QuickJS's `JS_ToCStringLen2` keeps it).
+    pub source: Option<Box<[u8]>>,
     /// The script or module the function belongs to.
     pub filename: Option<std::rc::Rc<str>>,
 }

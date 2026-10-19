@@ -1,6 +1,5 @@
-//! `Map`, `Set`, `WeakMap`, `WeakSet`, `WeakRef` and `FinalizationRegistry`
-//! (phase 4, section 6.1 row 10), over the ordered table of
-//! `heap::table` and the collector's weak references (section 3.4).
+//! `Map`, `Set`, `WeakMap`, `WeakSet`, `WeakRef` and `FinalizationRegistry`,
+//! over the ordered table of `heap::table` and the collector's weak references.
 //!
 //! A collection is an internal record (tags `Map`, `Set`, `WeakMap`,
 //! `WeakSet`) whose slots are its entries. A collection iterator's slots
@@ -11,7 +10,9 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use super::{Native, accessor, getter, install_constructor, methods, to_string_tag};
+use super::{
+    Native, accessor, getter, install_constructor, link_constructor, methods, to_string_tag,
+};
 use crate::PropertyKey;
 use crate::heap::HeapError;
 use crate::heap::object::{InternalData, InternalTag, ObjectKind};
@@ -40,7 +41,7 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     // Map.
     let prototype = super::plain_object(cx, Some(object_prototype), 16)?;
     cx.set_intrinsic(Intrinsic::MapPrototype, prototype);
-    let map = install_constructor(cx, Native::MapConstructor, prototype)?;
+    let map = install_constructor(cx, Native::MapConstructor)?;
     methods(cx, map, &[Native::MapGroupBy])?;
     accessor(
         cx,
@@ -76,6 +77,7 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     )?;
     alias(cx, prototype, "entries", iterator)?;
     to_string_tag(cx, prototype, "Map")?;
+    link_constructor(cx, map, prototype)?;
     let map_iterator = super::plain_object(cx, Some(iterator_prototype), 2)?;
     cx.set_intrinsic(Intrinsic::MapIteratorPrototype, map_iterator);
     methods(cx, map_iterator, &[Native::MapIteratorNext])?;
@@ -84,7 +86,7 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     // Set.
     let prototype = super::plain_object(cx, Some(object_prototype), 24)?;
     cx.set_intrinsic(Intrinsic::SetPrototype, prototype);
-    let set = install_constructor(cx, Native::SetConstructor, prototype)?;
+    let set = install_constructor(cx, Native::SetConstructor)?;
     // QuickJS installs `Set.groupBy`, which groups into a Map.
     methods(cx, set, &[Native::MapGroupBy])?;
     accessor(
@@ -126,6 +128,7 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     alias(cx, prototype, "values", iterator)?;
     methods(cx, prototype, &[Native::SetEntries])?;
     to_string_tag(cx, prototype, "Set")?;
+    link_constructor(cx, set, prototype)?;
     let set_iterator = super::plain_object(cx, Some(iterator_prototype), 2)?;
     cx.set_intrinsic(Intrinsic::SetIteratorPrototype, set_iterator);
     methods(cx, set_iterator, &[Native::SetIteratorNext])?;
@@ -134,7 +137,7 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     // WeakMap and WeakSet.
     let prototype = super::plain_object(cx, Some(object_prototype), 8)?;
     cx.set_intrinsic(Intrinsic::WeakMapPrototype, prototype);
-    install_constructor(cx, Native::WeakMapConstructor, prototype)?;
+    let constructor = install_constructor(cx, Native::WeakMapConstructor)?;
     methods(
         cx,
         prototype,
@@ -148,9 +151,10 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         ],
     )?;
     to_string_tag(cx, prototype, "WeakMap")?;
+    link_constructor(cx, constructor, prototype)?;
     let prototype = super::plain_object(cx, Some(object_prototype), 4)?;
     cx.set_intrinsic(Intrinsic::WeakSetPrototype, prototype);
-    install_constructor(cx, Native::WeakSetConstructor, prototype)?;
+    let constructor = install_constructor(cx, Native::WeakSetConstructor)?;
     methods(
         cx,
         prototype,
@@ -161,16 +165,18 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         ],
     )?;
     to_string_tag(cx, prototype, "WeakSet")?;
+    link_constructor(cx, constructor, prototype)?;
 
     // WeakRef and FinalizationRegistry.
     let prototype = super::plain_object(cx, Some(object_prototype), 2)?;
     cx.set_intrinsic(Intrinsic::WeakRefPrototype, prototype);
-    install_constructor(cx, Native::WeakRefConstructor, prototype)?;
+    let constructor = install_constructor(cx, Native::WeakRefConstructor)?;
     methods(cx, prototype, &[Native::WeakRefDeref])?;
     to_string_tag(cx, prototype, "WeakRef")?;
+    link_constructor(cx, constructor, prototype)?;
     let prototype = super::plain_object(cx, Some(object_prototype), 3)?;
     cx.set_intrinsic(Intrinsic::FinalizationRegistryPrototype, prototype);
-    install_constructor(cx, Native::FinalizationRegistryConstructor, prototype)?;
+    let constructor = install_constructor(cx, Native::FinalizationRegistryConstructor)?;
     methods(
         cx,
         prototype,
@@ -179,7 +185,8 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
             Native::FinalizationRegistryUnregister,
         ],
     )?;
-    to_string_tag(cx, prototype, "FinalizationRegistry")
+    to_string_tag(cx, prototype, "FinalizationRegistry")?;
+    link_constructor(cx, constructor, prototype)
 }
 
 /// Defines `key` of `object` as the function already at `name`.
@@ -200,7 +207,7 @@ fn root(cx: &mut Cx<'_>, value: Value) {
 }
 
 /// A new collection of kind `tag` inheriting from `prototype`, rooted.
-fn new_collection(
+pub(super) fn new_collection(
     cx: &mut Cx<'_>,
     tag: InternalTag,
     prototype: ObjectId,
@@ -240,7 +247,12 @@ fn this_collection(
     }
 }
 
-fn set_entry(cx: &mut Cx<'_>, object: ObjectId, key: Value, value: Value) -> Result<(), Throw> {
+pub(super) fn set_entry(
+    cx: &mut Cx<'_>,
+    object: ObjectId,
+    key: Value,
+    value: Value,
+) -> Result<(), Throw> {
     cx.heap
         .table_set(object, key, value)
         .map_err(|error| error::heap_error(cx, error))
@@ -296,7 +308,7 @@ fn construct_collection(
     intrinsic_adder: Native,
 ) -> Result<Value, Throw> {
     if !site.construct {
-        return Err(error::type_error(cx, "constructor requires 'new'"));
+        return Err(error::type_error(cx, "must be called with new"));
     }
     let prototype = internal::prototype_from_constructor(cx, site.new_target, default)?;
     let object = new_collection(cx, tag, prototype)?;
@@ -322,7 +334,7 @@ fn construct_collection(
         let result = (|| {
             if pairs {
                 let Some(entry) = item.as_object() else {
-                    return Err(error::type_error(cx, "iterator value is not an object"));
+                    return Err(error::type_error(cx, "not an object"));
                 };
                 let key = internal::get_property(cx, entry, PropertyKey::index(0).unwrap())?;
                 root(cx, key);
@@ -396,15 +408,10 @@ pub(super) fn weak_set_constructor(cx: &mut Cx<'_>, site: CallSite) -> Result<Va
 pub(super) fn group_by(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let items = site.arg(cx, 0);
     let callback = site.arg(cx, 1);
-    let groups = super::object::group(cx, items, callback, false)?;
-    let prototype = cx.realm.intrinsic(Intrinsic::MapPrototype);
-    let map = new_collection(cx, InternalTag::Map, prototype)?;
-    for (key, members) in groups {
-        let array = internal::array_from_list(cx, &members)?;
-        root(cx, Value::object(array));
-        set_entry(cx, map, key, Value::object(array))?;
-    }
-    Ok(Value::object(map))
+    super::object::group(cx, items, callback, false, |cx| {
+        let prototype = cx.realm.intrinsic(Intrinsic::MapPrototype);
+        new_collection(cx, InternalTag::Map, prototype)
+    })
 }
 
 // ---- Map.prototype ----
@@ -464,13 +471,24 @@ fn get_or_insert(cx: &mut Cx<'_>, site: &CallSite, map: ObjectId) -> Result<Valu
 /// absent, and its result is stored even if the callback added the key.
 pub(super) fn map_get_or_insert_computed(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let map = this_collection(cx, &site, InternalTag::Map, "Map")?;
-    get_or_insert_computed(cx, &site, map)
+    get_or_insert_computed(cx, &site, map, false)
 }
 
-fn get_or_insert_computed(cx: &mut Cx<'_>, site: &CallSite, map: ObjectId) -> Result<Value, Throw> {
+/// QuickJS's `js_map_getOrInsert` with a callback: checked before the key;
+/// an entry the callback added for the key is deleted, and the result
+/// appended.
+fn get_or_insert_computed(
+    cx: &mut Cx<'_>,
+    site: &CallSite,
+    map: ObjectId,
+    weak: bool,
+) -> Result<Value, Throw> {
     let (key, callback) = (site.arg(cx, 0), site.arg(cx, 1));
     if !ops::is_callable(cx.heap, callback) {
         return Err(error::type_error(cx, "not a function"));
+    }
+    if weak {
+        weak_key(cx, key, false)?;
     }
     if let Some(existing) = cx.heap.table_get(map, key) {
         return Ok(existing);
@@ -478,6 +496,7 @@ fn get_or_insert_computed(cx: &mut Cx<'_>, site: &CallSite, map: ObjectId) -> Re
     let key = canonical(key);
     let value = crate::vm::call(cx, callback, Value::UNDEFINED, &[key])?;
     root(cx, value);
+    cx.heap.table_delete(map, key);
     set_entry(cx, map, key, value)?;
     Ok(value)
 }
@@ -555,10 +574,12 @@ fn iterator_next(cx: &mut Cx<'_>, site: &CallSite, tag: InternalTag) -> Result<V
     let iterator = match this.as_object() {
         Some(object) if cx.heap.internal_tag(object) == tag => object,
         _ => {
-            return Err(error::type_error(
-                cx,
-                "not an iterator of the expected kind",
-            ));
+            let class = if tag == InternalTag::MapIterator {
+                "Map Iterator"
+            } else {
+                "Set Iterator"
+            };
+            return Err(error::object_expected(cx, class));
         }
     };
     let Some(object) = cx.heap.internal_slot(iterator, 0).as_object() else {
@@ -658,17 +679,25 @@ struct SetRecord {
 
 fn set_record(cx: &mut Cx<'_>, other: Value) -> Result<SetRecord, Throw> {
     let Some(set) = other.as_object() else {
-        return Err(error::type_error(cx, "set-like object expected"));
+        // QuickJS reads `size` off the primitive.
+        if other.is_null() || other.is_undefined() {
+            let base = if other.is_null() { "null" } else { "undefined" };
+            let message = format!("cannot read property 'size' of {base}");
+            return Err(error::type_error(cx, &message));
+        }
+        return Err(error::type_error(cx, ".size is not a number"));
     };
+    // Step 2 reads `size` from a genuine set too (QuickJS's
+    // `get_set_record` takes its size without the Get).
     let names = cx.realm.names;
     let size = internal::get_property(cx, set, Names::key(names.size))?;
     let size = ops::to_number(cx, size)?;
     if size.is_nan() {
-        return Err(error::type_error(cx, "size is not a number"));
+        return Err(error::type_error(cx, ".size is not a number"));
     }
     let size = internal::to_integer_or_infinity(cx, Value::number(size))?;
     if size < 0.0 {
-        return Err(error::range_error(cx, "invalid size"));
+        return Err(error::range_error(cx, ".size must be positive"));
     }
     let key = cx
         .heap
@@ -676,7 +705,14 @@ fn set_record(cx: &mut Cx<'_>, other: Value) -> Result<SetRecord, Throw> {
         .map_err(|error| error::heap_error(cx, error))?;
     let has = internal::get_property(cx, set, key)?;
     if !ops::is_callable(cx.heap, has) {
-        return Err(error::type_error(cx, "has is not a function"));
+        return Err(error::type_error(
+            cx,
+            if has.is_undefined() {
+                ".has is undefined"
+            } else {
+                ".has is not a function"
+            },
+        ));
     }
     root(cx, has);
     let key = cx
@@ -685,7 +721,14 @@ fn set_record(cx: &mut Cx<'_>, other: Value) -> Result<SetRecord, Throw> {
         .map_err(|error| error::heap_error(cx, error))?;
     let keys = internal::get_property(cx, set, key)?;
     if !ops::is_callable(cx.heap, keys) {
-        return Err(error::type_error(cx, "keys is not a function"));
+        return Err(error::type_error(
+            cx,
+            if keys.is_undefined() {
+                ".keys is undefined"
+            } else {
+                ".keys is not a function"
+            },
+        ));
     }
     root(cx, keys);
     Ok(SetRecord {
@@ -702,14 +745,17 @@ impl SetRecord {
         Ok(ops::to_boolean(cx.heap, result))
     }
 
-    /// The iterator of `keys()`, with `next` read once.
+    /// `GetKeysIterator`: the iterator of `keys()`, which must be an object,
+    /// with `next` read once.
     fn keys(&self, cx: &mut Cx<'_>) -> Result<iter::Iter, Throw> {
         let iterator = crate::vm::call(cx, self.keys, Value::object(self.set), &[])?;
         if iterator.as_object().is_none() {
             return Err(error::type_error(cx, "keys() result is not an object"));
         }
         root(cx, iterator);
-        iter::direct(cx, iterator)
+        let next = crate::vm::property::get(cx, iterator, Names::key(cx.realm.names.next))?;
+        root(cx, next);
+        Ok(iter::Iter::Protocol { iterator, next })
     }
 }
 
@@ -769,6 +815,8 @@ fn each_of(
         let result = visit(cx, value);
         cx.heap.roots().truncate(mark);
         if !result? {
+            // `? IteratorClose(keysIter, NormalCompletion(unused))`: a throw
+            // from `return` or a non-object result propagates.
             iter::close(cx, &iterator, Ok(()))?;
             return Ok(false);
         }
@@ -900,11 +948,13 @@ pub(super) fn set_is_disjoint_from(cx: &mut Cx<'_>, site: CallSite) -> Result<Va
 
 // ---- WeakMap and WeakSet ----
 
-fn weak_key(cx: &mut Cx<'_>, key: Value) -> Result<Value, Throw> {
+fn weak_key(cx: &mut Cx<'_>, key: Value, set: bool) -> Result<Value, Throw> {
     if can_be_held_weakly(cx, key) {
         Ok(key)
     } else {
-        Err(error::type_error(cx, "invalid value used as weak key"))
+        let class = if set { "WeakSet" } else { "WeakMap" };
+        let message = format!("invalid value used as {class} key");
+        Err(error::type_error(cx, &message))
     }
 }
 
@@ -917,7 +967,7 @@ pub(super) fn weak_map_get(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Thr
 pub(super) fn weak_map_set(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let map = this_collection(cx, &site, InternalTag::WeakMap, "WeakMap")?;
     let key = site.arg(cx, 0);
-    let key = weak_key(cx, key)?;
+    let key = weak_key(cx, key, false)?;
     let value = site.arg(cx, 1);
     set_entry(cx, map, key, value)?;
     Ok(Value::object(map))
@@ -938,7 +988,7 @@ pub(super) fn weak_map_delete(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, 
 pub(super) fn weak_map_get_or_insert(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let map = this_collection(cx, &site, InternalTag::WeakMap, "WeakMap")?;
     let key = site.arg(cx, 0);
-    weak_key(cx, key)?;
+    weak_key(cx, key, false)?;
     get_or_insert(cx, &site, map)
 }
 
@@ -947,15 +997,13 @@ pub(super) fn weak_map_get_or_insert_computed(
     site: CallSite,
 ) -> Result<Value, Throw> {
     let map = this_collection(cx, &site, InternalTag::WeakMap, "WeakMap")?;
-    let key = site.arg(cx, 0);
-    weak_key(cx, key)?;
-    get_or_insert_computed(cx, &site, map)
+    get_or_insert_computed(cx, &site, map, true)
 }
 
 pub(super) fn weak_set_add(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let set = this_collection(cx, &site, InternalTag::WeakSet, "WeakSet")?;
     let value = site.arg(cx, 0);
-    let value = weak_key(cx, value)?;
+    let value = weak_key(cx, value, true)?;
     set_entry(cx, set, value, Value::EMPTY)?;
     Ok(Value::object(set))
 }
@@ -1017,7 +1065,7 @@ pub(super) fn finalization_registry_constructor(
     }
     let callback = site.arg(cx, 0);
     if !ops::is_callable(cx.heap, callback) {
-        return Err(error::type_error(cx, "cleanup callback is not a function"));
+        return Err(error::type_error(cx, "argument must be a function"));
     }
     let prototype = internal::prototype_from_constructor(
         cx,
@@ -1053,7 +1101,7 @@ pub(super) fn finalization_registry_register(
         return Err(error::type_error(cx, "invalid target"));
     }
     if ops::same_value_zero_heap(cx.heap, target, held) {
-        return Err(error::type_error(cx, "target and held value must differ"));
+        return Err(error::type_error(cx, "held value cannot be the target"));
     }
     let token = if token.is_undefined() {
         Value::EMPTY

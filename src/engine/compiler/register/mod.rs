@@ -1,7 +1,6 @@
-//! Lowering from the compiler's stack code to the new core's register code
-//! (`docs/performance/new-core-phase2.md`, section 3).
+//! Lowering from the compiler's stack code to `oxide-core`'s register code.
 //!
-//! The input is the [`UnlinkedFunction`] tree the current engine publishes:
+//! The input is the [`UnlinkedFunction`] tree the front end compiles:
 //! QuickJS-shaped stack code whose operand-stack depth is static at every
 //! instruction. The stack depth is the register allocator. Register 0 is
 //! `this`, then the parameters, then the locals, then one temporary `T(d)` per
@@ -27,11 +26,11 @@ mod analysis;
 #[cfg(test)]
 mod ic_tests;
 #[cfg(test)]
-mod radix_tests;
-#[cfg(test)]
 pub(crate) mod run_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod window_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -56,9 +55,10 @@ use crate::engine::value::{JsString, PrimitiveValue};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LowerError {
-    /// A construct outside the phase 2 surface (section 3.4).
+    /// A construct the lowering does not support (direct eval code, or an
+    /// instruction or constant it has no form for).
     Unsupported(String),
-    /// A construct phase 0 made an early `SyntaxError` (`with`).
+    /// A dropped feature that is an early `SyntaxError` (`with`).
     Syntax(String),
     /// The input broke an invariant the stack code guarantees.
     Internal(String),
@@ -97,7 +97,7 @@ impl From<ValidateError> for LowerError {
     }
 }
 
-/// A script lowered and instantiated on the new core.
+/// A script lowered and instantiated on the core.
 pub(crate) struct LoweredScript {
     pub(crate) root: CodeUnitId,
     /// The script's function object. Unrooted: the caller holds it before
@@ -137,7 +137,7 @@ pub(crate) fn lower_script_into(
 
 /// Lowers a compiled module's function tree into `runtime` and describes
 /// its bindings, requests, imports and exports for the core's module
-/// records (phase 4, section 5.6); also returns the root unit.
+/// records; also returns the root unit.
 pub(crate) fn lower_module_tree_into(
     runtime: &mut Compiler<'_>,
     module: &crate::engine::code::module::UnlinkedModule,
@@ -342,14 +342,23 @@ fn lower_function(
 /// `window_locals` in the slots of a spill scope, held in the register after
 /// the window's locals; its temporaries stay above every local, so a call's
 /// window never covers one.
+///
+/// A function whose operand stack does not fit either keeps its first
+/// `temp_registers` depths in registers and the deeper ones in the spill
+/// scope's slots after the spilled locals, reached through [`SCRATCH`]
+/// registers above the temporaries.
 #[derive(Clone, Copy, Debug)]
 struct Layout {
     first_local: u32,
     window_locals: u32,
     spill: Option<(u32, u32)>,
     temp_base: u32,
-    /// The register a construction writes `new.target` into (phase 4,
-    /// section 4.5): a hidden local right after the parameters.
+    /// The depths whose temporaries are registers: all of them (`u32::MAX`)
+    /// unless the operand stack passes the window.
+    temp_registers: u32,
+    /// The spill slot of depth `temp_registers`.
+    first_temp_slot: u32,
+    /// The register a construction writes `new.target` into: a hidden local right after the parameters.
     new_target: Option<u32>,
 }
 
@@ -369,6 +378,12 @@ fn uses_new_target(function: &UnlinkedFunction) -> bool {
 /// Local registers past the window are named from here: `SPILLED + slot`.
 const SPILLED: u32 = 1 << 20;
 
+/// The registers above the temporaries of a function whose operand stack
+/// passes the window: the first carries a value between a slot and a
+/// constant or another slot, the others hold the operands and results of
+/// the instruction being built, taken in turn.
+const SCRATCH: u32 = 8;
+
 impl Layout {
     fn of(function: &UnlinkedFunction, analysis: &Analysis) -> Result<Layout, LowerError> {
         let metadata = function.metadata();
@@ -378,24 +393,53 @@ impl Layout {
         // One temporary above the deepest stack for scratch values.
         let temps = analysis.max_depth + 1;
         let window = oxide_core::bytecode::WINDOW;
-        if first_local + locals + temps <= window {
+        let stress = cfg!(feature = "register-stress");
+        if !stress && first_local + locals + temps <= window {
             return Ok(Layout {
                 first_local,
                 window_locals: locals,
                 spill: None,
                 temp_base: first_local + locals,
+                temp_registers: u32::MAX,
+                first_temp_slot: 0,
                 new_target,
             });
         }
-        let window_locals = window
+        if let Some(window_locals) = window
             .checked_sub(first_local + 1 + temps)
+            .filter(|_| !stress)
+        {
+            let spill = first_local + window_locals;
+            return Ok(Layout {
+                first_local,
+                window_locals,
+                spill: Some((spill, locals - window_locals)),
+                temp_base: spill + 1,
+                temp_registers: u32::MAX,
+                first_temp_slot: 0,
+                new_target,
+            });
+        }
+        // The operand stack passes the window: a quarter of it at most for
+        // locals, the spill register and the scratch registers at the top,
+        // the temporaries that fit in between.
+        let available = window
+            .checked_sub(first_local + 1 + SCRATCH)
             .ok_or_else(|| LowerError::unsupported("functions with more than 256 registers"))?;
+        let window_locals = locals.min(window / 4).min(available);
+        let mut temp_registers = available - window_locals;
+        if stress {
+            temp_registers = temp_registers.min(2);
+        }
+        let spilled_locals = locals - window_locals;
         let spill = first_local + window_locals;
         Ok(Layout {
             first_local,
             window_locals,
-            spill: Some((spill, locals - window_locals)),
+            spill: Some((spill, spilled_locals + temps.saturating_sub(temp_registers))),
             temp_base: spill + 1,
+            temp_registers,
+            first_temp_slot: spilled_locals,
             new_target,
         })
     }
@@ -412,7 +456,7 @@ impl Layout {
 
 /// Rejects whole-function features outside the surface.
 fn check_surface(function: &UnlinkedFunction) -> Result<(), LowerError> {
-    // Phase 0 dropped `with`: an early `SyntaxError`, as in strict code.
+    // `with` is a dropped feature: an early `SyntaxError`, as in strict code.
     if function
         .local_definitions()
         .iter()
@@ -424,8 +468,8 @@ fn check_surface(function: &UnlinkedFunction) -> Result<(), LowerError> {
     }
     let metadata = function.metadata();
     let unsupported = if metadata.eval_kind == EvalKind::Direct {
-        // Direct eval code: a direct `eval` runs as indirect eval (phase 0,
-        // section 5.5), so only indirect eval code is compiled.
+        // Direct eval code: a direct `eval` runs as indirect eval (a dropped
+        // feature), so only indirect eval code is compiled.
         Some("direct eval code")
     } else {
         None
@@ -539,10 +583,6 @@ fn unary(instruction: &Instruction) -> Option<Opcode> {
         Instruction::TypeOf => Opcode::TypeOf,
         Instruction::ToPropKey => Opcode::ToPropertyKey,
         Instruction::IsUndefinedOrNull => Opcode::IsUndefinedOrNull,
-        Instruction::IsUndefined => Opcode::IsUndefined,
-        Instruction::IsNull => Opcode::IsNull,
-        Instruction::TypeOfIsUndefined => Opcode::TypeOfIsUndefined,
-        Instruction::TypeOfIsFunction => Opcode::TypeOfIsFunction,
         _ => return None,
     })
 }
@@ -569,7 +609,7 @@ fn binary(instruction: &Instruction) -> Option<(Opcode, Option<Opcode>)> {
 }
 
 /// What an instruction outside the surface belongs to, for `Unsupported`:
-/// the construct when it is one of section 3.4's, else the stack-code name.
+/// the construct when it is a named one, else the stack-code name.
 fn unsupported_instruction(instruction: &Instruction) -> LowerError {
     use Instruction as I;
     let construct = match instruction {
@@ -605,6 +645,26 @@ fn method_flags(kind: DefineMethodKind, enumerable: bool) -> u32 {
         DefineMethodKind::Setter => method::SETTER,
     };
     kind | if enumerable { method::ENUMERABLE } else { 0 }
+}
+
+/// Whether QuickJS's `JS_NewAtom` makes `units` a tagged integer atom: the
+/// canonical decimal spelling of an integer up to `JS_ATOM_MAX_INT`.
+fn is_tagged_int_atom(units: &[u16]) -> bool {
+    let canonical = match units {
+        [unit] => (u16::from(b'0')..=u16::from(b'9')).contains(unit),
+        [first, rest @ ..] => {
+            (u16::from(b'1')..=u16::from(b'9')).contains(first)
+                && rest
+                    .iter()
+                    .all(|unit| (u16::from(b'0')..=u16::from(b'9')).contains(unit))
+        }
+        [] => false,
+    };
+    canonical
+        && units.len() <= 10
+        && String::from_utf16_lossy(units)
+            .parse::<u64>()
+            .is_ok_and(|value| value <= i32::MAX as u64)
 }
 
 fn string_units(string: &JsString) -> Vec<u16> {
@@ -643,9 +703,21 @@ struct Lowerer<'a, 'c> {
     max_scratch: u32,
     pool: Vec<CoreValue>,
     pool_index: HashMap<u32, u32>,
-    decimal_index: HashMap<u32, u32>,
     child_ordinal: HashMap<u32, u32>,
     this_keys: HashSet<u32>,
+    /// Register PCs of the calls written as a direct `eval` (for the
+    /// backtrace, which QuickJS gives no native frame there).
+    direct_eval_sites: Vec<u32>,
+    /// The next of the turn-taking scratch registers (see [`SCRATCH`]).
+    next_scratch: u32,
+    /// The scratch register the last [`Self::result_register`] gave for a
+    /// depth in the spill scope.
+    result_scratch: u8,
+    /// Jumps that write a register on the way to a stack PC whose depth is
+    /// in the spill scope, each through a stub after the code that stores
+    /// it: the jump's register PC, the register and its temporary, the
+    /// target.
+    store_stubs: Vec<(u32, u8, u32, usize)>,
 }
 
 impl<'a, 'c> Lowerer<'a, 'c> {
@@ -679,7 +751,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             }
         }
         let code = function.code();
-        // Section 5.1: a mapped `arguments` object aliases the parameters
+        // A mapped `arguments` object aliases the parameters
         // through cells, so every parameter of such a function is one.
         if code
             .iter()
@@ -701,13 +773,16 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             labels: vec![None; code.len()],
             fixups: Vec::new(),
             origins: Vec::new(),
+            direct_eval_sites: Vec::new(),
+            next_scratch: 0,
+            result_scratch: 0,
+            store_stubs: Vec::new(),
             pc: 0,
             last_dest: None,
             checked: HashSet::new(),
             max_scratch: 0,
             pool: Vec::new(),
             pool_index: HashMap::new(),
-            decimal_index: HashMap::new(),
             child_ordinal,
             this_keys: HashSet::new(),
             analysis,
@@ -716,8 +791,47 @@ impl<'a, 'c> Lowerer<'a, 'c> {
 
     // ---- registers ----
 
+    /// The temporary of `depth`: a register, or past the window's
+    /// temporaries a slot of the spill scope, named as a spilled local is.
     fn temp(&self, depth: usize) -> u32 {
-        self.temp_base + depth as u32
+        let depth = depth as u32;
+        if depth < self.layout.temp_registers {
+            self.temp_base + depth
+        } else {
+            SPILLED + self.layout.first_temp_slot + depth - self.layout.temp_registers
+        }
+    }
+
+    /// Whether the temporary of `depth` is a spill slot.
+    fn spilled(&self, depth: usize) -> bool {
+        depth as u32 >= self.layout.temp_registers
+    }
+
+    /// The scratch register that carries a value between a slot and a
+    /// constant or another slot within one helper.
+    fn transfer(&self) -> Result<u8, LowerError> {
+        Self::r8(self.temp_base + self.layout.temp_registers)
+    }
+
+    /// The next turn-taking scratch register.
+    fn rotating(&mut self) -> Result<u8, LowerError> {
+        let index = 1 + self.next_scratch % (SCRATCH - 1);
+        self.next_scratch = index;
+        Self::r8(self.temp_base + self.layout.temp_registers + index)
+    }
+
+    /// `count` consecutive turn-taking scratch registers.
+    fn scratch_run(&mut self, count: usize) -> Result<u8, LowerError> {
+        let count = count as u32;
+        if count >= SCRATCH {
+            return Err(LowerError::Internal("a scratch run past the pool".into()));
+        }
+        let mut start = self.next_scratch % (SCRATCH - 1);
+        if start + count > SCRATCH - 1 {
+            start = 0;
+        }
+        self.next_scratch = start + count;
+        Self::r8(self.temp_base + self.layout.temp_registers + 1 + start)
     }
 
     fn argument_register(&self, argument: u16) -> u32 {
@@ -745,6 +859,9 @@ impl<'a, 'c> Lowerer<'a, 'c> {
     /// A temporary above the stack, for shuttling a wide local.
     fn scratch(&mut self) -> Result<u8, LowerError> {
         let depth = self.stack.len();
+        if self.spilled(depth) {
+            return self.rotating();
+        }
         self.max_scratch = self.max_scratch.max(depth as u32 + 1);
         Self::r8(self.temp(depth))
     }
@@ -795,6 +912,25 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         self.fixups.push((pc, target));
     }
 
+    /// A jump that writes `register` for the depth just above the stack on
+    /// the way to `target`: through a stub that stores it when that depth is
+    /// in the spill scope.
+    fn emit_storing_jump(
+        &mut self,
+        build: impl FnOnce(&mut CodeBuilder) -> u32,
+        register: u8,
+        target: usize,
+    ) {
+        let depth = self.stack.len();
+        if self.spilled(depth) {
+            let pc = self.emit(build);
+            self.store_stubs
+                .push((pc, register, self.temp(depth), target));
+        } else {
+            self.emit_jump(build, target);
+        }
+    }
+
     /// A back edge from `pc` to a loop whose first lowered instruction is
     /// a compare-jump out of it repeats that test, negated, as a jump to the
     /// loop's body: an iteration runs one branch instead of a jump and the
@@ -828,22 +964,68 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         true
     }
 
+    /// `dst = src` between registers and spill slots.
     fn mov(&mut self, dst: u32, src: u32) -> Result<(), LowerError> {
-        if dst != src {
-            let (dst, src) = (Self::r8(dst)?, Self::r8(src)?);
-            self.emit(|b| b.ab(Opcode::Mov, dst, src));
+        if dst == src {
+            return Ok(());
+        }
+        match (Self::is_wide(dst), Self::is_wide(src)) {
+            (false, false) => {
+                let (dst, src) = (Self::r8(dst)?, Self::r8(src)?);
+                self.emit(|b| b.ab(Opcode::Mov, dst, src));
+            }
+            (false, true) => {
+                let dst = Self::r8(dst)?;
+                let (spill, slot) = self.spill_slot(src)?;
+                self.emit(|b| b.ab_int(Opcode::LoadSlot, dst, spill, slot));
+            }
+            (true, false) => {
+                let src = Self::r8(src)?;
+                let (spill, slot) = self.spill_slot(dst)?;
+                self.emit(|b| b.ab_int(Opcode::StoreSlot, src, spill, slot));
+            }
+            (true, true) => {
+                let transfer = self.transfer()?;
+                self.mov(u32::from(transfer), src)?;
+                self.mov(dst, u32::from(transfer))?;
+            }
         }
         Ok(())
     }
 
+    /// Exchanges two registers or spill slots.
+    fn swap(&mut self, a: u32, b: u32) -> Result<(), LowerError> {
+        let mut registers = [0; 2];
+        for (register, location) in registers.iter_mut().zip([a, b]) {
+            *register = if Self::is_wide(location) {
+                let scratch = self.rotating()?;
+                self.mov(u32::from(scratch), location)?;
+                scratch
+            } else {
+                Self::r8(location)?
+            };
+        }
+        let [ra, rb] = registers;
+        self.emit(|builder| builder.ab(Opcode::Swap, ra, rb));
+        self.mov(a, u32::from(ra))?;
+        self.mov(b, u32::from(rb))
+    }
+
     /// Loads a non-register entry into `dst`.
     fn load(&mut self, dst: u32, entry: Entry) -> Result<(), LowerError> {
+        if let Entry::Reg(src) = entry {
+            return self.mov(dst, src);
+        }
+        if Self::is_wide(dst) && !matches!(entry, Entry::Canon | Entry::Marker) {
+            let transfer = self.transfer()?;
+            self.load(u32::from(transfer), entry)?;
+            return self.mov(dst, u32::from(transfer));
+        }
         let a = Self::r8(dst)?;
         match entry {
-            Entry::Canon | Entry::Marker => {
+            Entry::Canon | Entry::Marker | Entry::Reg(_) => {
                 return Err(LowerError::Internal("load of a register entry".into()));
             }
-            Entry::Reg(src) => self.mov(dst, src)?,
             Entry::Int(value) => {
                 self.emit(|b| b.a_int(Opcode::LoadInt, a, value));
             }
@@ -886,17 +1068,101 @@ impl<'a, 'c> Lowerer<'a, 'c> {
     }
 
     /// The register holding the entry at `depth`, loading a constant into
-    /// its temporary first.
+    /// its temporary first; a slot's value or a constant of a depth in the
+    /// spill scope comes in a scratch register.
     fn operand(&mut self, depth: usize) -> Result<u8, LowerError> {
         match self.stack[depth] {
+            Entry::Canon if self.spilled(depth) => {
+                let scratch = self.rotating()?;
+                self.mov(u32::from(scratch), self.temp(depth))?;
+                Ok(scratch)
+            }
             Entry::Canon => Self::r8(self.temp(depth)),
             Entry::Reg(register) => Self::r8(register),
             Entry::Marker => Err(LowerError::Internal("catch marker used as a value".into())),
+            entry if self.spilled(depth) => {
+                let scratch = self.rotating()?;
+                self.load(u32::from(scratch), entry)?;
+                Ok(scratch)
+            }
             _ => {
                 self.materialize(depth)?;
                 Self::r8(self.temp(depth))
             }
         }
+    }
+
+    /// The register holding the entry at `depth` once it is canonical.
+    fn canonical(&mut self, depth: usize) -> Result<u8, LowerError> {
+        self.materialize(depth)?;
+        self.operand(depth)
+    }
+
+    /// Loads the entry at `depth`, whatever its kind, into `dst`.
+    fn copy_entry(&mut self, dst: u32, depth: usize) -> Result<(), LowerError> {
+        match self.stack[depth] {
+            Entry::Canon => self.mov(dst, self.temp(depth)),
+            entry => self.load(dst, entry),
+        }
+    }
+
+    /// The register an instruction writes the temporary of `depth` into: the
+    /// temporary, or a scratch register that [`Self::written`] stores.
+    fn dest(&mut self, depth: usize) -> Result<u8, LowerError> {
+        if self.spilled(depth) {
+            self.rotating()
+        } else {
+            Self::r8(self.temp(depth))
+        }
+    }
+
+    /// Stores what an instruction wrote to the register of [`Self::dest`]
+    /// or [`Self::temps_window`] into the temporary of `depth`.
+    fn written(&mut self, depth: usize, register: u8) -> Result<(), LowerError> {
+        self.mov(self.temp(depth), u32::from(register))
+    }
+
+    /// Consecutive registers for the canonical temporaries of
+    /// `base..base + count`, which an instruction reads or writes as a
+    /// range: the temporaries themselves, or once the range reaches the
+    /// spill scope a run of scratch registers holding copies of the first
+    /// `loaded`.
+    fn temps_window(&mut self, base: usize, count: usize, loaded: usize) -> Result<u8, LowerError> {
+        if !self.spilled(base + count - 1) {
+            return Self::r8(self.temp(base));
+        }
+        let run = self.scratch_run(count)?;
+        for index in 0..loaded {
+            self.mov(u32::from(run) + index as u32, self.temp(base + index))?;
+        }
+        Ok(run)
+    }
+
+    /// Stores the members `range` of a run of [`Self::temps_window`] back.
+    fn temps_written(
+        &mut self,
+        run: u8,
+        base: usize,
+        range: std::ops::Range<usize>,
+    ) -> Result<(), LowerError> {
+        for index in range {
+            self.mov(self.temp(base + index), u32::from(run) + index as u32)?;
+        }
+        Ok(())
+    }
+
+    /// Marks a record copied out of the spill scope done in its slot before
+    /// an operation that marks the copy done before what may throw
+    /// (`IterNext`'s and `IterNextRaw`'s call of `next`, `IterResult`'s
+    /// reads, `IterClose`'s call of `return`): a throw leaves the record
+    /// done for the closing stub, which reads the slots. The operation's
+    /// own value is stored back after it.
+    fn mark_record_done(&mut self, run: u8, record: usize) -> Result<(), LowerError> {
+        if u32::from(run) != self.temp(record) {
+            let done = self.temp(record + 2);
+            self.load(done, Entry::Bool(true))?;
+        }
+        Ok(())
     }
 
     fn pop(&mut self) -> Result<(usize, Entry), LowerError> {
@@ -924,16 +1190,28 @@ impl<'a, 'c> Lowerer<'a, 'c> {
     }
 
     /// The destination of a value pushed now.
-    fn result_register(&self) -> Result<u8, LowerError> {
-        Self::r8(self.temp(self.stack.len()))
+    fn result_register(&mut self) -> Result<u8, LowerError> {
+        let depth = self.stack.len();
+        if self.spilled(depth) {
+            self.result_scratch = self.rotating()?;
+            return Ok(self.result_scratch);
+        }
+        Self::r8(self.temp(depth))
     }
 
     /// Records the value written by the instruction at `pc` as the new top.
-    fn push_result(&mut self, pc: u32) {
-        let temp = self.temp(self.stack.len());
+    fn push_result(&mut self, pc: u32) -> Result<(), LowerError> {
+        let depth = self.stack.len();
+        let temp = self.temp(depth);
+        if self.spilled(depth) {
+            self.written(depth, self.result_scratch)?;
+            self.stack.push(Entry::Canon);
+            return Ok(());
+        }
         self.stack.push(Entry::Canon);
         self.max_scratch = self.max_scratch.max(self.stack.len() as u32);
         self.last_dest = Some((pc, temp));
+        Ok(())
     }
 
     /// Rule 2: entries aliasing `register` become canonical before it is
@@ -1000,9 +1278,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             return Ok(());
         }
         let name = self.closure_key(closure)?;
-        let scratch = self.stack.len();
-        self.max_scratch = self.max_scratch.max(scratch as u32 + 1);
-        let a = Self::r8(self.temp(scratch))?;
+        let a = self.scratch()?;
         self.emit(|b| b.a_capture(Opcode::LoadCaptured, a, u32::from(closure)));
         self.emit(|b| b.a_key(Opcode::CheckInit, a, name));
         Ok(())
@@ -1090,12 +1366,23 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             });
         };
         let value = match primitive {
-            PrimitiveValue::Undefined => return Ok(Entry::Undefined),
-            PrimitiveValue::Null => return Ok(Entry::Null),
-            PrimitiveValue::Bool(value) => return Ok(Entry::Bool(*value)),
             PrimitiveValue::Int(value) => return Ok(Entry::Int(*value)),
             PrimitiveValue::Float(value) => CoreValue::number(*value),
-            PrimitiveValue::String(string) => self.atom_value(&string_units(string))?,
+            PrimitiveValue::String(string) => {
+                let units = string_units(string);
+                if is_tagged_int_atom(&units) {
+                    // QuickJS keeps a literal spelling an index up to 2^31 - 1
+                    // as its own constant-pool string, not an atom: two such
+                    // literals are distinct values (`Array.prototype.sort`'s
+                    // identity shortcut observes this).
+                    let heap = self.runtime.heap_mut();
+                    let value = CoreValue::string(heap.alloc_string_units(&units)?);
+                    heap.roots().push(value);
+                    value
+                } else {
+                    self.atom_value(&units)?
+                }
+            }
             PrimitiveValue::BigInt(value) => {
                 let (sign, limbs) = value.to_bigint().to_u64_digits();
                 let heap = self.runtime.heap_mut();
@@ -1111,22 +1398,10 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         Ok(Entry::Const(slot))
     }
 
-    fn decimal_entry(&mut self, index: u32) -> Result<Entry, LowerError> {
-        if let Some(&slot) = self.decimal_index.get(&index) {
-            return Ok(Entry::Const(slot));
-        }
-        let units: Vec<u16> = index.to_string().encode_utf16().collect();
-        let value = self.atom_value(&units)?;
-        let slot = self.pool.len() as u32;
-        self.pool.push(value);
-        self.decimal_index.insert(index, slot);
-        Ok(Entry::Const(slot))
-    }
-
     // ---- function entry ----
 
     fn prologue(&mut self) -> Result<(), LowerError> {
-        // Section 4.3: an async function returns its promise; the body runs
+        // An async function returns its promise; the body runs
         // as a resumption from here.
         if self.function.metadata().function_kind == FunctionKind::Async {
             self.emit(|b| b.op(Opcode::AsyncStart));
@@ -1136,7 +1411,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             self.emit(|b| b.a_count(Opcode::NewSpill, spill, slots));
         }
         if self.is_script {
-            // Section 5.7: every name is checked before any binding is made.
+            // Every name is checked before any binding is made,
+            // in GlobalDeclarationInstantiation's passes (16.1.7 steps 3, 4,
+            // 10 and 11): the lexical names, then every var and function
+            // name against the lexical declarations, then whether the
+            // global object can take each function, then each var.
+            use oxide_core::bytecode::opcode::global;
             let mut declarations = Vec::new();
             let eval = self.global_flags();
             for index in 0..self.function.closure_variables().len() {
@@ -1144,23 +1424,39 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 match variable.source {
                     ClosureSource::GlobalDeclaration => {
                         let key = self.closure_key(index as u16)?;
-                        let (check, declare) = match (variable.is_lexical, variable.is_const) {
-                            (false, _) => (Opcode::CheckGlobalVar, Opcode::DeclareGlobal),
-                            (true, false) => (Opcode::CheckGlobalLexical, Opcode::DeclareGlobalLet),
-                            (true, true) => {
-                                (Opcode::CheckGlobalLexical, Opcode::DeclareGlobalConst)
-                            }
+                        let declare = match (variable.is_lexical, variable.is_const) {
+                            (false, _) => Opcode::DeclareGlobal,
+                            (true, false) => Opcode::DeclareGlobalLet,
+                            (true, true) => Opcode::DeclareGlobalConst,
                         };
                         let flags = if variable.kind == ClosureVariableKind::GlobalFunction {
-                            eval | oxide_core::bytecode::opcode::global::FUNCTION
+                            eval | global::FUNCTION
                         } else {
                             eval
                         };
-                        self.emit(|b| b.raw(oxide_core::Insn::new(check, 0, flags, 0, key.raw())));
                         declarations.push((declare, flags, key));
                     }
                     ClosureSource::Global => {}
                     _ => return Err(LowerError::unsupported("script closure source")),
+                }
+            }
+            let checks = [
+                (|d: Opcode, _: u8| d != Opcode::DeclareGlobal) as fn(Opcode, u8) -> bool,
+                |d, _| d == Opcode::DeclareGlobal,
+                |d, f| d == Opcode::DeclareGlobal && f & global::FUNCTION != 0,
+                |d, f| d == Opcode::DeclareGlobal && f & global::FUNCTION == 0,
+            ];
+            for (pass, selected) in checks.iter().enumerate() {
+                for &(declare, flags, key) in &declarations {
+                    if !selected(declare, flags) {
+                        continue;
+                    }
+                    let (check, flags) = match pass {
+                        0 => (Opcode::CheckGlobalLexical, flags),
+                        1 => (Opcode::CheckGlobalVar, flags | global::LEXICAL_CONFLICT),
+                        _ => (Opcode::CheckGlobalVar, flags | global::DEFINABLE),
+                    };
+                    self.emit(|b| b.raw(oxide_core::Insn::new(check, 0, flags, 0, key.raw())));
                 }
             }
             for (declare, flags, key) in declarations {
@@ -1207,6 +1503,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 continue;
             };
             self.pc = pc;
+            self.next_scratch = 0;
             if self.analysis.label[pc] {
                 self.materialize_all()?;
                 self.labels[pc] = Some(self.builder.pc());
@@ -1269,7 +1566,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             let (_, [value]) = self.pop_operands::<1>()?;
             let dst = self.result_register()?;
             let at = self.emit(|b| b.ab(op, dst, value));
-            self.push_result(at);
+            self.push_result(at)?;
             return Ok(1);
         }
         if let Some((op, immediate)) = binary(instruction) {
@@ -1285,10 +1582,6 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 let entry = self.pool_entry(index)?;
                 self.stack.push(entry);
             }
-            I::PushAtomValueIndex(index) => {
-                let entry = self.decimal_entry(index)?;
-                self.stack.push(entry);
-            }
             I::Undefined => self.stack.push(Entry::Undefined),
             I::Null => self.stack.push(Entry::Null),
             I::PushFalse => self.stack.push(Entry::Bool(false)),
@@ -1301,13 +1594,13 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     .ok_or_else(|| LowerError::Internal("closure of a non-child".into()))?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.a_child(Opcode::MakeClosure, dst, ordinal));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::Object => {
                 let slots = self.literal_slots(pc);
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.a_count(Opcode::NewObject, dst, slots));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::ArrayFrom(count) => {
                 let count = usize::from(count);
@@ -1316,13 +1609,16 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     .len()
                     .checked_sub(count)
                     .ok_or_else(|| LowerError::Internal("symbolic stack underflow".into()))?;
+                if count > 0 && self.spilled(base + count - 1) {
+                    return self.array_from_slots(base).map(|()| 1);
+                }
                 for depth in base..self.stack.len() {
                     self.materialize(depth)?;
                 }
                 self.stack.truncate(base);
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.ab_range(Opcode::NewArray, dst, dst, count as u32));
-                self.push_result(at);
+                self.push_result(at)?;
             }
 
             // ---- locals and parameters ----
@@ -1374,7 +1670,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 self.load_captured(closure)?;
                 if self.checked.insert(CAPTURE_BIT | u32::from(closure)) {
                     let name = self.closure_key(closure)?;
-                    let value = Self::r8(self.temp(self.stack.len() - 1))?;
+                    let value = self.operand(self.stack.len() - 1)?;
                     self.emit(|b| b.a_key(Opcode::CheckInit, value, name));
                 }
             }
@@ -1400,37 +1696,37 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 let (_, [object]) = self.pop_operands::<1>()?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.ab_key(Opcode::GetField, dst, object, key));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::GetField2(name) => {
                 let key = self.name_key(name)?;
                 let object = self.operand(self.stack.len() - 1)?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.ab_key(Opcode::GetField, dst, object, key));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::GetArrayEl => {
                 let (_, [object, key]) = self.pop_operands::<2>()?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.abc(Opcode::GetElem, dst, object, key));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::GetArrayEl2 => {
                 let (_, [key]) = self.pop_operands::<1>()?;
                 let object = self.operand(self.stack.len() - 1)?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.abc(Opcode::GetElem, dst, object, key));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::GetArrayEl3 => {
                 let (_, [raw]) = self.pop_operands::<1>()?;
                 let object = self.operand(self.stack.len() - 1)?;
                 let converted = self.result_register()?;
                 let at = self.emit(|b| b.abc(Opcode::ToPropertyKeyOf, converted, raw, object));
-                self.push_result(at);
+                self.push_result(at)?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.abc(Opcode::GetElem, dst, object, converted));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::PutField(name) => {
                 let key = self.name_key(name)?;
@@ -1510,7 +1806,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 let (_, [object, key]) = self.pop_operands::<2>()?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.abc(Opcode::DeleteElem, dst, object, key));
-                self.push_result(at);
+                self.push_result(at)?;
             }
 
             // ---- updates ----
@@ -1534,7 +1830,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     let (_, [value]) = self.pop_operands::<1>()?;
                     let new = self.result_register()?;
                     let at = self.emit(|b| b.ab(op, new, value));
-                    self.push_result(at);
+                    self.push_result(at)?;
                     self.pc = pc + 1;
                     self.instruction(pc + 1)?;
                     return Ok(3);
@@ -1542,10 +1838,10 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 let (_, [value]) = self.pop_operands::<1>()?;
                 let old = self.result_register()?;
                 let at = self.emit(|b| b.ab(Opcode::ToNumeric, old, value));
-                self.push_result(at);
+                self.push_result(at)?;
                 let new = self.result_register()?;
                 let at = self.emit(|b| b.ab(op, new, old));
-                self.push_result(at);
+                self.push_result(at)?;
             }
 
             // ---- stack shuffles ----
@@ -1627,7 +1923,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             I::Gosub(target) => {
                 self.materialize_all()?;
                 let dst = self.result_register()?;
-                self.emit_jump(|b| b.a_jump(Opcode::Gosub, dst, 0), target as usize);
+                self.emit_storing_jump(|b| b.a_jump(Opcode::Gosub, dst, 0), dst, target as usize);
             }
             I::Ret => {
                 let (_, [address]) = self.pop_operands::<1>()?;
@@ -1640,9 +1936,6 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 let (_, [value]) = self.pop_operands::<1>()?;
                 self.emit(|b| b.a(Opcode::Return, value));
             }
-            I::ReturnUndefined => {
-                self.emit(|b| b.op(Opcode::ReturnUndefined));
-            }
             I::Throw => {
                 let (_, [value]) = self.pop_operands::<1>()?;
                 self.emit(|b| b.a(Opcode::Throw, value));
@@ -1651,7 +1944,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 let (_, [specifier, options]) = self.pop_operands::<2>()?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.abc(Opcode::ImportCall, dst, specifier, options));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::InitializeModuleImportCollision(closure) => self.store_captured(closure, false)?,
             I::ThrowDeleteSuper => {
@@ -1666,17 +1959,17 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 self.emit(|b| b.key(Opcode::ThrowConstAssign, key));
             }
 
-            // ---- the phase 3 surface ----
+            // ---- arguments, rest, construction, for-in, spread and eval ----
             I::Arguments(kind) => {
                 let dst = self.result_register()?;
                 let mapped = i32::from(kind == ArgumentsKind::Mapped);
                 let at = self.emit(|b| b.a_int(Opcode::NewArguments, dst, mapped));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::Rest(start) => {
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.a_int(Opcode::Rest, dst, i32::from(start)));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::PushNewTarget => {
                 let register = self.layout.new_target.ok_or_else(|| {
@@ -1696,7 +1989,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 let (_, [value]) = self.pop_operands::<1>()?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.ab(Opcode::ToObject, dst, value));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::SetProto => {
                 let (_, [value]) = self.pop_operands::<1>()?;
@@ -1706,24 +1999,24 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             I::PushActiveFunction => {
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.a(Opcode::LoadFunction, dst));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::PushHomeObject => {
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.a(Opcode::LoadHomeObject, dst));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::RegExp(index) => {
                 let slot = self.regexp_constants(index)?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.a_const(Opcode::NewRegExp, dst, slot));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::ForInStart => {
                 let (_, [source]) = self.pop_operands::<1>()?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.ab(Opcode::ForInStart, dst, source));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::ForInNext => return self.for_in_next(pc),
             I::Append => {
@@ -1733,11 +2026,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     self.materialize(depth)?;
                 }
                 let (array, index, source) = (
-                    Self::r8(self.temp(base))?,
-                    Self::r8(self.temp(base + 1))?,
-                    Self::r8(self.temp(base + 2))?,
+                    self.operand(base)?,
+                    self.operand(base + 1)?,
+                    self.operand(base + 2)?,
                 );
                 self.emit(|b| b.abc(Opcode::AppendSpread, array, index, source));
+                self.written(base + 1, index)?;
                 self.stack.truncate(base + 2);
             }
             I::Apply(kind) => {
@@ -1745,25 +2039,24 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     ApplyKind::Call => Opcode::CallSpread,
                     ApplyKind::Construct => Opcode::NewSpread,
                 };
-                self.call(op, 0, 3, true)?;
+                self.call(op, 0, 3)?;
             }
             // A direct `eval` is a call of whatever `eval` resolves to, which
-            // runs as indirect eval (phase 0, section 5.5).
-            I::Eval { argument_count, .. } => self.call(Opcode::Call, argument_count, 1, true)?,
+            // runs as indirect eval (a dropped feature).
+            I::Eval { argument_count, .. } => {
+                let at = self.call(Opcode::Call, argument_count, 1)?;
+                self.direct_eval_sites.push(at);
+            }
             I::ApplyEval { .. } => {
                 // `CallSpread` takes the callee, `this` and the argument array.
                 let base = self.stack.len() - 2;
                 for depth in base..self.stack.len() {
                     self.materialize(depth)?;
                 }
-                let (array, moved) = (
-                    Self::r8(self.temp(base + 1))?,
-                    Self::r8(self.temp(base + 2))?,
-                );
-                self.emit(|b| b.ab(Opcode::Mov, moved, array));
+                self.mov(self.temp(base + 2), self.temp(base + 1))?;
                 self.stack[base + 1] = Entry::Undefined;
                 self.push_canon(1);
-                self.call(Opcode::CallSpread, 0, 3, true)?;
+                self.call(Opcode::CallSpread, 0, 3)?;
             }
             // A function with a direct `eval` has no dynamic binding: the
             // eval throws before it could create one.
@@ -1778,41 +2071,43 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             I::DynamicEnvironmentObject(_) => self.stack.push(Entry::Undefined),
             I::DeleteDynamicBinding { .. } => self.stack.push(Entry::Bool(true)),
 
-            // ---- iteration (phase 4, section 4.2) ----
-            I::ForOfStart => {
+            // ---- iteration ----
+            I::ForOfStart | I::IteratorStart => {
+                let generic = i32::from(matches!(instruction, I::IteratorStart));
                 let (depth, [iterable]) = self.pop_operands::<1>()?;
-                let record = Self::r8(self.temp(depth))?;
-                self.emit(|b| b.ab_int(Opcode::IterStart, record, iterable, 0));
-                self.push_canon(3);
-            }
-            I::IteratorStart => {
-                let (depth, [iterable]) = self.pop_operands::<1>()?;
-                let record = Self::r8(self.temp(depth))?;
-                self.emit(|b| b.ab_int(Opcode::IterStart, record, iterable, 1));
+                let record = self.temps_window(depth, 3, 0)?;
+                self.emit(|b| b.ab_int(Opcode::IterStart, record, iterable, generic));
+                self.temps_written(record, depth, 0..3)?;
                 self.push_canon(3);
             }
             I::ForOfNext(offset) => {
                 let top = self.stack.len();
-                let record = top
+                let base = top
                     .checked_sub(3 + usize::from(offset))
                     .ok_or_else(|| LowerError::Internal("ForOfNext without a record".into()))?;
-                let record = Self::r8(self.temp(record))?;
-                let value = Self::r8(self.temp(top))?;
-                let done = Self::r8(self.temp(top + 1))?;
+                let record = self.temps_window(base, 3, 3)?;
+                let value = self.dest(top)?;
+                let done = self.dest(top + 1)?;
+                self.mark_record_done(record, base)?;
                 self.emit(|b| b.abc(Opcode::IterNext, value, record, done));
+                self.temps_written(record, base, 2..3)?;
+                self.written(top, value)?;
+                self.written(top + 1, done)?;
                 self.push_canon(2);
             }
             I::IteratorClose => {
                 let base = self.record_base(3)?;
-                let record = Self::r8(self.temp(base))?;
+                let record = self.temps_window(base, 3, 3)?;
+                self.mark_record_done(record, base)?;
                 self.emit(|b| b.a(Opcode::IterClose, record));
                 self.stack.truncate(base);
             }
             I::IteratorClosePreserve | I::IteratorDropPreserve | I::IteratorDetachPreserve => {
                 let region = self.innermost_iterator(pc)?;
                 let value = self.operand(self.stack.len() - 1)?;
-                let record = Self::r8(self.temp(region))?;
+                let record = self.temps_window(region, 3, 3)?;
                 if matches!(instruction, I::IteratorClosePreserve) {
+                    self.mark_record_done(record, region)?;
                     self.emit(|b| b.a(Opcode::IterClose, record));
                 }
                 self.stack.truncate(region);
@@ -1831,16 +2126,18 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             I::IteratorNext => {
                 let top = self.stack.len();
                 let value = self.operand(top - 1)?;
-                let record = Self::r8(self.temp(top - 4))?;
-                let dst = Self::r8(self.temp(top - 1))?;
+                let record = self.temps_window(top - 4, 3, 3)?;
+                let dst = self.dest(top - 1)?;
                 self.emit(|b| b.abc(Opcode::IterCallNext, dst, record, value));
+                self.written(top - 1, dst)?;
                 self.stack[top - 1] = Entry::Canon;
             }
             I::IteratorCall(kind) => {
                 let top = self.stack.len();
                 let value = self.operand(top - 1)?;
-                let record = Self::r8(self.temp(top - 4))?;
-                let dst = Self::r8(self.temp(top - 1))?;
+                let record = self.temps_window(top - 4, 3, 3)?;
+                // The result and whether the method was missing.
+                let dst = self.temps_window(top - 1, 2, 0)?;
                 let kind = match kind {
                     IteratorCallKind::ReturnWithValue => 0,
                     IteratorCallKind::ThrowWithValue => 1,
@@ -1855,6 +2152,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                         kind,
                     ))
                 });
+                self.temps_written(dst, top - 1, 0..2)?;
                 self.stack[top - 1] = Entry::Canon;
                 self.push_canon(1);
             }
@@ -1871,28 +2169,35 @@ impl<'a, 'c> Lowerer<'a, 'c> {
 
             I::ForAwaitOfStart | I::AsyncIteratorStart => {
                 let (depth, [iterable]) = self.pop_operands::<1>()?;
-                let record = Self::r8(self.temp(depth))?;
+                let record = self.temps_window(depth, 3, 0)?;
                 self.emit(|b| b.ab(Opcode::IterStartAsync, record, iterable));
+                self.temps_written(record, depth, 0..3)?;
                 self.push_canon(3);
             }
             I::ForAwaitOfNext => {
                 let top = self.stack.len();
-                let record = Self::r8(self.temp(top - 3))?;
-                let dst = Self::r8(self.temp(top))?;
+                let record = self.temps_window(top - 3, 3, 3)?;
+                let dst = self.dest(top)?;
+                self.mark_record_done(record, top - 3)?;
                 self.emit(|b| b.ab(Opcode::IterNextRaw, dst, record));
+                self.temps_written(record, top - 3, 2..3)?;
+                self.written(top, dst)?;
                 self.push_canon(1);
             }
             I::IteratorGetValueDone => {
                 let top = self.stack.len();
-                self.materialize(top - 1)?;
-                let result = Self::r8(self.temp(top - 1))?;
-                let record = Self::r8(self.temp(top - 4))?;
-                let done = Self::r8(self.temp(top))?;
+                let result = self.canonical(top - 1)?;
+                let record = self.temps_window(top - 4, 3, 3)?;
+                let done = self.dest(top)?;
+                self.mark_record_done(record, top - 4)?;
                 self.emit(|b| b.abc(Opcode::IterResult, result, record, done));
+                self.temps_written(record, top - 4, 2..3)?;
+                self.written(top - 1, result)?;
+                self.written(top, done)?;
                 self.push_canon(1);
             }
 
-            // ---- suspension (section 4.3) ----
+            // ---- suspension ----
             I::InitialYield => {
                 self.emit(|b| b.op(Opcode::InitialYield));
             }
@@ -1904,29 +2209,30 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 };
                 let top = self.stack.len();
                 self.materialize(top - 1)?;
-                let value = Self::r8(self.temp(top - 1))?;
+                // A resumption writes the value and its kind.
+                let value = self.temps_window(top - 1, 2, 1)?;
                 self.materialize_all()?;
                 self.emit(|b| b.a(op, value));
+                self.temps_written(value, top - 1, 0..2)?;
                 self.push_canon(1);
             }
             I::Await => {
                 let top = self.stack.len();
-                self.materialize(top - 1)?;
-                let value = Self::r8(self.temp(top - 1))?;
+                let value = self.canonical(top - 1)?;
                 self.materialize_all()?;
                 self.emit(|b| b.a(Opcode::Await, value));
+                self.written(top - 1, value)?;
                 self.stack[top - 1] = Entry::Canon;
                 self.last_dest = None;
             }
 
-            // ---- classes (section 5.1) ----
+            // ---- classes ----
             I::DefineClass { name, has_heritage } => {
                 let key = self.name_key(name)?;
                 let base = self.stack.len() - 2;
                 self.materialize(base)?;
                 self.materialize(base + 1)?;
-                let (parent, closure) =
-                    (Self::r8(self.temp(base))?, Self::r8(self.temp(base + 1))?);
+                let (parent, closure) = (self.operand(base)?, self.operand(base + 1)?);
                 self.emit(|b| {
                     b.raw(oxide_core::Insn::new(
                         Opcode::MakeClass,
@@ -1936,6 +2242,9 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                         key.raw(),
                     ))
                 });
+                // The constructor and its prototype replace them.
+                self.written(base, parent)?;
+                self.written(base + 1, closure)?;
             }
             I::InstallClassInstanceInitializer => {
                 let (_, [initializer]) = self.pop_operands::<1>()?;
@@ -1962,21 +2271,19 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 let (_, [home]) = self.pop_operands::<1>()?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.ab(Opcode::GetSuper, dst, home));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::GetSuperValue | I::GetSuperValueForCall => {
                 let base = self.stack.len() - 3;
                 for depth in base..self.stack.len() {
                     self.materialize(depth)?;
                 }
-                let first = Self::r8(self.temp(base))?;
+                let first = self.temps_window(base, 3, 3)?;
                 let for_call = matches!(instruction, I::GetSuperValueForCall);
-                let (dst, keep) = if for_call {
-                    (Self::r8(self.temp(base + 1))?, base + 1)
-                } else {
-                    (first, base)
-                };
+                let keep = if for_call { base + 1 } else { base };
+                let dst = self.dest(keep)?;
                 self.emit(|b| b.ab_int(Opcode::GetSuperValue, dst, first, i32::from(for_call)));
+                self.written(keep, dst)?;
                 self.stack.truncate(keep);
                 self.stack.push(Entry::Canon);
             }
@@ -1985,18 +2292,22 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 for depth in base..self.stack.len() {
                     self.materialize(depth)?;
                 }
-                let first = Self::r8(self.temp(base))?;
+                let first = self.temps_window(base, 4, 4)?;
                 self.emit(|b| b.a(Opcode::PutSuperValue, first));
                 self.stack.truncate(base);
             }
             I::MarkSuperCall => {}
-            I::ConstructSuper(argc) => self.call(Opcode::New, argc, 2, true)?,
-            I::ApplySuper => self.call(Opcode::NewSpread, 0, 3, true)?,
+            I::ConstructSuper(argc) => {
+                self.call(Opcode::New, argc, 2)?;
+            }
+            I::ApplySuper => {
+                self.call(Opcode::NewSpread, 0, 3)?;
+            }
             I::InitDerivedConstructor => {
                 let new_target = self.new_target_register()?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.ab(Opcode::InitDerived, dst, new_target));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::InitializeDerivedLocal(local) => {
                 let register = self.local_register(local);
@@ -2016,8 +2327,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             }
             I::ReturnDerived(local) => {
                 let top = self.stack.len();
-                self.materialize(top - 1)?;
-                let value = Self::r8(self.temp(top - 1))?;
+                let value = self.canonical(top - 1)?;
                 self.get_local(local, false)?;
                 let this = self.operand(self.stack.len() - 1)?;
                 self.stack.pop();
@@ -2031,7 +2341,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 let name = self.local_key(local)?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.a_key(Opcode::NewPrivateName, dst, name));
-                self.push_result(at);
+                self.push_result(at)?;
                 self.put_local(local, false, false)?;
             }
             I::InitializePrivateMethod(local) | I::InitializePrivateAccessor(local) => {
@@ -2081,7 +2391,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     _ => Opcode::GetPrivate,
                 };
                 let at = self.emit(|b| b.abc(op, dst, target, name));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::PutPrivateField(source) | I::DefinePrivateField(source) => {
                 let define = matches!(instruction, I::DefinePrivateField(_));
@@ -2116,10 +2426,10 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     Opcode::PrivateBrandIn
                 };
                 let at = self.emit(|b| b.abc(op, dst, target, name));
-                self.push_result(at);
+                self.push_result(at)?;
             }
 
-            // ---- object spread and references (section 5.2) ----
+            // ---- object spread and references ----
             I::CopyDataProperties => {
                 let (_, [source]) = self.pop_operands::<1>()?;
                 let target = self.operand(self.stack.len() - 1)?;
@@ -2141,7 +2451,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 let key = self.closure_key(closure)?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.a_key(Opcode::GlobalRef, dst, key));
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::GetRefValue(name) | I::GetRefValueUndef(name) => {
                 let key = self.name_key(name)?;
@@ -2157,7 +2467,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                         key.raw(),
                     ))
                 });
-                self.push_result(at);
+                self.push_result(at)?;
             }
             I::PutRefValue(name) => {
                 let key = self.name_key(name)?;
@@ -2166,11 +2476,15 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             }
 
             // ---- calls ----
-            I::Call(argc) => self.call(Opcode::Call, argc, 1, true)?,
-            I::CallMethod(argc) => self.call(Opcode::CallMethod, argc, 2, true)?,
-            I::Construct(argc) => self.call(Opcode::New, argc, 2, true)?,
-            I::TailCall(argc) => self.call(Opcode::TailCall, argc, 1, false)?,
-            I::TailCallMethod(argc) => self.call(Opcode::TailCallMethod, argc, 2, false)?,
+            I::Call(argc) => {
+                self.call(Opcode::Call, argc, 1)?;
+            }
+            I::CallMethod(argc) => {
+                self.call(Opcode::CallMethod, argc, 2)?;
+            }
+            I::Construct(argc) => {
+                self.call(Opcode::New, argc, 2)?;
+            }
 
             _ => return Err(unsupported_instruction(instruction)),
         }
@@ -2191,7 +2505,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             let (_, [left, right]) = self.pop_operands::<2>()?;
             let dst = self.result_register()?;
             let at = self.emit(|b| b.abc(compare.value(), dst, left, right));
-            self.push_result(at);
+            self.push_result(at)?;
             return Ok(1);
         };
         let top = self.stack.len();
@@ -2229,30 +2543,30 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             self.stack.truncate(top - 2);
             let dst = self.result_register()?;
             let at = self.emit(|b| b.ab_int(immediate, dst, left, value));
-            self.push_result(at);
+            self.push_result(at)?;
             return Ok(());
         }
         let (_, [left, right]) = self.pop_operands::<2>()?;
         let dst = self.result_register()?;
         let at = self.emit(|b| b.abc(op, dst, left, right));
-        self.push_result(at);
+        self.push_result(at)?;
         Ok(())
     }
 
-    fn call(
-        &mut self,
-        op: Opcode,
-        argc: u16,
-        fixed: usize,
-        returns: bool,
-    ) -> Result<(), LowerError> {
-        let argc = u8::try_from(argc)
-            .map_err(|_| LowerError::unsupported("calls with more than 255 arguments"))?;
+    /// Lowers a call of `fixed` operands and `argc` arguments; returns the
+    /// call's register PC.
+    fn call(&mut self, op: Opcode, argc: u16, fixed: usize) -> Result<u32, LowerError> {
+        let count = fixed + usize::from(argc);
         let base = self
             .stack
             .len()
-            .checked_sub(fixed + usize::from(argc))
+            .checked_sub(count)
             .ok_or_else(|| LowerError::Internal("symbolic stack underflow".into()))?;
+        if self.spilled(base + count - 1) {
+            return self.call_from_slots(op, argc, fixed, base);
+        }
+        let argc = u8::try_from(argc)
+            .map_err(|_| LowerError::unsupported("calls with more than 255 arguments"))?;
         // The callee window overlaps the operands in place, so they must sit
         // in their own temporaries; entries below the call are untouched.
         for depth in base..self.stack.len() {
@@ -2260,11 +2574,106 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         }
         self.stack.truncate(base);
         let callee = Self::r8(self.temp(base))?;
-        if returns {
-            let at = self.emit(|b| b.call(op, callee, callee, argc));
-            self.push_result(at);
+        let at = self.emit(|b| b.call(op, callee, callee, argc));
+        self.push_result(at)?;
+        Ok(at)
+    }
+
+    /// A call whose window reaches the spill scope: on a run of scratch registers when it
+    /// fits, else as a spread call over an array of the arguments
+    /// (`CallSpread` copies a dense array without the iterator protocol).
+    fn call_from_slots(
+        &mut self,
+        op: Opcode,
+        argc: u16,
+        fixed: usize,
+        base: usize,
+    ) -> Result<u32, LowerError> {
+        let count = fixed + usize::from(argc);
+        let dst = if count < SCRATCH as usize {
+            let run = self.scratch_run(count)?;
+            for (index, depth) in (base..self.stack.len()).enumerate() {
+                self.copy_entry(u32::from(run) + index as u32, depth)?;
+            }
+            run
         } else {
-            self.emit(|b| b.call(op, 0, callee, argc));
+            let (spread, receiver) = match op {
+                Opcode::Call => (Opcode::CallSpread, None),
+                Opcode::CallMethod => (Opcode::CallSpread, Some(base)),
+                Opcode::New => (Opcode::NewSpread, Some(base + 1)),
+                _ => {
+                    return Err(LowerError::Internal(format!(
+                        "a {} past the window",
+                        op.name()
+                    )));
+                }
+            };
+            let callee = if op == Opcode::CallMethod {
+                base + 1
+            } else {
+                base
+            };
+            // Callee, receiver or new.target, then the array.
+            let run = self.scratch_run(3)?;
+            self.array_of(u32::from(run) + 2, base + fixed)?;
+            self.copy_entry(u32::from(run), callee)?;
+            match receiver {
+                Some(depth) => self.copy_entry(u32::from(run) + 1, depth)?,
+                None => self.load(u32::from(run) + 1, Entry::Undefined)?,
+            }
+            self.stack.truncate(base);
+            let at = self.emit(|b| b.call(spread, run, run, 0));
+            self.written(base, run)?;
+            self.stack.push(Entry::Canon);
+            return Ok(at);
+        };
+        self.stack.truncate(base);
+        let argc = argc as u8;
+        let at = self.emit(|b| b.call(op, dst, dst, argc));
+        self.written(base, dst)?;
+        self.stack.push(Entry::Canon);
+        Ok(at)
+    }
+
+    /// An array literal whose elements reach the spill scope.
+    fn array_from_slots(&mut self, base: usize) -> Result<(), LowerError> {
+        let count = self.stack.len() - base;
+        let dst = if count < SCRATCH as usize {
+            let run = self.scratch_run(count)?;
+            for (index, depth) in (base..self.stack.len()).enumerate() {
+                self.copy_entry(u32::from(run) + index as u32, depth)?;
+            }
+            self.emit(|b| b.ab_range(Opcode::NewArray, run, run, count as u32));
+            run
+        } else {
+            let run = self.scratch_run(1)?;
+            self.array_of(u32::from(run), base)?;
+            run
+        };
+        self.stack.truncate(base);
+        self.written(base, dst)?;
+        self.stack.push(Entry::Canon);
+        Ok(())
+    }
+
+    /// Builds in `dst` an array of the entries from `first` to the top, one
+    /// element at a time: an empty `NewArray`, then a `DefineElem` per
+    /// entry through the two scratch registers after `dst`'s run.
+    fn array_of(&mut self, dst: u32, first: usize) -> Result<(), LowerError> {
+        let array = Self::r8(dst)?;
+        self.emit(|b| b.ab_range(Opcode::NewArray, array, array, 0));
+        let (index, value) = (self.rotating()?, self.rotating()?);
+        if index == array || value == array {
+            return Err(LowerError::Internal(
+                "an array's scratch registers overlap".into(),
+            ));
+        }
+        for (position, depth) in (first..self.stack.len()).enumerate() {
+            let position = i32::try_from(position)
+                .map_err(|_| LowerError::unsupported("arrays of more than 2^31 elements"))?;
+            self.emit(|b| b.a_int(Opcode::LoadInt, index, position));
+            self.copy_entry(u32::from(value), depth)?;
+            self.emit(|b| b.abc(Opcode::DefineElem, array, index, value));
         }
         Ok(())
     }
@@ -2298,12 +2707,16 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         let iterator = self.operand(self.stack.len() - 1)?;
         self.materialize_all()?;
         let key = self.result_register()?;
-        self.emit_jump(|b| b.ab_jump(Opcode::ForInNext, key, iterator, 0), target);
+        self.emit_storing_jump(
+            |b| b.ab_jump(Opcode::ForInNext, key, iterator, 0),
+            key,
+            target,
+        );
         self.stack.push(Entry::Canon);
         Ok(2)
     }
 
-    // ---- phase 4 helpers ----
+    // ---- iterator records, `new.target`, private names, templates ----
 
     /// Pushes `count` canonical entries (values an instruction wrote to the
     /// temporaries at their depths).
@@ -2404,7 +2817,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         let cell = self.cell_operand(cell)?;
         let dst = self.result_register()?;
         let at = self.emit(|b| b.ab(Opcode::LoadCell, dst, cell));
-        self.push_result(at);
+        self.push_result(at)?;
         Ok(())
     }
 
@@ -2437,7 +2850,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 let dst = self.result_register()?;
                 let (spill, slot) = self.spill_slot(register)?;
                 let at = self.emit(|b| b.ab_int(Opcode::LoadSlot, dst, spill, slot));
-                self.push_result(at);
+                self.push_result(at)?;
             } else {
                 self.stack.push(Entry::Reg(register));
             }
@@ -2483,8 +2896,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             }
         } else if Self::is_wide(register) {
             let depth = self.stack.len() - 1;
-            self.materialize(depth)?;
-            let value = Self::r8(self.temp(depth))?;
+            let value = self.canonical(depth)?;
             let (spill, slot) = self.spill_slot(register)?;
             self.emit(|b| b.ab_int(Opcode::StoreSlot, value, spill, slot));
             if !keep {
@@ -2503,7 +2915,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
     fn load_captured(&mut self, closure: u16) -> Result<(), LowerError> {
         let dst = self.result_register()?;
         let at = self.emit(|b| b.a_capture(Opcode::LoadCaptured, dst, u32::from(closure)));
-        self.push_result(at);
+        self.push_result(at)?;
         Ok(())
     }
 
@@ -2521,7 +2933,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         let key = self.closure_key(closure)?;
         let dst = self.result_register()?;
         let at = self.emit(|b| b.a_key(op, dst, key));
-        self.push_result(at);
+        self.push_result(at)?;
         Ok(())
     }
 
@@ -2589,8 +3001,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             }
             // Every destination is still to be read: a cycle.
             let (dst, src) = moves.remove(0);
-            let (a, b) = (Self::r8(dst)?, Self::r8(src)?);
-            self.emit(|builder| builder.ab(Opcode::Swap, a, b));
+            self.swap(dst, src)?;
             for pending in &mut moves {
                 if pending.1 == dst {
                     pending.1 = src;
@@ -2638,25 +3049,73 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 .ok_or_else(|| LowerError::Internal(format!("jump to {target} has no label")))?;
             self.builder.patch_target(at, label);
         }
-        // Section 4.2: an exception leaving an iterator record's range closes
+        // A jump that writes a depth in the spill scope reaches its target
+        // through a stub that stores the register first.
+        for index in 0..self.store_stubs.len() {
+            let (at, register, temp, target) = self.store_stubs[index];
+            let label = self.labels[target]
+                .ok_or_else(|| LowerError::Internal(format!("jump to {target} has no label")))?;
+            let origin = self.origins[at as usize];
+            let start = self.builder.pc();
+            let (spill, slot) = self.spill_slot(temp)?;
+            self.builder
+                .ab_int(Opcode::StoreSlot, register, spill, slot);
+            self.builder.jump(Opcode::Jmp, label);
+            self.origins.extend([origin, origin]);
+            self.builder.patch_target(at, start);
+        }
+        // An exception leaving an iterator record's range closes
         // the iterator (unless it is done) and propagates. Each record gets a
         // stub after the code, reached through its own handler entry.
         let mut stubs = vec![None; self.analysis.catches.len()];
-        for (region, catch) in self.analysis.catches.iter().enumerate() {
+        let catches = self.analysis.catches.clone();
+        for (region, catch) in catches.iter().enumerate() {
             if !catch.iterator {
                 continue;
             }
-            let record = Self::r8(self.temp(catch.marker_depth as usize))?;
-            let thrown = catch.marker_depth + 3;
-            self.max_scratch = self.max_scratch.max(thrown + 1);
-            let thrown = Self::r8(self.temp(thrown as usize))?;
-            // The stub runs in the regions that enclose the record.
+            let depth = catch.marker_depth as usize;
             let start = self.builder.pc();
+            // A record in the spill scope is copied into scratch registers.
+            let record = if self.spilled(depth + 2) {
+                let run = self.temp_base + self.layout.temp_registers + 1;
+                self.pc = catch.opened_at;
+                for index in 0..3 {
+                    self.mov(run + index as u32, self.temp(depth + index))?;
+                }
+                Self::r8(run)?
+            } else {
+                Self::r8(self.temp(depth))?
+            };
+            let thrown = if self.spilled(depth + 3) {
+                Self::r8(self.temp_base + self.layout.temp_registers + 4)?
+            } else {
+                self.max_scratch = self.max_scratch.max(catch.marker_depth + 4);
+                Self::r8(self.temp(depth + 3))?
+            };
+            // The stub runs in the regions that enclose the record.
             self.builder.ab(Opcode::IterCloseThrow, record, thrown);
             self.origins.push(catch.opened_at);
             self.builder.a(Opcode::Throw, thrown);
             self.origins.push(catch.opened_at);
             stubs[region] = Some((start, u16::from(thrown)));
+        }
+        // A catch whose value lands in the spill scope is reached through a
+        // stub that stores it.
+        for (region, catch) in self.analysis.catches.iter().enumerate() {
+            let depth = catch.marker_depth as usize;
+            if catch.iterator || !self.spilled(depth) {
+                continue;
+            }
+            let target = self.labels[catch.target]
+                .ok_or_else(|| LowerError::Internal("catch target has no label".into()))?;
+            let register = Self::r8(self.temp_base + self.layout.temp_registers + 1)?;
+            let (spill, slot) = self.spill_slot(self.temp(depth))?;
+            let start = self.builder.pc();
+            self.builder
+                .ab_int(Opcode::StoreSlot, register, spill, slot);
+            self.builder.jump(Opcode::Jmp, target);
+            self.origins.extend([catch.target, catch.target]);
+            stubs[region] = Some((start, u16::from(register)));
         }
         let handlers = self.handlers(&stubs)?;
         for handler in handlers {
@@ -2664,7 +3123,11 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         }
 
         let metadata = self.function.metadata();
-        let register_count = self.temp_base + self.analysis.max_depth.max(self.max_scratch);
+        let register_count = if self.layout.temp_registers == u32::MAX {
+            self.temp_base + self.analysis.max_depth.max(self.max_scratch)
+        } else {
+            self.temp_base + self.layout.temp_registers + SCRATCH
+        };
         let register_count = u16::try_from(register_count)
             .map_err(|_| LowerError::unsupported("functions with more than 65535 registers"))?;
         let class_constructor = self
@@ -2733,7 +3196,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             .debug()
             .and_then(|debug| debug.source.as_ref())
             .filter(|_| !self.is_script)
-            .map(|bytes| String::from_utf8_lossy(bytes).into_owned().into_boxed_str());
+            .map(|bytes| bytes.to_vec().into_boxed_slice());
         let captures = self.captures(parent)?;
         let name = self
             .function
@@ -2749,7 +3212,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             this_slots,
             constant_count: self.pool.len() as u32,
             spill_register: self.layout.spill.map(|(register, _)| register as u16),
-            spill_slots: self.layout.spill.map_or(0, |(_, slots)| slots as u16),
+            spill_slots: match self.layout.spill {
+                Some((_, slots)) => u16::try_from(slots).map_err(|_| {
+                    LowerError::unsupported("functions with more than 65535 spill slots")
+                })?,
+                None => 0,
+            },
             children,
             captures,
             name,
@@ -2762,6 +3230,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 .map(|debug| std::rc::Rc::from(debug.filename.to_utf8_lossy())),
         });
         unit.debug.positions = positions;
+        unit.debug.definition = self
+            .function
+            .debug()
+            .and_then(|debug| debug.pc2line.as_ref())
+            .and_then(|table| table.definition.one_based());
+        unit.direct_eval_sites = self.direct_eval_sites.into();
         Ok((unit, self.pool))
     }
 

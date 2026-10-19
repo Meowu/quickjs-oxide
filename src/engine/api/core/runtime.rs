@@ -1,4 +1,4 @@
-//! The API's runtime (phase 6, section 2.1): one `Rc<RefCell<…>>` at the
+//! The API's runtime: one `Rc<RefCell<…>>` at the
 //! boundary around `oxide_core::Runtime`. Every method borrows the cell for
 //! one engine entry; a host callback that calls back in without its
 //! [`Scope`](super::Scope) gets [`RuntimeError::Reentered`].
@@ -77,6 +77,14 @@ pub(crate) struct Inner {
     temps: Vec<Handle>,
 }
 
+/// Host stack an outermost entry keeps below the loop's re-entry budget for
+/// the frames that build and unwind a stack overflow error.
+const NATIVE_RESERVE: usize = if cfg!(debug_assertions) {
+    256 * 1024
+} else {
+    64 * 1024
+};
+
 thread_local! {
     /// The runtimes with an entry in progress on this thread, innermost
     /// last: how the core's module and compile callbacks find the API.
@@ -149,8 +157,8 @@ impl Entry<'_> {
             Kind::BigInt => {
                 let decimal = self.core.bigint_decimal(value).unwrap_or_default();
                 Value::BigInt(
-                    JsBigInt::parse_js_string(&decimal)
-                        .map_err(|error| RuntimeError::Internal(format!("{error:?}")))?,
+                    JsBigInt::from_decimal_unchecked(&decimal)
+                        .ok_or(RuntimeError::Invariant("a BigInt's decimal text"))?,
                 )
             }
             Kind::Symbol => Value::Symbol(SymbolRef {
@@ -477,6 +485,24 @@ impl Runtime {
             .try_borrow_mut()
             .map_err(|_| RuntimeError::Reentered)?;
         self.shared.drain_released(&mut inner);
+        if CURRENT.with(|current| current.borrow().is_empty()) {
+            // The loop's re-entries may use the thread's stack past what this
+            // entry needs to unwind an error: QuickJS's one-MiB budget, which
+            // its frames reach at the depths its nesting tests pin, takes
+            // larger debug frames here.
+            // An undeclared thread keeps the default as a ceiling.
+            let (available, declared) = crate::engine::compiler::stack_guard::available_stack();
+            let budget = available
+                .saturating_sub(available / 8)
+                .saturating_sub(NATIVE_RESERVE)
+                .max(available / 2);
+            let budget = if declared {
+                budget
+            } else {
+                budget.min(oxide_core::vm::NATIVE_STACK_BUDGET)
+            };
+            inner.core.set_native_stack_budget(budget);
+        }
         CURRENT.with(|current| current.borrow_mut().push(Rc::clone(&self.shared)));
         Ok(Entry {
             inner,
@@ -672,6 +698,37 @@ impl Runtime {
             GcPolicy::Automatic
         })
     }
+
+    /// Collects before every `interval`-th allocating operation (`qjs
+    /// --gc-stress=N`), or stops (`None`); only in a build with the stress
+    /// collector ([`Runtime::GC_STRESS_AVAILABLE`]).
+    pub fn set_gc_stress(&self, interval: Option<u32>) -> Result<(), RuntimeError> {
+        let mut entry = self.enter()?;
+        #[cfg(feature = "gc-stress")]
+        {
+            let gc = entry.core.heap_mut().gc_mut();
+            gc.stress = interval.is_some_and(|interval| interval > 0);
+            gc.stress_interval = interval.unwrap_or(1).max(1);
+            Ok(())
+        }
+        #[cfg(not(feature = "gc-stress"))]
+        {
+            let _ = &mut entry;
+            match interval {
+                Some(_) => Err(RuntimeError::Unsupported(
+                    "stress collections in this build",
+                )),
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// Whether this build has the stress collector.
+    pub const GC_STRESS_AVAILABLE: bool = cfg!(feature = "gc-stress");
+
+    /// Whether this build counts inline-cache hits (`ic_report` returns
+    /// `Some`).
+    pub const IC_STATS_AVAILABLE: bool = cfg!(feature = "ic-stats");
 
     /// Records every collection's pause (for [`Runtime::gc_report`]).
     pub fn set_record_gc_pauses(&self, record: bool) -> Result<(), RuntimeError> {
@@ -922,9 +979,13 @@ impl Runtime {
         Ok(entry.inner.core.print_value(value))
     }
 
-    /// [`Runtime::print_value`] as bytes (the current API's form).
+    /// [`Runtime::print_value`] as the bytes QuickJS writes: a lone
+    /// surrogate of a raw name, message or stack as its own three bytes
+    /// (WTF-8) instead of U+FFFD.
     pub fn qjs_print_value_bytes(&self, value: &Value) -> Result<Vec<u8>, RuntimeError> {
-        self.print_value(value).map(String::into_bytes)
+        let mut entry = self.enter()?;
+        let value = entry.lower(value)?;
+        Ok(entry.inner.core.print_value_bytes(value))
     }
 }
 

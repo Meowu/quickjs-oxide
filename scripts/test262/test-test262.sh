@@ -20,7 +20,6 @@ usage() {
 
 die() { echo "error: $*" >&2; exit 1; }
 
-vm_configuration=stack-vm
 mode=check
 spec_arg=$default_spec
 mode_seen=false
@@ -59,8 +58,8 @@ esac
 
 required_keys='schema milestone quickjs test262 test262_patch_sha256 test262_config_sha256 test262_metadata_records test262_metadata_sha256 engine_fingerprint_tool engine_fingerprint_tool_lines engine_fingerprint_tool_sha256 engine_semantics_files engine_semantics_trees engine_semantics_sha256 upstream upstream_lines upstream_sha256 admissions admissions_lines admissions_sha256 profile profile_lines profile_sha256 negative_diagnostics negative_diagnostics_lines negative_diagnostics_sha256 negative_diagnostic_rules negative_diagnostic_rules_lines negative_diagnostic_rules_sha256 negative_diagnostic_audit_tool negative_diagnostic_audit_tool_lines negative_diagnostic_audit_tool_sha256 negative_diagnostic_exemptions negative_diagnostic_exemptions_lines negative_diagnostic_exemptions_sha256 manifest manifest_lines manifest_sha256 focused_tsv focused_tsv_lines focused_tsv_sha256 focused_jsonl focused_jsonl_lines focused_jsonl_sha256 mode timeout_ms focused_variants focused_eligible focused_runnable focused_passes focused_summary full_variants full_eligible full_runnable full_passes full_tsv_lines full_tsv_body_sha256 full_jsonl_lines full_jsonl_body_sha256 full_summary dropped_variants dropped_variants_lines dropped_variants_sha256 dropped_variants_count'
 
-# The spec names the frozen list of variants the dropped features cost (new-core
-# phase 4, section 7.1); nothing is optional since the runner has one backend.
+# The spec names the frozen list of variants the dropped features cost; nothing
+# is optional since the runner has one backend.
 optional_keys=''
 
 # Parse as inert data. In particular, this gate never sources or evaluates a spec.
@@ -515,11 +514,10 @@ QUICKJS_OXIDE_TEST262_ENGINE_SEMANTICS_SHA256=$workspace_engine_semantics_sha256
     cargo build --locked --release --target "$build_host" \
     --target-dir "$target_dir" -p quickjs-oxide-test262 --bin run-test262 \
     --message-format json-render-diagnostics > "$tmp/runner-build.jsonl"
-python3 - "$tmp/runner-build.jsonl" "$vm_configuration" <<'PY_BUILD'
+python3 - "$tmp/runner-build.jsonl" <<'PY_BUILD'
 import json, sys
 artifacts = [r for line in open(sys.argv[1]) if (r := json.loads(line)).get("reason") == "compiler-artifact" and r.get("target", {}).get("name") == "run-test262"]
 assert len(artifacts) == 1, "expected one authenticated runner artifact"
-assert "stack-vm" not in artifacts[0]["features"], "retired VM feature selected"
 PY_BUILD
 assert_workspace_engine_unchanged 'runner build'
 built_runner=$target_dir/$build_host/release/run-test262
@@ -558,11 +556,11 @@ runner_sha256=$(sha256_file "$runner")
 printf 'Rust Test262 runner provenance passed: engine_semantics_sha256=%s binary_sha256=%s\n' \
     "$workspace_engine_semantics_sha256" "$runner_sha256"
 
-python3 - "$output_dir/test262-runner-$vm_configuration.json" "$tmp/runner-build.jsonl" "$vm_configuration" "$workspace_engine_semantics_sha256" "$runner_sha256" <<'PY_RECEIPT'
+python3 - "$output_dir/test262-runner.json" "$tmp/runner-build.jsonl" "$workspace_engine_semantics_sha256" "$runner_sha256" <<'PY_RECEIPT'
 import json, sys
 artifact = next(r for line in open(sys.argv[2]) if (r := json.loads(line)).get("reason") == "compiler-artifact" and r.get("target", {}).get("name") == "run-test262")
 with open(sys.argv[1], "w") as output:
-    json.dump(dict(vm_configuration=sys.argv[3], features=artifact["features"], engine_semantics_sha256=sys.argv[4], binary_sha256=sys.argv[5]), output, indent=2)
+    json.dump(dict(features=artifact["features"], engine_semantics_sha256=sys.argv[3], binary_sha256=sys.argv[4]), output, indent=2)
     output.write("\n")
 PY_RECEIPT
 

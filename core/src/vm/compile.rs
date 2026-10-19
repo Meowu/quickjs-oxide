@@ -1,6 +1,6 @@
-//! Code compiled at run time (phase 4, section 5.5): `eval`, the `Function`
-//! constructors, `$262.evalScript` and `Function.prototype.toString`'s
-//! source text, through the compile host the embedder installs.
+//! Code compiled at run time: `eval`, the `Function` constructors,
+//! `$262.evalScript` and `Function.prototype.toString`'s source text, through
+//! the compile host the embedder installs.
 //!
 //! The core has no front end. The embedder installs a [`CompileFn`] that
 //! compiles and lowers source into a [`Compiler`], the part of the runtime a
@@ -67,7 +67,8 @@ impl<'a> Compiler<'a> {
         self.heap.handles().create(value)
     }
 
-    /// A new error object of `kind` with `message` and no backtrace.
+    /// A new error object of `kind` with `message` and an empty `stack`: an
+    /// error a host callback raises, with no JavaScript frame, as QuickJS's.
     pub fn new_error(&mut self, kind: ErrorKind, message: &str) -> Result<Value, HeapError> {
         let prototype = self.realm.intrinsic(kind.prototype());
         let message = self.heap.alloc_string(message)?;
@@ -86,7 +87,68 @@ impl<'a> Compiler<'a> {
                 crate::PropertyFlags::data(true, false, true),
                 Value::string(message),
             )?;
+            let empty = self.heap.intern("")?;
+            let stack = crate::runtime::Names::key(self.realm.names.stack);
+            self.heap.add_property(
+                object,
+                stack,
+                crate::PropertyFlags::data(true, false, true),
+                Value::string(empty),
+            )?;
             Ok(Value::object(object))
+        })();
+        self.heap.roots().truncate(mark);
+        result
+    }
+
+    /// [`Compiler::new_error`] located at `file:line:column` (a module's
+    /// compile error): `fileName`, `lineNumber`, `columnNumber`, and a
+    /// `stack` of the location alone.
+    pub fn new_located_error(
+        &mut self,
+        kind: ErrorKind,
+        message: &str,
+        file: &str,
+        line: u32,
+        column: u32,
+    ) -> Result<Value, HeapError> {
+        let error = self.new_error(kind, message)?;
+        let object = error.as_object().expect("an error object");
+        let names = self.realm.names;
+        let mark = self.heap.roots().mark();
+        self.heap.roots().push(error);
+        let result = (|| {
+            let flags = crate::PropertyFlags::data(true, false, true);
+            let stack_key = crate::runtime::Names::key(names.stack);
+            // `fileName`, `lineNumber` and `columnNumber` precede `stack`,
+            // as QuickJS's `build_backtrace` defines them: the stack is
+            // re-added after them.
+            self.heap.delete_property(object, stack_key)?;
+            let file_text = self.heap.alloc_string(file)?;
+            self.heap.add_property(
+                object,
+                crate::runtime::Names::key(names.file_name),
+                flags,
+                Value::string(file_text),
+            )?;
+            self.heap.add_property(
+                object,
+                crate::runtime::Names::key(names.line_number),
+                flags,
+                Value::int32(line as i32),
+            )?;
+            self.heap.add_property(
+                object,
+                crate::runtime::Names::key(names.column_number),
+                flags,
+                Value::int32(column as i32),
+            )?;
+            let stack = self
+                .heap
+                .alloc_string(&format!("    at {file}:{line}:{column}\n"))?;
+            self.heap
+                .add_property(object, stack_key, flags, Value::string(stack))?;
+            Ok(error)
         })();
         self.heap.roots().truncate(mark);
         result
@@ -172,7 +234,7 @@ impl<'a> Compiler<'a> {
 }
 
 impl Compiler<'_> {
-    /// A tagged template's frozen site object (section 5.2).
+    /// A tagged template's frozen site object.
     pub fn template_object(
         &mut self,
         cooked: &[Value],
@@ -338,7 +400,7 @@ fn run(cx: &mut Cx<'_>, source: &[u16], kind: CompileKind) -> Result<Value, Thro
     result
 }
 
-/// `%eval%(x)`: a direct eval runs as an indirect one (phase 0).
+/// `%eval%(x)`: a direct eval runs as an indirect one.
 pub(crate) fn eval(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let source = site.arg(cx, 0);
     let Some(string) = source.as_string() else {
@@ -414,6 +476,17 @@ pub(crate) fn function_constructor(
     Ok(function)
 }
 
+/// The unit flags of a bytecode function (its kind), or `None` for any
+/// other function.
+pub(crate) fn function_kind_flags(cx: &Cx<'_>, function: ObjectId) -> Option<u16> {
+    if cx.heap.object_kind(function) != crate::ObjectKind::Function {
+        return None;
+    }
+    let bytecode = cx.heap.function_bytecode(function)?;
+    let unit = cx.heap.bytecode_unit(bytecode);
+    Some(cx.code.get(unit).flags)
+}
+
 /// The source text of a bytecode function, if it was recorded.
 pub(crate) fn function_source(cx: &Cx<'_>, function: ObjectId) -> Option<Vec<u16>> {
     if cx.heap.object_kind(function) != crate::ObjectKind::Function {
@@ -422,12 +495,80 @@ pub(crate) fn function_source(cx: &Cx<'_>, function: ObjectId) -> Option<Vec<u16
     let bytecode = cx.heap.function_bytecode(function)?;
     let unit = cx.heap.bytecode_unit(bytecode);
     let source = cx.code.get(unit).source.as_ref()?;
-    Some(source.encode_utf16().collect())
+    Some(wtf8_units(source))
 }
 
-/// `$262.evalScript(source)`: the source as a separate script.
-/// qjs's `load(path)` (`oxide-run --std`): the file, run as a script.
+/// The UTF-16 units of source `bytes` as QuickJS's `JS_NewStringLen` reads
+/// them (`Function.prototype.toString` of a function's debug source): a
+/// surrogate's three-byte form gives the lone unit back, and an invalid
+/// sequence gives one U+FFFD, skipping its continuation bytes, the next
+/// byte and that byte's continuation bytes.
+fn wtf8_units(bytes: &[u8]) -> Vec<u16> {
+    let continuation = |byte: u8| (0x80..0xc0).contains(&byte);
+    let mut units = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let lead = bytes[index];
+        if lead < 0x80 {
+            units.push(u16::from(lead));
+            index += 1;
+            continue;
+        }
+        // QuickJS's `unicode_from_utf8`.
+        let (length, mask, minimum) = match lead {
+            0xc0..=0xdf => (1, 0x1f, 0x80),
+            0xe0..=0xef => (2, 0x0f, 0x800),
+            0xf0..=0xf7 => (3, 0x07, 0x1_0000),
+            0xf8..=0xfb => (4, 0x03, 0x20_0000),
+            0xfc..=0xfd => (5, 0x01, 0x400_0000),
+            _ => (0, 0, 0),
+        };
+        let decoded = (length > 0 && index + length < bytes.len())
+            .then(|| &bytes[index + 1..=index + length])
+            .filter(|tail| tail.iter().all(|&byte| continuation(byte)))
+            .map(|tail| {
+                tail.iter().fold(u32::from(lead & mask), |code, &byte| {
+                    code << 6 | u32::from(byte & 0x3f)
+                })
+            })
+            .filter(|&code| code >= minimum && code <= 0x10_ffff);
+        match decoded {
+            Some(code) if code >= 0x1_0000 => {
+                let code = code - 0x1_0000;
+                units.push(0xd800 | (code >> 10) as u16);
+                units.push(0xdc00 | (code & 0x3ff) as u16);
+                index += length + 1;
+            }
+            Some(code) => {
+                units.push(code as u16);
+                index += length + 1;
+            }
+            None => {
+                units.push(0xfffd);
+                while index < bytes.len() && continuation(bytes[index]) {
+                    index += 1;
+                }
+                if index < bytes.len() {
+                    index += 1;
+                    while index < bytes.len() && continuation(bytes[index]) {
+                        index += 1;
+                    }
+                }
+            }
+        }
+    }
+    units
+}
+
+/// `$262.evalScript(source)`: the source as a separate script. qjs's
+/// `load(path)` (`qjs --std`): the file, run as a script.
 pub(crate) fn load(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
+    load_script(cx, site).map(|_| Value::UNDEFINED)
+}
+
+/// qjs's `__loadScript(path)`: the file, run as a script; its completion
+/// value.
+pub(crate) fn load_script(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let path = site.arg(cx, 0);
     let path = ops::to_string(cx, path)?;
     let path = cx.heap.string_text(path.as_string().unwrap());
@@ -442,10 +583,10 @@ pub(crate) fn load(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let global = Value::object(cx.realm.global());
     let result = super::call(cx, Value::object(function), global, &[]);
     cx.heap.roots().truncate(mark);
-    result.map(|_| Value::UNDEFINED)
+    result
 }
 
-/// qjs's `read(path)` (`oxide-run --std`): the file's text.
+/// qjs's `read(path)` (`qjs --std`): the file's text.
 pub(crate) fn read(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let path = site.arg(cx, 0);
     let path = ops::to_string(cx, path)?;

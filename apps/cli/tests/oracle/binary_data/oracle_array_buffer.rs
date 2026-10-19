@@ -1,5 +1,5 @@
 use crate::runtime_observation::host_runtime_context;
-use quickjs_oxide::engine::api::Value;
+use quickjs_oxide::engine::api::core::Value;
 
 #[test]
 fn context_detach_array_buffer_uses_the_same_idempotent_core() {
@@ -21,5 +21,6 @@ fn context_detach_array_buffer_uses_the_same_idempotent_core() {
     else {
         panic!("detach observation was not a string");
     };
-    assert_eq!(observation.to_utf8_lossy(), "0|8|true|true");
+    // 25.1.6.4: a detached buffer's maxByteLength is 0.
+    assert_eq!(observation.to_utf8_lossy(), "0|0|true|true");
 }

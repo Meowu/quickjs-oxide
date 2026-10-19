@@ -1,6 +1,5 @@
-//! Async generators (phase 4, section 4.3): the request queue and the
-//! `AsyncGenerator*` abstract operations over the suspension of
-//! `vm::suspend`.
+//! Async generators: the request queue and the `AsyncGenerator*` abstract
+//! operations over the suspension of `vm::suspend`.
 //!
 //! The record's second slot is the queue: an object whose internal slots
 //! hold five values per request (kind, value, and the capability's promise,
@@ -23,9 +22,10 @@ const RETURN: i32 = 1;
 const THROW: i32 = 2;
 const REQUEST: usize = 5;
 
-/// Waiting for the value of a `return` request that reached a completed
-/// generator (`AsyncGeneratorAwaitReturn`).
-const AWAITING_RETURN: u8 = 6;
+/// The spec's `draining-queue`: the body has finished, and the queue's
+/// requests are being settled or a `return` request's value awaited
+/// (`AsyncGeneratorAwaitReturn`). Requests made meanwhile only queue.
+const DRAINING: u8 = 6;
 
 fn root(cx: &mut Cx<'_>, value: Value) {
     cx.heap.roots().push(value);
@@ -104,9 +104,10 @@ fn resume_with_request(cx: &mut Cx<'_>, generator: ObjectId) -> Result<(), Throw
 }
 
 /// What follows a run of the body: at a `yield`, the first request
-/// completes and the next one (if any) resumes it at once; on completion
-/// the first request completes and the queue drains; while it awaits,
-/// nothing.
+/// completes while the generator still counts as executing (requests made
+/// meanwhile only queue) and the next one (if any) resumes it at once
+/// (AsyncGeneratorYield); on completion the first request completes and
+/// the queue drains; while it awaits, nothing.
 fn after_run(
     cx: &mut Cx<'_>,
     generator: ObjectId,
@@ -116,14 +117,18 @@ fn after_run(
         YIELD => {
             let value = result?;
             root(cx, value);
-            complete_step(cx, generator, Ok(value), false)?;
-            if queue_len(cx, generator) > 0 {
-                return resume_with_request(cx, generator);
+            suspend::set_state(cx, generator, EXECUTING);
+            let settled = complete_step(cx, generator, Ok(value), false);
+            suspend::set_state(cx, generator, YIELD);
+            settled?;
+            if queue_len(cx, generator) == 0 {
+                return Ok(());
             }
-            Ok(())
+            resume_with_request(cx, generator)
         }
         EXECUTING => {
             suspend::complete(cx, generator);
+            suspend::set_state(cx, generator, DRAINING);
             complete_step(cx, generator, result, true)?;
             drain(cx, generator)
         }
@@ -131,20 +136,21 @@ fn after_run(
     }
 }
 
-/// `AsyncGeneratorDrainQueue`.
+/// `AsyncGeneratorDrainQueue`: settles the requests in order until the queue
+/// is empty (the generator is then completed) or a `return` request awaits.
 fn drain(cx: &mut Cx<'_>, generator: ObjectId) -> Result<(), Throw> {
-    while queue_len(cx, generator) > 0 {
+    loop {
+        if queue_len(cx, generator) == 0 {
+            suspend::set_state(cx, generator, COMPLETED);
+            return Ok(());
+        }
         let (kind, value) = first(cx, generator);
         match kind {
-            RETURN => {
-                suspend::set_state(cx, generator, AWAITING_RETURN);
-                return await_return(cx, generator, value);
-            }
+            RETURN => return await_return(cx, generator, value),
             THROW => complete_step(cx, generator, Err(Throw(value)), true)?,
             _ => complete_step(cx, generator, Ok(Value::UNDEFINED), true)?,
         }
     }
-    Ok(())
 }
 
 /// `AsyncGeneratorAwaitReturn`: awaits the value of the first (a `return`)
@@ -164,7 +170,6 @@ fn await_return(cx: &mut Cx<'_>, generator: ObjectId, value: Value) -> Result<()
             )
         }
         Err(throw) => {
-            suspend::set_state(cx, generator, COMPLETED);
             complete_step(cx, generator, Err(throw), true)?;
             drain(cx, generator)
         }
@@ -178,8 +183,7 @@ pub(crate) fn resume_await(
     generator: ObjectId,
     resumption: Resumption,
 ) -> Result<(), Throw> {
-    if suspend::state(cx, generator) == AWAITING_RETURN {
-        suspend::set_state(cx, generator, COMPLETED);
+    if suspend::state(cx, generator) == DRAINING {
         let outcome = match resumption {
             Resumption::Rejected(reason) => Err(Throw(reason)),
             Resumption::Fulfilled(value) => Ok(value),
@@ -203,7 +207,7 @@ fn request(cx: &mut Cx<'_>, site: CallSite, kind: i32) -> Result<Value, Throw> {
         .as_object()
         .filter(|&object| cx.heap.internal_tag(object) == InternalTag::AsyncGenerator)
     else {
-        let error = error::type_error(cx, "not an async generator");
+        let error = error::type_error(cx, "not an AsyncGenerator object");
         root(cx, error.0);
         super::call(cx, capability[2], Value::UNDEFINED, &[error.0])?;
         return Ok(capability[0]);
@@ -238,11 +242,11 @@ fn request(cx: &mut Cx<'_>, site: CallSite, kind: i32) -> Result<Value, Throw> {
     match state {
         START if kind == RETURN => {
             suspend::complete(cx, generator);
-            suspend::set_state(cx, generator, AWAITING_RETURN);
+            suspend::set_state(cx, generator, DRAINING);
             await_return(cx, generator, value)?;
         }
         COMPLETED if kind == RETURN => {
-            suspend::set_state(cx, generator, AWAITING_RETURN);
+            suspend::set_state(cx, generator, DRAINING);
             await_return(cx, generator, value)?;
         }
         START | YIELD if queue_len(cx, generator) == 1 => resume_with_request(cx, generator)?,

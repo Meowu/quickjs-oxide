@@ -1,5 +1,5 @@
-//! M3 and M4 acceptance: programs lowered from the compiler's stack code and
-//! run by the new core's loop.
+//! Programs lowered from the compiler's stack code and run by the core's
+//! loop.
 
 use std::path::Path;
 
@@ -10,13 +10,13 @@ use oxide_core::heap::gc::HeapLimits;
 use super::lower_script;
 use crate::engine::compiler::compile_unlinked_script;
 
-/// Runs `source` on the new core with `print` captured; an uncaught
+/// Runs `source` on the core with `print` captured; an uncaught
 /// exception appends `uncaught: <ToString>`.
-pub(crate) fn run_new_core(source: &str) -> String {
+pub(crate) fn run_on_core(source: &str) -> String {
     run_with(source, |_| {}).0
 }
 
-/// [`run_new_core`] on a runtime `setup` adjusted first; also returns the
+/// [`run_on_core`] on a runtime `setup` adjusted first; also returns the
 /// number of collections the run took.
 fn run_with(source: &str, setup: impl FnOnce(&mut Runtime)) -> (String, u64) {
     let script = compile_unlinked_script(source).expect("compiles");
@@ -45,78 +45,24 @@ fn run_with(source: &str, setup: impl FnOnce(&mut Runtime)) -> (String, u64) {
 
 #[test]
 fn smoke() {
-    assert_eq!(run_new_core("print(1 + 2)"), "3\n");
+    assert_eq!(run_on_core("print(1 + 2)"), "3\n");
     assert_eq!(
-        run_new_core("function f(a, b) { return a * b + 1; } print(f(6, 7), 'x')"),
+        run_on_core("function f(a, b) { return a * b + 1; } print(f(6, 7), 'x')"),
         "43 x\n"
     );
 }
 
-/// The current engine's qjs output, captured.
-#[derive(Debug, Default)]
-struct Captured(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
-
-impl crate::engine::host::HostServices for Captured {
-    fn write_output(&self, bytes: &[u8], _flush: bool) {
-        self.0.borrow_mut().extend_from_slice(bytes);
-    }
-
-    fn now_millis(&self) -> i64 {
-        0
-    }
-
-    fn timezone_offset_minutes(&self, _: i64) -> i32 {
-        0
-    }
-
-    fn random_seed(&self) -> u64 {
-        1
-    }
-}
-
-/// Runs `source` on the current engine with qjs's `print` (QuickJS's
-/// `JS_PrintValue`, as the new core's), reporting an uncaught exception the
-/// same way as [`run_new_core`].
-fn run_current_core(source: &str) -> String {
-    use crate::engine::api::{Runtime, Value};
-
-    let output = std::rc::Rc::default();
-    let runtime = Runtime::new_with_host_services(Captured(std::rc::Rc::clone(&output)));
-    let mut context = runtime.new_context().unwrap();
-    context.install_qjs_helpers_with_script_args(&[]).unwrap();
-    let mut uncaught = None;
-    if context.eval(source).is_err() {
-        let exception = context
-            .take_exception()
-            .unwrap()
-            .unwrap_or(Value::Undefined);
-        let Value::Object(report) = context
-            .eval("(function (e) { return String(e); })")
-            .unwrap()
-        else {
-            panic!("report is not a function");
-        };
-        let report = runtime.as_callable(&report).unwrap().unwrap();
-        if let Value::String(text) = context
-            .call(&report, Value::Undefined, &[exception])
-            .unwrap()
-        {
-            uncaught = Some(text.to_utf8_lossy());
-        }
-    }
-    while uncaught.is_none()
-        && runtime
-            .execute_pending_job()
-            .is_ok_and(|outcome| outcome.executed())
-    {}
-    let mut text = String::from_utf8_lossy(&output.borrow()).into_owned();
-    if let Some(uncaught) = uncaught {
-        text.push_str(&format!("uncaught: {uncaught}\n"));
-    }
-    text
-}
-
+/// The corpus's programs with the output each must print (`NAME.out` beside
+/// `NAME.js`); `builtins_number` prints the fewest digits of a power of two,
+/// as the specification says (QUICKJS-SPEC-036).
 pub(crate) fn corpus() -> Vec<(String, String)> {
+    corpus_with_outputs()
+        .into_iter()
+        .map(|(name, source, _)| (name, source))
+        .collect()
+}
+
+fn corpus_with_outputs() -> Vec<(String, String, String)> {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("core/tests/corpus");
     let mut files: Vec<_> = std::fs::read_dir(&directory)
         .unwrap()
@@ -128,21 +74,21 @@ pub(crate) fn corpus() -> Vec<(String, String)> {
         .into_iter()
         .map(|path| {
             let name = path.file_stem().unwrap().to_string_lossy().into_owned();
-            (name, std::fs::read_to_string(&path).unwrap())
+            let output = std::fs::read_to_string(path.with_extension("out")).unwrap();
+            (name, std::fs::read_to_string(&path).unwrap(), output)
         })
         .collect()
 }
 
-/// Every corpus program prints the same on both cores.
+/// Every corpus program prints its recorded output.
 #[test]
-fn corpus_matches_the_current_core() {
+fn corpus_prints_its_recorded_outputs() {
     let mut failures = Vec::new();
-    for (name, source) in corpus() {
-        let expected = run_current_core(&source);
-        let actual = run_new_core(&source);
+    for (name, source, expected) in corpus_with_outputs() {
+        let actual = run_on_core(&source);
         if expected != actual {
             failures.push(format!(
-                "==== {name}\n-- current core\n{expected}-- new core\n{actual}"
+                "==== {name}\n-- expected\n{expected}-- actual\n{actual}"
             ));
         }
     }
@@ -155,7 +101,7 @@ fn corpus_matches_the_current_core() {
 #[test]
 fn collection_under_200_frames_preserves_registers() {
     // Under the stress collector every allocation collects already.
-    let iterations = if cfg!(feature = "new-core-gc-stress") {
+    let iterations = if cfg!(feature = "gc-stress") {
         3
     } else {
         80000
@@ -178,7 +124,7 @@ fn collection_under_200_frames_preserves_registers() {
         let gc = runtime.heap_mut().gc_mut();
         gc.min_heap = 64 << 10;
         // `junk` stays live, so the trigger grows with it; a small factor
-        // keeps collections frequent above phase 4's larger startup heap.
+        // keeps collections frequent above the startup heap.
         gc.growth_factor = 1.25;
         runtime.heap_mut().collect();
     });
@@ -195,7 +141,7 @@ fn runtime_depth_after_run_is_zero() -> bool {
     runtime.vm_stack().depth() == 0
 }
 
-#[cfg(feature = "new-core-gc-stress")]
+#[cfg(feature = "gc-stress")]
 #[test]
 fn stress_mode_collects_at_every_allocation() {
     let (output, collections) = run_with("var o = {}; o.a = [1, 2]; print('x' + o.a);", |_| {});
@@ -203,12 +149,38 @@ fn stress_mode_collects_at_every_allocation() {
     assert!(collections >= 4, "only {collections} collections");
 }
 
-/// The fixed probes of section 9, at a smoke-test iteration count, print the
-/// same on both cores.
+/// What each fixed probe (`docs/performance/probes/fixed`) prints with
+/// `print(work(37…`.
+const FIXED_PROBE_OUTPUTS: &[(&str, &str)] = &[
+    ("argument_move", "36\n"),
+    ("array_read", "91\n"),
+    ("array_write", "138\n"),
+    ("bigint_256", "true\n"),
+    ("bigint_32", "true\n"),
+    ("bigint_64", "true\n"),
+    ("call0", "37\n"),
+    ("empty_loop", "37\n"),
+    ("local_move", "72\n"),
+    ("local_read", "41\n"),
+    ("local_read_with_setup", "41\n"),
+    ("number_owner_fallback", "37\n"),
+    ("numeric_coercion_loop", "37\n"),
+    ("numeric_local_loop", "37\n"),
+    ("object_move", "2\n"),
+    ("prop_read", "111\n"),
+    ("prop_write", "36\n"),
+    ("string_bridge", "37\n"),
+    ("tdz", "37\n"),
+    ("type_error", "37\n"),
+];
+
+/// The fixed probes, at a smoke-test iteration count, print their recorded
+/// outputs.
 #[test]
-fn fixed_probes_match_the_current_core() {
+fn fixed_probes_print_their_recorded_outputs() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/performance/probes/fixed");
     let mut failures = Vec::new();
+    let mut seen = 0;
     for entry in std::fs::read_dir(&directory).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|extension| extension != "js") {
@@ -219,17 +191,25 @@ fn fixed_probes_match_the_current_core() {
         let call = source.rfind("print(work(").expect("a work call") + "print(work(".len();
         let end = call + source[call..].find([',', ')']).unwrap();
         let source = format!("{}37{}", &source[..call], &source[end..]);
-        let (expected, actual) = (run_current_core(&source), run_new_core(&source));
+        let name = path.file_stem().unwrap().to_string_lossy();
+        let expected = FIXED_PROBE_OUTPUTS
+            .iter()
+            .find(|(probe, _)| *probe == name)
+            .unwrap_or_else(|| panic!("{name} has no recorded output"))
+            .1;
+        seen += 1;
+        let actual = run_on_core(&source);
         if expected != actual {
             failures.push(format!("{}: {expected:?} != {actual:?}", path.display()));
         }
     }
+    assert_eq!(seen, FIXED_PROBE_OUTPUTS.len());
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Opcodes no compiled program lowers to: the wide shuttles (no function
-/// needs more than 256 registers yet), stack-code forms the current compiler
-/// never emits (tail calls, `return_undef`, the fused `typeof`/nullish tests,
+/// Opcodes no compiled program lowers to: the wide shuttles (locals and
+/// temporaries past the window live in spill slots), stack-code forms the
+/// compiler never emits (tail calls, `return_undef`, the fused `typeof`/nullish tests,
 /// a field-form `delete`), and `JUndefinedOrNull`, which fuses only the
 /// for-of iterator-close pattern. `core/tests/vm.rs` runs each of them from
 /// built units.
@@ -246,13 +226,12 @@ const NOT_EMITTED: &[Opcode] = &[
     Opcode::TypeOfIsFunction,
     Opcode::DeleteField,
     Opcode::JUndefinedOrNull,
-    // Emitted only for a direct `eval` call, which the current core runs.
+    // Not emitted: a direct `eval` call lowers as a call of `eval`, which runs
+    // as indirect eval.
     Opcode::ThrowInternal,
-    // `new.target` is a register from phase 4 (section 4.5); the opcode
-    // remains for built units.
+    // `new.target` is a register; the opcode remains for built units.
     Opcode::LoadNewTarget,
-    // Class constructors and methods with `super`: the corpus gains them
-    // with classes (M3).
+    // Class constructors and methods with `super`.
     Opcode::CheckCtor,
     Opcode::LoadHomeObject,
     // Accessors in literals lower through `DefineMethod` with the getter
@@ -260,15 +239,15 @@ const NOT_EMITTED: &[Opcode] = &[
     Opcode::DefineGetter,
     Opcode::DefineSetter,
     // A reference read through a prepared global reference, emitted only
-    // in a function that also calls `eval` directly (M7).
+    // in a function that also calls `eval` directly.
     Opcode::GetRef,
     // `import()` needs the module host, which the corpus's scripts run
-    // without; Test262's dynamic-import tests run it (phase 4, section 5.6).
+    // without; Test262's dynamic-import tests run it.
     Opcode::ImportCall,
 ];
 
 /// The corpus and probes lower to every opcode the lowering can emit, so the
-/// two-core comparison runs each of them at least once.
+/// comparison with the recorded outputs runs each of them at least once.
 #[test]
 fn corpus_covers_every_emitted_opcode() {
     let mut seen = std::collections::HashSet::new();
@@ -288,27 +267,22 @@ fn corpus_covers_every_emitted_opcode() {
     assert!(missing.is_empty(), "not covered: {missing:?}");
 }
 
-/// Measurement hook for `docs/performance/probes/new-core/phase2.py`: runs
-/// the file `PROBE_FILE` on the core `PROBE_CORE` (`new` or `current`) and
-/// prints its output. Ignored in ordinary runs.
+/// Measurement hook for `docs/performance/probes/slopes/instruction_slopes.py`:
+/// runs the file `PROBE_FILE` and prints its output. Ignored in ordinary runs.
 #[test]
 #[ignore = "measurement hook"]
 fn run_probe_file() {
     let path = std::env::var("PROBE_FILE").expect("PROBE_FILE");
     let source = std::fs::read_to_string(path).unwrap();
-    let output = match std::env::var("PROBE_CORE").as_deref() {
-        Ok("current") => run_current_core(&source),
-        _ => run_new_core(&source),
-    };
-    print!("{output}");
+    print!("{}", run_on_core(&source));
 }
 
-/// Measurement hook for M6 (section 11): lowers every function of every
+/// Measurement hook: lowers every function of every
 /// `.js` file in `CENSUS_DIR` on its own and prints, per file, the
 /// functions lowered, every reason a function was declined, and the
 /// functions whose register count (`1 + params + locals + max depth`)
 /// exceeds the 256-register window. With `CENSUS_TEST262` (a Test262
-/// checkout's `test` directory, phase 4 section 8) it walks the tree
+/// checkout's `test` directory) it walks the tree
 /// instead and prints the totals: files, functions, and each decline with
 /// its count. Ignored in ordinary runs.
 #[test]
@@ -475,11 +449,10 @@ fn test262_census(directory: &Path) {
         let census = if flags.contains("module") {
             let name =
                 crate::engine::value::JsString::try_from_utf8(&path.to_string_lossy()).unwrap();
-            crate::engine::compiler::compile_unlinked_module_bytes_with_name_and_attribute_checker(
+            crate::engine::compiler::compile_unlinked_module_bytes_with_name(
                 source.as_bytes(),
                 name,
                 crate::engine::code::debug::DebugInfoMode::Full,
-                None,
             )
             .ok()
             .map(|module| census(module.function()))

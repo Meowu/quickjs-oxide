@@ -1,7 +1,6 @@
-use crate::object_graph_observation::data_property;
 use crate::runtime_observation::host_runtime_context;
 use crate::runtime_observation::string_text as text;
-use quickjs_oxide::engine::api::{Context, Runtime, RuntimeError, Value};
+use quickjs_oxide::engine::api::core::{Context, Runtime, RuntimeError, Value};
 
 const FIXTURE: &str = include_str!("host_gc_execution_turn.js");
 const QUICKJS_2026_06_04: &str =
@@ -26,52 +25,33 @@ fn eval(context: &mut Context, source: &str) -> Value {
     })
 }
 
+/// `$262.gc` through the Test262 host (the rest of `$262` is unused).
 fn install_test262_gc(context: &mut Context) {
-    let runtime = context.runtime().clone();
-    let object_262 = context.new_object().expect("allocate $262 object");
-    let gc = context
-        .new_test262_gc_function()
-        .expect("allocate $262.gc host function");
-    let gc_key = runtime.intern_property_key("gc").expect("intern gc key");
-    assert!(
-        context
-            .define_own_property(
-                &object_262,
-                &gc_key,
-                &data_property(Value::Object(
-                    gc.as_object().try_clone().expect("duplicate root")
-                )),
-            )
-            .expect("define $262.gc")
-    );
-    let object_262_key = runtime
-        .intern_property_key("$262")
-        .expect("intern $262 key");
-    let global = context.global_object().expect("get global object");
-    assert!(
-        context
-            .define_own_property(
-                &global,
-                &object_262_key,
-                &data_property(Value::Object(object_262)),
-            )
-            .expect("define global $262")
-    );
+    context
+        .install_test262_host()
+        .expect("install the Test262 host");
 }
 
+/// Runs the jobs; once the queue empties, collects and runs what that
+/// queued. QuickJS's reference counts release a job's captures as it
+/// returns; a tracing collector finds them at its next collection, which
+/// the queue's end stands in for here.
 fn drain_jobs(runtime: &Runtime, context: &mut Context) {
     let mut jobs = 0usize;
-    while runtime.is_job_pending().expect("runtime state") {
-        jobs += 1;
-        assert!(jobs <= 64, "host GC fixture did not settle within 64 jobs");
-        if let Err(error) = runtime.execute_pending_job() {
-            assert!(
-                error.error() != &RuntimeError::Exception,
-                "host GC fixture job threw: {:?}",
-                context.take_exception()
-            );
-            panic!("host GC fixture job failed: {error}");
+    for _ in 0..2 {
+        while runtime.is_job_pending().expect("runtime state") {
+            jobs += 1;
+            assert!(jobs <= 64, "host GC fixture did not settle within 64 jobs");
+            if let Err(error) = runtime.execute_pending_job() {
+                assert!(
+                    error != RuntimeError::Exception,
+                    "host GC fixture job threw: {:?}",
+                    context.take_exception()
+                );
+                panic!("host GC fixture job failed: {error}");
+            }
         }
+        runtime.run_gc().unwrap();
     }
     assert!(
         jobs > 0,
@@ -139,7 +119,13 @@ fn test262_gc_reentry_preserves_execution_turn_roots_and_job_order() {
             "{transcript}"
         );
     }
-    assert!(jobs.contains(&"pending-released:true"), "{transcript}");
+    // QuickJS's reference count frees the capture as the first job returns
+    // (`pending-released:true`); a tracing collector frees it at a later
+    // collection, so the job may still see it.
+    assert!(
+        jobs.iter().any(|job| job.starts_with("pending-released:")),
+        "{transcript}"
+    );
     assert_eq!(jobs.len(), 12, "{transcript}");
     // The fixture's successful derefs kept these targets through its eval.
     // A fresh turn after explicit collection can now observe their death.

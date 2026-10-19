@@ -1,6 +1,5 @@
-//! The register machine (new-core phase 2, section 4): the register file and
-//! frame table, the main loop, its slow paths, exception unwinding and the
-//! leaf-native ABI.
+//! The register machine: the register file and frame table, the main loop, its
+//! slow paths, exception unwinding and the leaf-native ABI.
 //!
 //! A frame owns a window of the register file: register 0 is `this`, then
 //! the parameters, the locals and the operand temporaries of its code unit. A
@@ -28,9 +27,9 @@ pub(crate) mod property;
 pub(crate) mod proxy;
 pub(crate) mod suspend;
 pub(crate) mod typed;
+pub(crate) mod via;
 pub(crate) mod waiter;
-// Not called yet: `Number.prototype.toString` and the parsers land with the
-// phase 3 builtins. Public for the root crate's differential test.
+// Public for the root crate's differential test.
 #[doc(hidden)]
 pub mod radix;
 pub mod regexp;
@@ -62,6 +61,13 @@ pub mod frame_flags {
     pub const CONSTRUCT: u8 = 1 << 1;
     /// Entered by a tail call: its result is also its caller's result.
     pub const TAIL: u8 = 1 << 2;
+    /// Called through `Function.prototype.call` (the loop's rewrite): QuickJS
+    /// lists `at call (native)` after its backtrace line.
+    pub const VIA_CALL: u8 = 1 << 3;
+    /// Called through `Function.prototype.apply`, likewise.
+    pub const VIA_APPLY: u8 = 1 << 4;
+    /// Called through a chain of them: `ViaCalls::frames` lists it.
+    pub const VIA_CHAIN: u8 = 1 << 5;
 }
 
 /// One activation. `return_pc` and `return_dst` belong to the caller: where
@@ -94,6 +100,19 @@ pub const NATIVE_STACK_BUDGET: usize = 1 << 20;
 /// stack overflow`: 8 MiB of values.
 pub const DEFAULT_STACK_LIMIT: u32 = 1 << 20;
 
+/// The `pc` of a [`NativeSite`] made by a call from Rust: the caller's
+/// instruction is not known there.
+pub(crate) const NO_PC: u32 = u32::MAX;
+
+/// A native call made by the loop, or from Rust (`pc` [`NO_PC`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeSite {
+    /// The frame count when it was made: the caller is `frames[depth - 1]`.
+    pub depth: u32,
+    pub pc: u32,
+    pub callee: Value,
+}
+
 /// The register file and the frame table.
 pub struct VmStack {
     pub(crate) registers: Vec<Value>,
@@ -121,10 +140,30 @@ pub struct VmStack {
     pub(crate) native_depth: u32,
     /// The frame count and instruction index of the call running the
     /// current native, for the backtrace of an error it creates.
-    pub(crate) native_site: (u32, u32),
-    /// The suspendable activations running, innermost last (phase 4,
-    /// section 4.3): where `Yield` and `Await` save their frame.
+    /// The native calls in progress, innermost last: the frame count and
+    /// instruction index of each call and the native it runs, for the
+    /// backtrace's `at name (native)` lines and the positions of the frames
+    /// that called them.
+    pub(crate) natives: Vec<NativeSite>,
+    /// The next native called from Rust is listed in no backtrace: an
+    /// iterator's `next` stepped by [`call_next`].
+    pub(crate) frameless_native: bool,
+    /// The last error whose backtrace has frames it could not place (the
+    /// innermost frame when the loop itself threw; a frame that called into
+    /// Rust, which re-entered the loop): per frame, its depth and its line
+    /// of the backtrace. Each loop the throw unwinds through places its own.
+    pub(crate) unpositioned: Option<(ObjectId, Vec<(u32, u32)>)>,
+    /// The suspendable activations running, innermost last: where `Yield` and
+    /// `Await` save their frame.
     pub(crate) active: Vec<ObjectId>,
+    /// Whether the last proxy `[[Set]]` or `[[DefineOwnProperty]]` that
+    /// returned false was refused by a trap rather than by the target it
+    /// forwarded to: QuickJS throws `proxy: cannot set property` or `proxy:
+    /// defineProperty exception` only for the former.
+    pub(crate) proxy_refused: bool,
+    /// The bookkeeping of rewritten `call`s and `apply`s, boxed to keep the
+    /// loop's hot fields where they were.
+    pub(crate) via: Box<via::ViaCalls>,
 }
 
 impl Default for VmStack {
@@ -139,8 +178,12 @@ impl Default for VmStack {
             native_base: 0,
             native_budget: NATIVE_STACK_BUDGET,
             native_depth: u32::MAX,
-            native_site: (u32::MAX, 0),
+            natives: Vec::new(),
+            frameless_native: false,
+            via: Box::default(),
+            unpositioned: None,
             active: Vec::new(),
+            proxy_refused: false,
         }
     }
 }
@@ -187,6 +230,17 @@ impl VmStack {
         true
     }
 
+    /// The native stack bytes nested re-entries may still use.
+    pub(crate) fn native_remaining(&self) -> usize {
+        if self.nesting == 0 {
+            return self.native_budget;
+        }
+        let marker = 0u8;
+        let here = std::ptr::addr_of!(marker) as usize;
+        self.native_budget
+            .saturating_sub(self.native_base.abs_diff(here))
+    }
+
     #[inline]
     pub(crate) fn leave_native(&mut self) {
         self.nesting -= 1;
@@ -214,7 +268,7 @@ pub enum Output {
 /// stream, the symbol registry, and the embedder's [`Host`](crate::host::Host).
 pub struct Services {
     pub output: Output,
-    /// The embedder's hooks (phase 4, section 6.3).
+    /// The embedder's hooks.
     pub(crate) hooks: Box<dyn crate::host::Host>,
     /// `Math.random`'s xorshift64* state; never zero.
     random_state: u64,
@@ -223,9 +277,9 @@ pub struct Services {
     pub(crate) symbol_registry: crate::heap::hash::FxHashMap<Vec<u16>, crate::SymbolId>,
     /// Whether `Atomics.wait` may block this agent.
     pub can_block: bool,
-    /// The embedder's compiler (section 6.3).
+    /// The embedder's compiler.
     pub(crate) compile: Option<compile::CompileFn>,
-    /// The embedder's module loader (section 6.3).
+    /// The embedder's module loader.
     pub(crate) module_host: Option<module::ModuleHost>,
     /// The module records by normalized name.
     pub(crate) modules: crate::heap::hash::FxHashMap<String, ObjectId>,
@@ -330,6 +384,16 @@ pub(crate) fn call(
     cx.heap.vm.top = end as u32;
     let result = interp::call_from_rust(cx, function, base, args.len());
     cx.heap.vm.top = saved_top;
+    result
+}
+
+/// [`call`] of an iterator's `next` with no arguments, as QuickJS's
+/// `JS_IteratorNext2` makes it: a native `next` runs without a stack frame
+/// of its own (QuickJS calls its `iterator_next` C functions directly).
+pub(crate) fn call_next(cx: &mut Cx<'_>, next: Value, iterator: Value) -> Result<Value, Throw> {
+    cx.heap.vm.frameless_native = true;
+    let result = call(cx, next, iterator, &[]);
+    cx.heap.vm.frameless_native = false;
     result
 }
 

@@ -1,8 +1,8 @@
-//! `JSON` (phase 4, section 6.1 row 6): `parse` with a reviver and the
-//! JSON.parse source text access proposal's `context.source`, `stringify`,
-//! and `rawJSON`/`isRawJSON`. The parser reports QuickJS's messages; the
-//! serializer is the spec's `SerializeJSONProperty` over the internal
-//! methods, so proxies, getters and `toJSON` are observed in spec order.
+//! `JSON`: `parse` with a reviver and the JSON.parse source text access
+//! proposal's `context.source`, `stringify`, and `rawJSON`/`isRawJSON`. The
+//! parser reports QuickJS's messages; the serializer is the spec's
+//! `SerializeJSONProperty` over the internal methods, so proxies, getters and
+//! `toJSON` are observed in spec order.
 
 use super::{Native, define, methods, to_string_tag};
 use crate::ErrorKind;
@@ -70,14 +70,14 @@ impl Record {
         let Record::Object { entries, .. } = self else {
             return None;
         };
-        // QuickJS hashes a record from its ninth member on, after which a
-        // duplicate key finds the newest entry rather than the first.
-        let mut matching = entries.iter().filter(|(name, _)| *name == key);
-        if entries.len() >= 9 {
-            matching.next_back().map(|(_, record)| record)
-        } else {
-            matching.next().map(|(_, record)| record)
-        }
+        // Of duplicate names the last one's record, whose value the object
+        // keeps (QuickJS finds the first one's in records of up to eight
+        // members).
+        entries
+            .iter()
+            .rev()
+            .find(|(name, _)| *name == key)
+            .map(|(_, record)| record)
     }
 }
 
@@ -106,6 +106,11 @@ struct Parser<'a> {
     /// quotes, identifier keys, trailing commas, `+`, `.5`, hexadecimal,
     /// octal and binary numbers, `NaN` and `Infinity`.
     extended: bool,
+    /// Units standing for invalid UTF-8 of a module's bytes, sorted.
+    invalid: &'a [u32],
+    /// Units QuickJS's byte columns do not count, sorted: among the
+    /// invalid ones, the stray continuation bytes.
+    no_column: &'a [u32],
 }
 
 fn heap_failure(cx: &mut Cx<'_>, error: HeapError) -> Failure {
@@ -185,6 +190,41 @@ impl Parser<'_> {
                 && (unit == 0x2b || (unit == 0x2e && self.peek_at(1).is_some_and(is_digit))))
     }
 
+    fn is_invalid(&self, at: usize) -> bool {
+        !self.invalid.is_empty() && self.invalid.binary_search(&(at as u32)).is_ok()
+    }
+
+    /// Whether the unit at `at` stands for a stray continuation byte.
+    fn is_continuation(&self, at: usize) -> bool {
+        self.is_invalid(at) && self.no_column.binary_search(&(at as u32)).is_ok()
+    }
+
+    /// QuickJS's `Unexpected token '%c'` of the first byte at `at` (or the
+    /// end), read back by `JS_NewString`: a NUL ends the text, any other
+    /// non-ASCII byte is U+FFFD, and a stray continuation byte swallows the
+    /// closing quote.
+    fn unexpected_token<T>(&self, at: usize) -> Parsed<T> {
+        let message = match self.units.get(at) {
+            None | Some(0) => "Unexpected token '".to_owned(),
+            Some(_) if self.is_continuation(at) => "Unexpected token '\u{fffd}".to_owned(),
+            Some(&unit) if unit < 0x80 && !self.is_invalid(at) => {
+                format!("Unexpected token '{}'", unit as u8 as char)
+            }
+            Some(_) => "Unexpected token '\u{fffd}'".to_owned(),
+        };
+        Err(Failure::Syntax(message, self.cursor))
+    }
+
+    /// An error at unit `at` rather than at the cursor.
+    fn syntax_at<T>(&self, message: &str, at: usize) -> Parsed<T> {
+        Err(Failure::Syntax(message.to_owned(), at))
+    }
+
+    /// QuickJS's byte-level parser meets invalid UTF-8 here.
+    fn bad_utf8<T>(&self, at: usize) -> Parsed<T> {
+        Err(Failure::Syntax("Bad UTF-8 sequence".to_owned(), at))
+    }
+
     fn syntax<T>(&self, message: &str) -> Parsed<T> {
         Err(Failure::Syntax(message.to_owned(), self.cursor))
     }
@@ -204,9 +244,18 @@ impl Parser<'_> {
             return self.syntax("Unexpected end of JSON input");
         };
         let start = self.cursor;
+        // `json_next_token` rejects any byte past ASCII in token context.
+        if self.is_invalid(start) {
+            return self.syntax("unexpected character");
+        }
+        // QuickJS's budget runs out at a value nested this deep, a leaf
+        // included (an empty innermost container is one value shallower).
+        if depth > MAX_DEPTH {
+            return self.syntax("stack overflow");
+        }
         let value = match unit {
             0x7b | 0x5b => {
-                if depth > MAX_DEPTH || !cx.heap.vm.enter_native() {
+                if !cx.heap.vm.enter_native() {
                     return self.syntax("stack overflow");
                 }
                 let result = if unit == 0x7b {
@@ -270,6 +319,9 @@ impl Parser<'_> {
         if !self.eat(b'}') {
             loop {
                 self.skip_space()?;
+                if self.is_invalid(self.cursor) {
+                    return self.syntax("unexpected character");
+                }
                 let name = match self.peek() {
                     Some(0x22) => self.string()?,
                     Some(0x27) if self.extended => self.string()?,
@@ -281,7 +333,7 @@ impl Parser<'_> {
                         self.units[start..self.cursor].to_vec()
                     }
                     Some(unit) if unit >= 0x80 => return self.syntax("unexpected character"),
-                    None => return self.syntax("Unexpected end of JSON input"),
+                    None => return self.syntax("expecting property name"),
                     _ => return self.syntax("expecting property name"),
                 };
                 let key = cx
@@ -361,10 +413,16 @@ impl Parser<'_> {
             let Some(unit) = self.peek() else {
                 return self.syntax("Unexpected end of JSON input");
             };
+            if self.is_invalid(self.cursor) {
+                return self.bad_utf8(self.cursor);
+            }
             self.cursor += 1;
             match unit {
                 _ if unit == separator => return Ok(output),
-                0x00..=0x1f => return self.syntax("Bad control character in string literal"),
+                0x00..=0x1f => {
+                    return self
+                        .syntax_at("Bad control character in string literal", self.cursor - 1);
+                }
                 0x5c => {
                     let Some(escaped) = self.peek() else {
                         return self.syntax("Unexpected end of JSON input");
@@ -391,7 +449,7 @@ impl Parser<'_> {
                             }
                             value
                         }
-                        _ => return self.syntax("Bad escaped character"),
+                        _ => return self.syntax_at("Bad escaped character", self.cursor - 1),
                     });
                 }
                 _ => output.push(unit),
@@ -432,13 +490,7 @@ impl Parser<'_> {
                 self.cursor += 2;
                 let digit = |unit: u16| hex_value(unit).filter(|&d| u32::from(d) < radix);
                 if self.peek().and_then(digit).is_none() {
-                    return match self.peek() {
-                        None => self.syntax("Unexpected token '"),
-                        Some(unit) => {
-                            let unit = char::from_u32(u32::from(unit)).unwrap_or('\u{fffd}');
-                            self.syntax(&format!("Unexpected token '{unit}'"))
-                        }
-                    };
+                    return self.unexpected_token(self.cursor);
                 }
                 let mut value = 0.0f64;
                 while let Some(d) = self.peek().and_then(digit) {
@@ -455,7 +507,7 @@ impl Parser<'_> {
             }
         }
         match self.peek() {
-            None => return self.syntax("Unexpected end of JSON input"),
+            None => return self.syntax("Unexpected token '"),
             Some(0x30) => {
                 self.cursor += 1;
                 if self.peek().is_some_and(is_digit) {
@@ -463,10 +515,7 @@ impl Parser<'_> {
                 }
             }
             Some(0x31..=0x39) => self.digits(),
-            Some(unit) => {
-                let unit = char::from_u32(u32::from(unit)).unwrap_or('\u{fffd}');
-                return self.syntax(&format!("Unexpected token '{unit}'"));
-            }
+            Some(_) => return self.unexpected_token(self.cursor),
         }
         if self.peek() == Some(0x2e) {
             self.digits_after_point()?;
@@ -544,12 +593,15 @@ fn parse_text(
     records: bool,
     file: Option<&str>,
     extended: bool,
+    invalid: &[u32],
 ) -> Result<(Value, Option<Record>), Throw> {
     let mut parser = Parser {
         units,
         cursor: 0,
         records,
         extended,
+        invalid,
+        no_column: &[],
     };
     match parser.document(cx) {
         Ok(parsed) => Ok(parsed),
@@ -558,7 +610,12 @@ fn parse_text(
                 let (line, column) = position(units, at);
                 error::throw_at(cx, ErrorKind::Syntax, &message, file, line, column)
             }
-            None => error::throw(cx, ErrorKind::Syntax, &message),
+            // `JSON.parse` locates its error in `<input>`, the running
+            // frames after it, as QuickJS's does.
+            None => {
+                let (line, column) = position(units, at);
+                error::throw_located(cx, ErrorKind::Syntax, &message, "<input>", line, column)
+            }
         }),
         Err(Failure::Throw(throw)) => Err(throw),
     }
@@ -575,14 +632,48 @@ fn position(units: &[u16], at: usize) -> (u32, u32) {
     (line as u32, (before.len() - start) as u32 + 1)
 }
 
-/// The value of a JSON module `file` of UTF-16 text.
-pub(crate) fn json_parse_text(cx: &mut Cx<'_>, units: &[u16], file: &str) -> Result<Value, Throw> {
-    parse_text(cx, units, false, Some(file), false).map(|(value, _)| value)
+/// The value of a JSON module `file` (`extended`: a JSON5 module, QuickJS's
+/// extended JSON); `invalid` marks the units of invalid UTF-8.
+pub(crate) fn json_module_text(
+    cx: &mut Cx<'_>,
+    text: &crate::vm::module::JsonText,
+    file: &str,
+    extended: bool,
+) -> Result<Value, Throw> {
+    let mut parser = Parser {
+        units: &text.units,
+        cursor: 0,
+        records: false,
+        extended,
+        invalid: &text.invalid,
+        no_column: &text.no_column,
+    };
+    match parser.document(cx) {
+        Ok((value, _)) => Ok(value),
+        Err(Failure::Syntax(message, at)) => {
+            let (line, column) = position_skipping(&text.units, at, &text.no_column);
+            Err(error::throw_at(
+                cx,
+                ErrorKind::Syntax,
+                &message,
+                file,
+                line,
+                column,
+            ))
+        }
+        Err(Failure::Throw(throw)) => Err(throw),
+    }
 }
 
-/// The value of a JSON5 module `file` (QuickJS's extended JSON).
-pub(crate) fn json5_parse_text(cx: &mut Cx<'_>, units: &[u16], file: &str) -> Result<Value, Throw> {
-    parse_text(cx, units, false, Some(file), true).map(|(value, _)| value)
+/// [`position`] where the units of `no_column` add no column.
+fn position_skipping(units: &[u16], at: usize, no_column: &[u32]) -> (u32, u32) {
+    let (line, column) = position(units, at);
+    let line_start = at + 1 - column as usize;
+    let skipped = no_column
+        .iter()
+        .filter(|&&index| (line_start..at).contains(&(index as usize)))
+        .count();
+    (line, column - skipped as u32)
 }
 
 /// `JSON.parse(text, reviver)`.
@@ -592,7 +683,7 @@ pub(super) fn parse(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let units = ops::units(cx.heap, text.as_string().unwrap());
     let reviver = site.arg(cx, 1);
     let revive = ops::is_callable(cx.heap, reviver);
-    let (value, record) = parse_text(cx, &units, revive, None, false)?;
+    let (value, record) = parse_text(cx, &units, revive, None, false, &[])?;
     if !revive {
         return Ok(value);
     }
@@ -607,6 +698,7 @@ pub(super) fn parse(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let mut reviving = Reviving {
         units: &units,
         reviver,
+        depth: 0,
     };
     reviving.internalize(cx, root, empty, record.as_ref())
 }
@@ -614,7 +706,14 @@ pub(super) fn parse(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
 struct Reviving<'a> {
     units: &'a [u16],
     reviver: Value,
+    /// Nested `InternalizeJSONProperty` calls.
+    depth: usize,
 }
+
+/// The most nested `InternalizeJSONProperty` calls: the holder's, then one
+/// per value, as deep as QuickJS 2026-06-04's `internalize_json_property`
+/// recursion reaches within its stack budget (3,630 nested arrays).
+const MAX_REVIVER_DEPTH: usize = 3_631;
 
 impl Reviving<'_> {
     /// `InternalizeJSONProperty(holder, name, reviver)` with the parse
@@ -627,13 +726,15 @@ impl Reviving<'_> {
         name: PropertyKey,
         record: Option<&Record>,
     ) -> Result<Value, Throw> {
-        if !cx.heap.vm.enter_native() {
+        if self.depth >= MAX_REVIVER_DEPTH || !cx.heap.vm.enter_native() {
             return Err(error::stack_overflow(cx));
         }
+        self.depth += 1;
         let mark = cx.heap.roots().mark();
         let result = self.internalize_rooted(cx, holder, name, record);
         cx.heap.roots().truncate(mark);
         cx.heap.vm.leave_native();
+        self.depth -= 1;
         result
     }
 
@@ -725,7 +826,7 @@ pub(super) fn raw_json(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> 
     let boundary = |unit: u16| matches!(unit, 0x61..=0x7a | 0x30..=0x39 | 0x2d | 0x22);
     let valid = units.first().is_some_and(|&unit| boundary(unit))
         && units.last().is_some_and(|&unit| boundary(unit))
-        && parse_text(cx, &units, false, None, false).is_ok();
+        && parse_text(cx, &units, false, None, false, &[]).is_ok();
     if !valid {
         return Err(error::throw(
             cx,
@@ -775,8 +876,32 @@ struct Serializer {
     keys: Option<Vec<PropertyKey>>,
     gap: Vec<u16>,
     indent: Vec<u16>,
-    stack: Vec<ObjectId>,
+    /// The containers being serialized, for the cycle check.
+    stack: crate::heap::hash::FxHashSet<ObjectId>,
     out: Vec<u16>,
+}
+
+/// What `SerializeJSONProperty` found before serializing a value.
+enum Prepared {
+    /// Written out (`true`), or not serializable (`false`).
+    Done(bool),
+    /// An object or array, still to write; the root stack keeps it from
+    /// the mark.
+    Container(ObjectId, bool),
+}
+
+/// A container being written: its members are serialized one at a time
+/// on this explicit stack, so deep nesting uses no host stack.
+struct Level {
+    object: ObjectId,
+    /// The keys of an object; `None` for an array.
+    keys: Option<Vec<PropertyKey>>,
+    /// An array's length.
+    length: u64,
+    next: u64,
+    any: bool,
+    stepback: usize,
+    mark: crate::RootMark,
 }
 
 /// `JSON.stringify(value, replacer, space)`.
@@ -788,7 +913,7 @@ pub(super) fn stringify(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw>
         keys: None,
         gap: Vec::new(),
         indent: Vec::new(),
-        stack: Vec::new(),
+        stack: Default::default(),
         out: Vec::new(),
     };
     if ops::is_callable(cx.heap, replacer) {
@@ -874,7 +999,8 @@ impl Serializer {
     }
 
     /// `SerializeJSONProperty(key, holder)`; false when the value is not
-    /// serializable (undefined, a symbol, a function).
+    /// serializable (undefined, a symbol, a function). Nested containers are
+    /// walked on an explicit stack of [`Level`]s.
     fn property(
         &mut self,
         cx: &mut Cx<'_>,
@@ -882,17 +1008,94 @@ impl Serializer {
         key: PropertyKey,
     ) -> Result<bool, Throw> {
         let mark = cx.heap.roots().mark();
-        let result = self.property_rooted(cx, holder, key);
+        let result = self.serialize(cx, holder, key, mark);
         cx.heap.roots().truncate(mark);
+        self.stack.clear();
         result
     }
 
-    fn property_rooted(
+    fn serialize(
         &mut self,
         cx: &mut Cx<'_>,
         holder: ObjectId,
         key: PropertyKey,
+        mark: crate::RootMark,
     ) -> Result<bool, Throw> {
+        let mut levels: Vec<Level> = Vec::new();
+        match self.prepare(cx, holder, key)? {
+            Prepared::Done(serialized) => return Ok(serialized),
+            Prepared::Container(object, is_array) => {
+                levels.push(self.open(cx, object, is_array, mark)?);
+            }
+        }
+        while let Some(level) = levels.last_mut() {
+            let object = level.object;
+            let member = match &level.keys {
+                Some(keys) => keys.get(level.next as usize).copied(),
+                None if level.next < level.length => {
+                    Some(internal::number_key(cx, level.next as f64)?)
+                }
+                None => None,
+            };
+            let Some(member) = member else {
+                let level = levels.pop().expect("a level");
+                self.close(cx, &level);
+                continue;
+            };
+            let level = levels.last_mut().expect("a level");
+            let is_object = level.keys.is_some();
+            let rollback = self.out.len();
+            if is_object {
+                if level.any {
+                    self.out.push(0x2c);
+                }
+            } else if level.next > 0 {
+                self.out.push(0x2c);
+            }
+            level.next += 1;
+            self.separator();
+            if is_object {
+                let name = super::object::key_string(cx, member)?;
+                let units = ops::units(cx.heap, name.as_string().unwrap());
+                quote(&mut self.out, &units);
+                self.out.push(0x3a);
+                if !self.gap.is_empty() {
+                    self.out.push(0x20);
+                }
+            }
+            let child_mark = cx.heap.roots().mark();
+            match self.prepare(cx, object, member)? {
+                Prepared::Done(serialized) => {
+                    cx.heap.roots().truncate(child_mark);
+                    let level = levels.last_mut().expect("a level");
+                    if is_object {
+                        if serialized {
+                            level.any = true;
+                        } else {
+                            self.out.truncate(rollback);
+                        }
+                    } else if !serialized {
+                        self.text("null");
+                    }
+                }
+                Prepared::Container(child, is_array) => {
+                    levels.last_mut().expect("a level").any = true;
+                    let level = self.open(cx, child, is_array, child_mark)?;
+                    levels.push(level);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// The part of `SerializeJSONProperty` before a container's members:
+    /// `toJSON`, the replacer, unwrapping and primitives.
+    fn prepare(
+        &mut self,
+        cx: &mut Cx<'_>,
+        holder: ObjectId,
+        key: PropertyKey,
+    ) -> Result<Prepared, Throw> {
         let mut value = internal::get(cx, holder, key, Value::object(holder))?;
         cx.heap.roots().push(value);
         if matches!(value.kind(), Kind::Object | Kind::BigInt) {
@@ -927,7 +1130,7 @@ impl Serializer {
                     let raw = ops::to_string(cx, raw)?;
                     let units = ops::units(cx.heap, raw.as_string().unwrap());
                     self.out.extend(units);
-                    return Ok(true);
+                    return Ok(Prepared::Done(true));
                 }
                 _ => {}
             }
@@ -964,22 +1167,56 @@ impl Serializer {
                 if self.stack.contains(&object) {
                     return Err(error::type_error(cx, "circular reference"));
                 }
-                if !cx.heap.vm.enter_native() {
-                    return Err(error::stack_overflow(cx));
-                }
-                self.stack.push(object);
-                let result = if internal::is_array(cx, value)? {
-                    self.array(cx, object)
-                } else {
-                    self.object(cx, object)
-                };
-                self.stack.pop();
-                cx.heap.vm.leave_native();
-                result?;
+                let is_array = internal::is_array(cx, value)?;
+                return Ok(Prepared::Container(object, is_array));
             }
-            _ => return Ok(false),
+            _ => return Ok(Prepared::Done(false)),
         }
-        Ok(true)
+        Ok(Prepared::Done(true))
+    }
+
+    /// Starts writing a container: its opening bracket, keys or length.
+    fn open(
+        &mut self,
+        cx: &mut Cx<'_>,
+        object: ObjectId,
+        is_array: bool,
+        mark: crate::RootMark,
+    ) -> Result<Level, Throw> {
+        self.stack.insert(object);
+        let stepback = self.indent.len();
+        self.indent.extend_from_slice(&self.gap.clone());
+        let (keys, length) = if is_array {
+            (None, internal::length_of_array_like(cx, object)?)
+        } else {
+            let keys = match &self.keys {
+                Some(keys) => keys.clone(),
+                None => internal::enumerable_own_keys(cx, object)?,
+            };
+            (Some(keys), 0)
+        };
+        self.out.push(if is_array { 0x5b } else { 0x7b });
+        Ok(Level {
+            object,
+            keys,
+            length,
+            next: 0,
+            any: false,
+            stepback,
+            mark,
+        })
+    }
+
+    /// Ends a container: the closing bracket after its last member.
+    fn close(&mut self, cx: &mut Cx<'_>, level: &Level) {
+        self.indent.truncate(level.stepback);
+        let is_array = level.keys.is_none();
+        if (is_array && level.length > 0) || (!is_array && level.any) {
+            self.separator();
+        }
+        self.out.push(if is_array { 0x5d } else { 0x7d });
+        self.stack.remove(&level.object);
+        cx.heap.roots().truncate(level.mark);
     }
 
     /// The line break and indentation before a member, with a gap.
@@ -988,67 +1225,6 @@ impl Serializer {
             self.out.push(0x0a);
             self.out.extend_from_slice(&self.indent);
         }
-    }
-
-    fn object(&mut self, cx: &mut Cx<'_>, object: ObjectId) -> Result<(), Throw> {
-        let stepback = self.indent.len();
-        self.indent.extend_from_slice(&self.gap.clone());
-        let keys = match &self.keys {
-            Some(keys) => keys.clone(),
-            None => internal::enumerable_own_keys(cx, object)?,
-        };
-        self.out.push(0x7b);
-        let mut any = false;
-        for key in keys {
-            let rollback = self.out.len();
-            if any {
-                self.out.push(0x2c);
-            }
-            self.separator();
-            let name = super::object::key_string(cx, key)?;
-            let units = ops::units(cx.heap, name.as_string().unwrap());
-            quote(&mut self.out, &units);
-            self.out.push(0x3a);
-            if !self.gap.is_empty() {
-                self.out.push(0x20);
-            }
-            if self.property(cx, object, key)? {
-                any = true;
-            } else {
-                self.out.truncate(rollback);
-            }
-        }
-        self.indent.truncate(stepback);
-        if any {
-            self.separator();
-        }
-        self.out.push(0x7d);
-        Ok(())
-    }
-
-    fn array(&mut self, cx: &mut Cx<'_>, array: ObjectId) -> Result<(), Throw> {
-        let stepback = self.indent.len();
-        self.indent.extend_from_slice(&self.gap.clone());
-        let length = internal::length_of_array_like(cx, array)?;
-        self.out.push(0x5b);
-        let mut index = 0u64;
-        while index < length {
-            if index > 0 {
-                self.out.push(0x2c);
-            }
-            self.separator();
-            let key = internal::number_key(cx, index as f64)?;
-            if !self.property(cx, array, key)? {
-                self.text("null");
-            }
-            index += 1;
-        }
-        self.indent.truncate(stepback);
-        if length > 0 {
-            self.separator();
-        }
-        self.out.push(0x5d);
-        Ok(())
     }
 }
 

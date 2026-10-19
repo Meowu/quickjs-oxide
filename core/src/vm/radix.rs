@@ -1,9 +1,7 @@
-//! `Number.prototype.toString(radix)`, `parseInt` and `parseFloat` (phase 3,
-//! section 6.2), ported from the current engine's `value/number/format.rs`
-//! and `value/number_parse.rs` with their QuickJS-exact rules: the FREE
-//! formatter keeps the shortest digits that round-trip after rounding to
-//! nearest, ties to even, and the parsers keep only QuickJS's
-//! `atod_max_digits` significant digits.
+//! `Number.prototype.toString(radix)`, `parseInt` and `parseFloat`, with
+//! QuickJS-exact rules: the FREE formatter keeps the shortest digits that
+//! round-trip after rounding to nearest, ties to even, and the parsers keep
+//! only QuickJS's `atod_max_digits` significant digits.
 //!
 //! The common cases stay on plain machine arithmetic: a power-of-two radix
 //! prints the binary digits exactly, an integer below 2^53 prints from a
@@ -301,22 +299,42 @@ fn free_big(value: f64, radix: u32) -> String {
 /// is the rounding QuickJS applies at each digit count, so the walk down
 /// from 17 digits is a format and a parse per count. Returns the digits
 /// (trailing zeros removed) and the decimal point's position.
+///
+/// Where the nearest stops round-tripping, a sequence of that count may
+/// still at a power of two: below one the rounding interval is half the
+/// one above, so the neighbor above can hit where the nearest misses
+/// (QuickJS stops there: `2**-24` prints 17 digits, 16 round-trip).
+/// `Number::toString` takes the fewest digits that round-trip (6.1.6.1.20
+/// step 5), which Rust's shortest formatting gives; QuickJS's choice stands
+/// when it is as short. Elsewhere the interval is symmetric, so the
+/// farther neighbor misses whenever the nearest does.
 fn decimal_sequence(value: f64) -> (String, i32) {
-    let mut best: Option<(String, i32)> = None;
-    let mut digits = DTOA_MAX_DIGITS[8];
-    loop {
-        let text = format!("{:.*e}", (digits - 1) as usize, value);
-        if best.is_some() && text.parse::<f64>() != Ok(value) {
-            break;
-        }
+    let power_of_two = value.to_bits() & ((1 << 52) - 1) == 0;
+    let split = |text: &str| {
         let (mantissa, exponent) = text.split_once('e').expect("an exponent");
         let exponent: i32 = exponent.parse().expect("a decimal exponent");
         let mut kept: String = mantissa.chars().filter(|c| *c != '.').collect();
         while kept.len() > 1 && kept.ends_with('0') {
             kept.pop();
         }
-        digits = kept.len() as i32;
-        best = Some((kept, exponent + 1));
+        (kept, exponent + 1)
+    };
+    let mut best: Option<(String, i32)> = None;
+    let mut digits = DTOA_MAX_DIGITS[8];
+    loop {
+        let text = format!("{:.*e}", (digits - 1) as usize, value);
+        if best.is_some() && text.parse::<f64>() != Ok(value) {
+            if power_of_two {
+                let shortest = split(&format!("{value:e}"));
+                if shortest.0.len() as i32 <= digits {
+                    best = Some(shortest);
+                }
+            }
+            break;
+        }
+        let sequence = split(&text);
+        digits = sequence.0.len() as i32;
+        best = Some(sequence);
         if digits == 1 {
             break;
         }
@@ -725,7 +743,7 @@ fn digit_value(unit: u16) -> Option<u32> {
     }
 }
 
-// ---- toFixed, toExponential, toPrecision (phase 4, section 6.1 row 5) ----
+// ---- toFixed, toExponential, toPrecision ----
 
 /// The largest digit count `toFixed`, `toExponential` and `toPrecision`
 /// accept.
@@ -1015,19 +1033,20 @@ mod tests {
     }
 
     #[test]
-    fn decimal_keeps_quickjs_rules_where_rust_formatting_differs() {
-        // QuickJS rounds the exact value to nearest-even at each digit
-        // count, so it keeps one more digit at some powers of two (whose
-        // round-trip interval is asymmetric) and rounds an exact digit tie
-        // to even, where Rust's shortest formatting does not;
-        // `number::to_string` takes this path for them.
-        for (value, quickjs) in [
-            (2f64.powi(-1017), "7.1202363472230444e-307"),
+    fn decimal_takes_the_fewest_digits_and_quickjs_ties() {
+        // At some powers of two (whose round-trip interval is asymmetric)
+        // QuickJS keeps one more digit than the fewest that round-trip,
+        // which 6.1.6.1.20 step 5 requires (QuickJS prints
+        // 7.1202363472230444e-307); an exact digit tie still rounds to
+        // even as in QuickJS, where Rust's shortest formatting does not.
+        for (value, expected) in [
+            (2f64.powi(-1017), "7.120236347223045e-307"),
+            (2f64.powi(-24), "5.960464477539063e-8"),
             // 192181864906432.125 exactly.
             (f64::from_bits(0x42e5_d93a_7947_d804), "192181864906432.12"),
         ] {
-            assert_eq!(to_string_radix(value, 10), quickjs);
-            assert_eq!(super::super::number::to_string(value), quickjs);
+            assert_eq!(to_string_radix(value, 10), expected);
+            assert_eq!(super::super::number::to_string(value), expected);
         }
     }
 

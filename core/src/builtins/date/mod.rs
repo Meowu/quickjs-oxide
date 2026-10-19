@@ -1,8 +1,7 @@
-//! `Date` (phase 4, section 6.1 row 6): the constructor and its statics
-//! (`now`, `parse`, `UTC`), and `Date.prototype` with the Annex B `getYear`,
-//! `setYear` and `toGMTString`. The calendar, formatting and parsing kernels
-//! are the old engine's, which follow QuickJS 2026-06-04; the clock and the
-//! time zone come from the host (section 6.3).
+//! `Date`: the constructor and its statics (`now`, `parse`, `UTC`), and
+//! `Date.prototype` with the Annex B `getYear`, `setYear` and `toGMTString`.
+//! The calendar, formatting and parsing kernels follow QuickJS 2026-06-04; the
+//! clock and the time zone come from the host.
 
 mod calendar;
 mod format;
@@ -12,7 +11,9 @@ use self::calendar::{DateFields, DateInputFields, get_date_fields, set_date_fiel
 use self::calendar::{set_date_fields_checked, time_clip};
 use self::format::format_date_string;
 use self::parse::{ParsedDateString, parse_date_string};
-use super::{Native, define, install_constructor, methods, string_text, symbol_method};
+use super::{
+    Native, define, install_constructor, link_constructor, methods, string_text, symbol_method,
+};
 use crate::heap::HeapError;
 use crate::heap::object::{InternalTag, ObjectKind};
 use crate::runtime::Intrinsic;
@@ -49,7 +50,7 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     let object_prototype = cx.realm.intrinsic(Intrinsic::ObjectPrototype);
     let prototype = super::plain_object(cx, Some(object_prototype), 48)?;
     cx.set_intrinsic(Intrinsic::DatePrototype, prototype);
-    let date = install_constructor(cx, Native::DateConstructor, prototype)?;
+    let date = install_constructor(cx, Native::DateConstructor)?;
     cx.set_intrinsic(Intrinsic::Date, date);
     methods(
         cx,
@@ -128,7 +129,8 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
             Native::DateSetUtcFullYear,
             Native::DateToJson,
         ],
-    )
+    )?;
+    link_constructor(cx, date, prototype)
 }
 
 // ---- the host clock and time zone ----
@@ -165,7 +167,9 @@ fn parsed_date_value(cx: &mut Cx<'_>, parsed: Option<ParsedDateString>) -> f64 {
         *target = f64::from(source);
     }
     let value = set_date_fields(&fields, parsed.is_local, tz(cx));
-    value - f64::from(parsed.fields[8]) * MS_PER_MINUTE
+    // The offset can carry a time past the range: clip after applying it
+    // (QuickJS checks the range before).
+    time_clip(value - f64::from(parsed.fields[8]) * MS_PER_MINUTE)
 }
 
 fn parse_value(cx: &mut Cx<'_>, string: Value) -> f64 {
@@ -422,12 +426,12 @@ pub(super) fn set_time(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> 
     Ok(store(cx, object, time_clip(value)))
 }
 
-/// Annex B `setYear`: years 0 to 99 mean 1900 to 1999.
+/// Annex B `setYear` (B.2.3.2): years 0 to 99 mean 1900 to 1999. The time
+/// value is read before the year converts (QuickJS reads it after).
 pub(super) fn set_year(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
-    let (object, _) = this_time(cx, &site)?;
+    let (object, current) = this_time(cx, &site)?;
     let argument = site.arg(cx, 0);
     let mut year = ops::to_number(cx, argument)?;
-    let current = date_value(cx, Value::object(object)).unwrap_or(f64::NAN);
     if year.is_finite() {
         year = year.trunc();
         if (0.0..100.0).contains(&year) {
@@ -454,7 +458,9 @@ pub(super) fn to_primitive(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Thr
     };
     let hint = site.arg(cx, 0);
     let hint = match hint.as_string().map(|hint| cx.heap.string_text(hint)) {
-        Some(text) if text == "number" || text == "integer" => ops::Hint::Number,
+        // Only the three hints of step 5 (QuickJS also takes its internal
+        // "integer").
+        Some(text) if text == "number" => ops::Hint::Number,
         Some(text) if text == "string" || text == "default" => ops::Hint::String,
         _ => return Err(error::type_error(cx, "invalid hint")),
     };
@@ -477,5 +483,10 @@ pub(super) fn to_json(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
         .heap
         .property_key("toISOString")
         .map_err(|error| error::heap_error(cx, error))?;
-    internal::invoke(cx, Value::object(object), key, &[])
+    let method = internal::get_property(cx, object, key)?;
+    if !ops::is_callable(cx.heap, method) {
+        return Err(error::type_error(cx, "object needs toISOString method"));
+    }
+    cx.heap.roots().push(method);
+    crate::vm::call(cx, method, Value::object(object), &[])
 }

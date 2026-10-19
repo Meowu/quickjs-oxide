@@ -94,56 +94,48 @@ fn compiler_lowers_spread_calls_to_quickjs_apply_abis() {
 }
 
 #[test]
-#[cfg_attr(
-    feature = "dropped-features-probe",
-    ignore = "phase 4, section 7.2: asserts a behavior the new core drops"
-)]
-fn runtime_executes_call_method_construct_and_direct_eval_spread() {
+fn runtime_executes_call_method_and_construct_spread() {
     assert_eq!(
         evaluate_in_context(
             r#"
             function list() { return Array.prototype.join.call(arguments, ","); }
             var object = { value: 7, add: function (amount) { return this.value + amount; } };
             function C(a, b) { this.value = a + b; }
-            function direct() { let value = 1; eval(...["value = 42", "ignored"]); return value; }
             [
                 list(0, ...[1, 2], 3, ...[], 4,),
                 object.add(...[5]),
-                new C(...[20, 22]).value,
-                direct()
+                new C(...[20, 22]).value
             ].join("|")
             "#,
         ),
-        Value::String(JsString::from_static("0,1,2,3,4|12|42|42"))
+        Value::String(JsString::from_static("0,1,2,3,4|12|42"))
     );
 }
 
 #[test]
-fn runtime_append_preserves_quickjs_double_probe_and_fast_array_copy() {
+fn runtime_append_reads_the_iterator_method_once() {
+    // ArgumentListEvaluation's GetIterator: one `@@iterator` read
+    // (QuickJS reads it twice, QUICKJS-SPEC-014).
     assert_eq!(
         evaluate_in_context(
             r#"
             (function () {
                 var reads = 0;
-                var captured;
                 var source = [1, 2];
                 Object.defineProperty(source, Symbol.iterator, {
                     get: function () {
                         reads++;
                         if (reads === 1) return Array.prototype.values;
-                        return function () {
-                            captured = [9].values();
-                            return captured;
-                        };
+                        return function () { return [9].values(); };
                     }
                 });
                 function list() { return Array.prototype.join.call(arguments, ","); }
                 var copied = list(...source);
-                return copied + "|" + reads + "|" + captured.next().value;
+                return copied + "|" + reads;
             })()
             "#,
         ),
-        Value::String(JsString::from_static("1,2|2|9"))
+        Value::String(JsString::from_static("1,2|1"))
     );
 }
 

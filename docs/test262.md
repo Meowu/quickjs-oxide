@@ -10,20 +10,20 @@ pinned in [`compat/upstream.toml`](../compat/upstream.toml) and mirrored by
 <!-- current-test262-metrics:start -->
 Metrics are reported in this order:
 
-1. **QuickJS-scope pass:** 81,445 / 83,562 (97.467%). The denominator is
+1. **QuickJS-scope pass:** 81,441 / 83,562 (97.462%). The denominator is
    every variant the pinned QuickJS `test262.conf` runs; it excludes the
    18,475 `skipped-*` variants that QuickJS itself skips.
-2. **Full pass:** 81,445 / 102,037 (79.819%). Every frozen Test262 variant is in
+2. **Full pass:** 81,441 / 102,037 (79.815%). Every frozen Test262 variant is in
    the denominator.
 3. **Eligible coverage:** 83,354 / 102,037 (81.690%). This measures how much of
    the full vector the current profile admits to execution.
-4. **Runnable pass quality:** 81,445 / 83,354 (97.710%). This diagnoses
+4. **Runnable pass quality:** 81,441 / 83,354 (97.705%). This diagnoses
    admitted behavior and complements the coverage metrics above.
 
 The frozen outcome summary is:
 
 ```text
-fail-async=16 fail-async-done-count=53 fail-parse=324 fail-runtime=1516 pass=81445 skipped-config-exclude=6700 skipped-feature=11775 unsupported-module=121 unsupported-negative-provenance=87
+fail-async=16 fail-async-done-count=53 fail-parse=324 fail-runtime=1520 pass=81441 skipped-config-exclude=6700 skipped-feature=11775 unsupported-module=121 unsupported-negative-provenance=87
 ```
 <!-- current-test262-metrics:end -->
 
@@ -56,18 +56,27 @@ the frozen `full_*_body_sha256` hashes; the scheduled `test262-full` job and the
 
 ## The dropped variants
 
-The runner has one backend, the new core (`oxide-core`, #122), since new-core
-phase 6 M2. `current.conf` holds the receipts the new core froze in phase 4,
-moved unchanged, and the frozen dropped-variant list
-[`new-core-dropped-variants.tsv`](../dev-support/test262/new-core-dropped-variants.tsv)
-is part of the metric's definition: the D = 1,897 variants that passed on the
-previous engine and fail with the five behaviors phase 0 dropped (`with`,
-direct `eval`, realms, `Symbol.species`, unscopables). They fail by decision,
-recorded as the `NEWCORE-*` entries of the [deviation ledger](deviations.md);
-31 of them pass anyway (phase 4 M9's reconciliation). The previous engine
-passed 83,304 of the 83,562 QuickJS-scope variants; the new core passes
-81,445, at least 83,304 − D, and every variant the previous engine passed and
-the new core fails is in D.
+The runner `run-test262` (`conformance/test262`) has one backend, the engine
+through `api::core`'s Test262 host. The frozen dropped-variant list
+[`dropped-variants.tsv`](../dev-support/test262/dropped-variants.tsv)
+is part of the metric's definition: it names, with a reason each, the D =
+1,897 variants that pass with the five features of the `TARGET-*` entries of
+the [deviation ledger](deviations.md) and fail without them:
+
+| Reason | Ledger entry | Variants |
+| --- | --- | ---: |
+| `species` | `TARGET-SPECIES-001` | 528 |
+| `direct-eval` | `TARGET-DIRECT-EVAL-001` | 517 |
+| `realm` | `TARGET-REALMS-001` | 488 |
+| `with` | `TARGET-WITH-001` | 311 |
+| `unscopables` | `TARGET-UNSCOPABLES-001` | 53 |
+
+These variants fail by decision. 27 of them pass anyway (negative `with` tests
+whose expected early error the front end gives either way); the other 1,870
+are among the 1,913 failures above. Every other failing variant is one that
+QuickJS 2026-06-04 also fails, as its `test262_errors.txt` lists; a failure
+outside both is a defect. `current.conf` authenticates the list by its line
+count, hash and `dropped_variants_count`.
 
 ## Promotion
 

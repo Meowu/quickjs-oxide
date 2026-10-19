@@ -15,7 +15,7 @@
 //! validity cell and the list of prototype objects that inherit from it. Any
 //! change to a prototype object clears its cell and, through the dependents
 //! lists, every cell downstream. A shape caches its prototype's cell; the
-//! phase 3 prototype IC records `(holder, slot, cell)` and tests one boolean.
+//! prototype IC records `(holder, slot, cell)` and tests one boolean.
 
 use std::cell::OnceCell;
 use std::fmt;
@@ -267,6 +267,28 @@ impl Dictionary {
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    /// Moves the present keys of `front` to the start of the insertion
+    /// order, in that order; the rest keep their relative order. Slots are
+    /// unchanged.
+    fn reorder(&mut self, front: &[PropertyKey]) {
+        let mut entries = Vec::with_capacity(self.map.len());
+        for &key in front {
+            if let Some(&index) = self.map.get(&key) {
+                entries.push(self.entries[index as usize]);
+            }
+        }
+        for entry in &self.entries {
+            if entry.slot != NONE && !front.contains(&entry.key) {
+                entries.push(*entry);
+            }
+        }
+        self.map.clear();
+        for (index, entry) in entries.iter().enumerate() {
+            self.map.insert(entry.key, index as u32);
+        }
+        self.entries = entries;
     }
 }
 
@@ -717,9 +739,9 @@ impl Heap {
         Ok(())
     }
 
-    /// Bumps the global generation (phase 3, section 2.4) when `object` is the
-    /// global object: an insert, remove or reflag of its dictionary moves a
-    /// slot or a flag that a global cache entry may hold.
+    /// Bumps the global generation when `object` is the global object: an
+    /// insert, remove or reflag of its dictionary moves a slot or a flag that a
+    /// global cache entry may hold.
     #[inline]
     fn dictionary_changed(&mut self, object: ObjectId) {
         if self.objects.get(object.0).kind == ObjectKind::GlobalObject {
@@ -752,6 +774,23 @@ impl Heap {
         header.shape = shape;
         header.flags |= flags::DICTIONARY;
         Ok(())
+    }
+
+    /// Moves the own properties `front` names to the start of a dictionary
+    /// object's key order, in that order (realm setup: the global object's
+    /// order is QuickJS's, not the install order). Values keep their slots.
+    pub fn reorder_dictionary(&mut self, object: ObjectId, front: &[PropertyKey]) {
+        let header = *self.objects.get(object.0);
+        debug_assert!(header.has(flags::DICTIONARY), "a dictionary object");
+        if let Some(dictionary) = self
+            .shapes
+            .get_mut(header.shape.0)
+            .dictionary
+            .as_deref_mut()
+        {
+            dictionary.reorder(front);
+            self.dictionary_changed(object);
+        }
     }
 
     /// Deletes an own property; returns whether it existed. The object enters
@@ -1087,9 +1126,9 @@ impl Heap {
 
     /// The cell guarding the chain that starts at `prototype`: valid until
     /// `prototype` or any object above it changes. It is the cell
-    /// [`Heap::validity_cell`] gives an object whose prototype is
-    /// `prototype`; the string-receiver cache (phase 3, section 2.2) uses it
-    /// for `%String.prototype%`, which no object inherits from.
+    /// [`Heap::validity_cell`] gives an object whose prototype is `prototype`;
+    /// the string-receiver cache uses it for `%String.prototype%`, which no
+    /// object inherits from.
     pub fn chain_cell(&mut self, prototype: ObjectId) -> Result<ValidityCellId, HeapError> {
         self.chain_cell_keeping(prototype, Value::UNDEFINED)
     }

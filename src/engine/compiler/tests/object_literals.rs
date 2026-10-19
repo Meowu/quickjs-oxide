@@ -376,10 +376,6 @@ fn object_literal_arrow_super_relays_lexical_this_and_home_object() {
 }
 
 #[test]
-#[cfg_attr(
-    feature = "dropped-features-probe",
-    ignore = "phase 4, section 7.2: asserts a behavior the new core drops"
-)]
 fn object_literal_direct_eval_super_relays_authenticated_home_object() {
     let script = compile_unlinked_script(
         "({method(){return eval('super.value')},get read(){return eval('super.value')},set write(value){eval('super.value=value')},arrow(){return()=>eval('super.value')}})",
@@ -523,60 +519,6 @@ fn object_literal_direct_eval_super_relays_authenticated_home_object() {
     assert!(!cutoff_ordinary.metadata().super_call_allowed);
     assert!(!cutoff_ordinary.eval_environments()[0].super_allowed);
     assert!(!cutoff_ordinary.eval_environments()[0].super_call_allowed);
-
-    assert_eq!(
-        evaluate_in_context(
-            r#"
-                (function () {
-                    var proto = {
-                        get value() { return this.base + 2; },
-                        set value(input) { this.base = input - 2; },
-                        call() { return this.base + 2; }
-                    };
-                    var home = {
-                        __proto__: proto,
-                        base: 40,
-                        method() { return eval("super.value"); },
-                        get read() { return eval("super.value"); },
-                        set write(value) { eval("super.value = value"); },
-                        arrow() { return (() => eval("super.call()"))(); },
-                        escaped() { return eval("() => super.value"); },
-                        nested() { return eval("eval('super.value')"); },
-                        cutoff() {
-                            super.value;
-                            return function ordinary() { return eval("super.value"); };
-                        },
-                        indirect() { return (0, eval)("super.value"); },
-                        superCall() { return eval("super(sideEffect = true)"); }
-                    };
-                    var initial = home.method();
-                    var getter = home.read;
-                    home.write = 44;
-                    var setter = home.base;
-                    var arrow = home.arrow();
-                    var receiver = { base: 40 };
-                    var escaped = home.escaped.call(receiver)();
-                    var nested = home.nested.call(receiver);
-                    var cutoff;
-                    try { home.cutoff()(); } catch (error) { cutoff = error.name; }
-                    var globalEval;
-                    try { eval("super.value"); } catch (error) { globalEval = error.name; }
-                    var indirect;
-                    try { home.indirect(); } catch (error) { indirect = error.name; }
-                    var sideEffect = false;
-                    var superCall;
-                    try { home.superCall(); } catch (error) { superCall = error.name; }
-                    return [
-                        initial, getter, setter, arrow, escaped, nested,
-                        cutoff, globalEval, indirect, superCall, sideEffect
-                    ].join("|");
-                })()
-            "#,
-        ),
-        Value::String(JsString::from_static(
-            "42|42|42|44|42|42|SyntaxError|SyntaxError|SyntaxError|SyntaxError|false"
-        ))
-    );
 }
 
 #[test]
@@ -694,7 +636,7 @@ fn object_literal_grammar_is_fail_closed_at_remaining_method_frontiers() {
 }
 
 #[test]
-fn object_literal_runtime_preserves_descriptors_proto_names_and_pinned_spread() {
+fn object_literal_runtime_preserves_descriptors_proto_names_and_spread() {
     assert_eq!(
         evaluate_in_context(
             "(function(){var x=3;var o={2:'two',a:1,x,a:4};var d=Object.getOwnPropertyDescriptor(o,'a');return o[2]+'|'+o.x+'|'+o.a+'|'+d.writable+'|'+d.enumerable+'|'+d.configurable})()"
@@ -711,6 +653,8 @@ fn object_literal_runtime_preserves_descriptors_proto_names_and_pinned_spread() 
         evaluate_in_context(
             "(function(){var s=Symbol('key');var a={[s]:function(){},plain:function(){}};return a[s].name+'|'+a.plain.name+'|'+Object.hasOwn({...\"ab\"},'0')})()"
         ),
-        Value::String(JsString::from_static("[key]|plain|false"))
+        // CopyDataProperties converts a primitive source: `{..."ab"}` has
+        // `0` and `1` (QUICKJS-SPEC-037).
+        Value::String(JsString::from_static("[key]|plain|true"))
     );
 }

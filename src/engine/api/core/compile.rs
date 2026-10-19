@@ -1,5 +1,5 @@
-//! The front end and the lowering as the core's compile host (phase 4,
-//! section 6.3): scripts, `eval` code and modules are compiled by the
+//! The front end and the lowering as the core's compile host:
+//! scripts, `eval` code and modules are compiled by the
 //! shared front end and lowered to register code in the running runtime.
 
 use oxide_core::vm::compile::{CompileError, CompileKind, CompileRequest, Compiler};
@@ -165,27 +165,18 @@ pub(crate) fn compile_module(
     };
     let module_name = crate::engine::value::JsString::try_from_utf8(name)
         .map_err(|error| failure(oxide_core::ErrorKind::Internal, error.to_string()))?;
-    let module =
-        crate::engine::compiler::compile_unlinked_module_bytes_with_name_and_attribute_checker(
-            source,
-            module_name,
-            debug_info,
-            None,
-        )
-        .map_err(|error| match error {
-            crate::engine::compiler::ModuleCompileFailure::Engine(error) => {
-                ModuleCompileError::Front(error)
-            }
-            crate::engine::compiler::ModuleCompileFailure::Host => failure(
-                oxide_core::ErrorKind::Type,
-                "import attribute rejected".into(),
-            ),
-        })?;
+    let module = crate::engine::compiler::compile_unlinked_module_bytes_with_name(
+        source,
+        module_name,
+        debug_info,
+    )
+    .map_err(ModuleCompileError::Front)?;
     crate::engine::compiler::register::lower_module_tree_into(compiler, &module)
         .map_err(|error| ModuleCompileError::Core(lower_compile_error(error)))
 }
 
 /// `$262.agent.start`'s runner: an agent's script and then its jobs.
+#[cfg(feature = "test262-host")]
 pub(crate) fn run_agent_script(
     runtime: &mut oxide_core::Runtime,
     source: &str,

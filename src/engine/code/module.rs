@@ -3,8 +3,9 @@
 //! QuickJS keeps a `JSModuleDef` beside the compiled module function.  This
 //! module is the Rust ownership boundary for the same information: parsing
 //! produces request/import/export tables whose local binding indices point at
-//! authenticated closure slots on the module root function.  Runtime
-//! publication consumes the complete draft transactionally.
+//! authenticated closure slots on the module root function. The register
+//! lowering (`lower_module_tree_into`) reads the whole draft and turns it into
+//! the core's module source.
 
 use crate::engine::code::function::UnlinkedFunction;
 use crate::engine::value::JsString;
@@ -164,7 +165,6 @@ pub struct ModuleStarExport {
 /// Mutable compiler output which has not entered a runtime domain yet.
 #[derive(Debug)]
 pub struct UnlinkedModule {
-    name: JsString,
     function: UnlinkedFunction,
     has_top_level_await: bool,
     declaration_order: Box<[u16]>,
@@ -176,7 +176,7 @@ pub struct UnlinkedModule {
     star_exports: Box<[ModuleStarExport]>,
 }
 
-/// Compiler-owned module tables published as one sealed aggregate.
+/// Compiler-owned module tables, sealed into one [`UnlinkedModule`].
 pub struct UnlinkedModuleTables {
     pub declaration_order: Vec<u16>,
     pub link_initializers: Vec<ModuleLinkInitializer>,
@@ -187,21 +187,9 @@ pub struct UnlinkedModuleTables {
     pub star_exports: Vec<ModuleStarExport>,
 }
 
-/// Owned pieces crossing the one-way module publication boundary.
-pub struct UnlinkedModuleParts<F = UnlinkedFunction> {
-    pub name: JsString,
-    pub function: F,
-    pub has_top_level_await: bool,
-    pub requested_modules: Box<[ModuleRequest]>,
-    pub imports: Box<[ModuleImport]>,
-    pub exports: Box<[ModuleExport]>,
-    pub star_exports: Box<[ModuleStarExport]>,
-}
-
 impl UnlinkedModule {
     #[must_use]
     pub fn new(
-        name: JsString,
         function: UnlinkedFunction,
         has_top_level_await: bool,
         tables: UnlinkedModuleTables,
@@ -216,7 +204,6 @@ impl UnlinkedModule {
             star_exports,
         } = tables;
         Self {
-            name,
             function,
             has_top_level_await,
             declaration_order: declaration_order.into_boxed_slice(),
@@ -281,18 +268,5 @@ impl UnlinkedModule {
     #[cfg_attr(not(test), allow(dead_code))]
     pub const fn star_exports(&self) -> &[ModuleStarExport] {
         &self.star_exports
-    }
-
-    #[must_use]
-    pub fn into_parts(self) -> UnlinkedModuleParts {
-        UnlinkedModuleParts {
-            name: self.name,
-            function: self.function,
-            has_top_level_await: self.has_top_level_await,
-            requested_modules: self.requested_modules,
-            imports: self.imports,
-            exports: self.exports,
-            star_exports: self.star_exports,
-        }
     }
 }

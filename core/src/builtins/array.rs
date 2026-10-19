@@ -1,15 +1,15 @@
-//! `Array` (phase 4, section 6.1 row 2): the constructor, `from`, `of`,
-//! `isArray`, and every `Array.prototype` method, in the specification's
-//! step order over generic array-likes, with direct element access for a
-//! plain array (an `Array` whose elements are dense and whose prototypes
-//! have no index properties). `Symbol.species` is dropped (phase 0): the
-//! methods that would create a species instance create a plain array.
-//! `sort` is QuickJS's stable merge sort.
+//! `Array`: the constructor, `from`, `of`, `isArray`, and every
+//! `Array.prototype` method, in the specification's step order over generic
+//! array-likes, with direct element access for a plain array (an `Array` whose
+//! elements are dense and whose prototypes have no index properties).
+//! `Symbol.species` is dropped: the methods that would create a species
+//! instance create a plain array. `sort` is QuickJS's `rqsort` with its
+//! comparison and write-back shortcuts.
 
 use std::cmp::Ordering;
 
 use super::{
-    Native, accessor, install_constructor, methods, plain_object, string_units, symbol_method,
+    Native, accessor, install_constructor, link_constructor, methods, plain_object, string_units,
     this_object,
 };
 use crate::heap::HeapError;
@@ -31,12 +31,13 @@ const MAX_LENGTH: u64 = 9_007_199_254_740_991;
 
 pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     let prototype = cx.realm.intrinsic(Intrinsic::ArrayPrototype);
-    let array = install_constructor(cx, Native::ArrayConstructor, prototype)?;
+    // QuickJS's `js_array_funcs` and `js_array_proto_funcs`, in order.
+    let array = install_constructor(cx, Native::ArrayConstructor)?;
     cx.set_intrinsic(Intrinsic::Array, array);
     methods(
         cx,
         array,
-        &[Native::ArrayFrom, Native::ArrayIsArray, Native::ArrayOf],
+        &[Native::ArrayIsArray, Native::ArrayFrom, Native::ArrayOf],
     )?;
     let species = WellKnown::key(cx.realm.symbols.species);
     accessor(
@@ -52,27 +53,8 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         prototype,
         &[
             Native::ArrayAt,
+            Native::ArrayWith,
             Native::ArrayConcat,
-            Native::ArrayCopyWithin,
-            Native::ArrayFill,
-            Native::ArrayFind,
-            Native::ArrayFindIndex,
-            Native::ArrayFindLast,
-            Native::ArrayFindLastIndex,
-            Native::ArrayLastIndexOf,
-            Native::ArrayPop,
-            Native::ArrayPush,
-            Native::ArrayReverse,
-            Native::ArrayShift,
-            Native::ArrayUnshift,
-            Native::ArraySlice,
-            Native::ArraySort,
-            Native::ArraySplice,
-            Native::ArrayIncludes,
-            Native::ArrayIndexOf,
-            Native::ArrayJoin,
-            Native::ArrayToString,
-            Native::ArrayToLocaleString,
             Native::ArrayEvery,
             Native::ArraySome,
             Native::ArrayForEach,
@@ -80,16 +62,53 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
             Native::ArrayFilter,
             Native::ArrayReduce,
             Native::ArrayReduceRight,
-            Native::ArrayFlat,
-            Native::ArrayFlatMap,
+            Native::ArrayFill,
+            Native::ArrayFind,
+            Native::ArrayFindIndex,
+            Native::ArrayFindLast,
+            Native::ArrayFindLastIndex,
+            Native::ArrayIndexOf,
+            Native::ArrayLastIndexOf,
+            Native::ArrayIncludes,
+            Native::ArrayJoin,
+            Native::ArrayToString,
+            Native::ArrayToLocaleString,
+            Native::ArrayPop,
+            Native::ArrayPush,
+            Native::ArrayShift,
+            Native::ArrayUnshift,
+            Native::ArrayReverse,
             Native::ArrayToReversed,
+            Native::ArraySort,
             Native::ArrayToSorted,
+            Native::ArraySlice,
+            Native::ArraySplice,
             Native::ArrayToSpliced,
-            Native::ArrayWith,
+            Native::ArrayCopyWithin,
+            Native::ArrayFlatMap,
+            Native::ArrayFlat,
+            Native::ArrayValues,
+            Native::ArrayKeys,
+            Native::ArrayEntries,
         ],
     )?;
-    // `Array.prototype[Symbol.unscopables]`: unscopables are dropped
-    // (phase 0), the object is still there.
+    let values_key = cx.heap.property_key("values")?;
+    let values = cx
+        .heap
+        .lookup_own(prototype, values_key)
+        .map(|(slot, _)| cx.heap.get_slot(prototype, slot))
+        .and_then(|value| value.as_object())
+        .expect("Array.prototype.values");
+    cx.set_intrinsic(Intrinsic::ArrayValues, values);
+    super::define_key(
+        cx,
+        prototype,
+        WellKnown::key(cx.realm.symbols.iterator),
+        Value::object(values),
+        PropertyFlags::data(true, false, true),
+    )?;
+    // `Array.prototype[Symbol.unscopables]`: unscopables are dropped, the
+    // object is still there.
     let unscopables = plain_object(cx, None, 16)?;
     for name in [
         "at",
@@ -118,8 +137,7 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         Value::object(unscopables),
         PropertyFlags::data(false, false, true),
     )?;
-    let _ = symbol_method;
-    Ok(())
+    link_constructor(cx, array, prototype)
 }
 
 fn root(cx: &mut Cx<'_>, value: Value) {
@@ -201,6 +219,16 @@ fn create_at(cx: &mut Cx<'_>, object: ObjectId, index: u64, value: Value) -> Res
     internal::create_data_property_or_throw(cx, object, key, value)
 }
 
+/// QuickJS's `JS_TryGetPropertyInt64`: `HasProperty`, then `Get` when
+/// present, else `undefined`.
+fn try_get_at(cx: &mut Cx<'_>, object: ObjectId, index: u64) -> Result<Value, Throw> {
+    if has_at(cx, object, index)? {
+        get_at(cx, object, index)
+    } else {
+        Ok(Value::UNDEFINED)
+    }
+}
+
 /// `DeletePropertyOrThrow(O, ToString(index))`.
 fn delete_at(cx: &mut Cx<'_>, object: ObjectId, index: u64) -> Result<(), Throw> {
     let key = key_at(cx, index)?;
@@ -255,6 +283,15 @@ fn array_create(cx: &mut Cx<'_>, length: u64) -> Result<ObjectId, Throw> {
     Ok(array)
 }
 
+/// QuickJS's `js_allocate_fast_array`: the change-by-copy methods' result,
+/// limited to `INT32_MAX` elements before any element is read.
+fn fast_array_create(cx: &mut Cx<'_>, length: u64) -> Result<ObjectId, Throw> {
+    if length > i32::MAX as u64 {
+        return Err(error::range_error(cx, "invalid array length"));
+    }
+    array_create(cx, length)
+}
+
 // ---- the constructor ----
 
 /// `Array(...)`: a length, the arguments as elements, or a single
@@ -303,7 +340,7 @@ pub(super) fn from(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let constructor = site.this(cx);
     let (items, map, this_arg) = (site.arg(cx, 0), site.arg(cx, 1), site.arg(cx, 2));
     if !map.is_undefined() && !ops::is_callable(cx.heap, map) {
-        return Err(error::type_error(cx, "Array.from: not a function"));
+        return Err(error::type_error(cx, "not a function"));
     }
     let key = WellKnown::key(cx.realm.symbols.iterator);
     let using_iterator = internal::get_method(cx, items, key)?;
@@ -419,7 +456,7 @@ pub(super) fn push(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     }
     let length = length_of(cx, object)?;
     if length + site.argc as u64 > MAX_LENGTH {
-        return Err(error::type_error(cx, "array too long"));
+        return Err(error::type_error(cx, "Array loo long"));
     }
     for index in 0..site.argc {
         let value = site.arg(cx, index);
@@ -499,7 +536,7 @@ pub(super) fn unshift(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let count = site.argc as u64;
     if count > 0 {
         if length + count > MAX_LENGTH {
-            return Err(error::type_error(cx, "array too long"));
+            return Err(error::type_error(cx, "Array loo long"));
         }
         let mut index = length;
         while index > 0 {
@@ -588,7 +625,7 @@ pub(super) fn splice(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
         count.clamp(0.0, (length - start) as f64) as u64
     };
     if length + insert - delete > MAX_LENGTH {
-        return Err(error::type_error(cx, "array too long"));
+        return Err(error::type_error(cx, "Array loo long"));
     }
     let removed = array_create(cx, delete)?;
     for offset in 0..delete {
@@ -851,7 +888,7 @@ pub(super) fn concat(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
             let source = item.as_object().unwrap();
             let length = length_of(cx, source)?;
             if next + length > MAX_LENGTH {
-                return Err(error::type_error(cx, "array too long"));
+                return Err(error::type_error(cx, "Array loo long"));
             }
             for at in 0..length {
                 if has_at(cx, source, at)? {
@@ -862,7 +899,7 @@ pub(super) fn concat(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
             }
         } else {
             if next >= MAX_LENGTH {
-                return Err(error::type_error(cx, "array too long"));
+                return Err(error::type_error(cx, "Array loo long"));
             }
             create_at(cx, result, next, item)?;
             next += 1;
@@ -1030,6 +1067,8 @@ pub(super) fn filter(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
 /// included.
 fn find(cx: &mut Cx<'_>, site: CallSite, last: bool, index_result: bool) -> Result<Value, Throw> {
     let object = this_object(cx, &site)?;
+    // 23.1.3.9 step 1: `O = ToObject(this)` is the predicate's third argument.
+    let receiver = Value::object(object);
     let length = length_of(cx, object)?;
     let predicate = callback(cx, &site)?;
     let this_arg = site.arg(cx, 1);
@@ -1042,7 +1081,7 @@ fn find(cx: &mut Cx<'_>, site: CallSite, last: bool, index_result: bool) -> Resu
             cx,
             predicate,
             this_arg,
-            &[value, index_value(index), Value::object(object)],
+            &[value, index_value(index), receiver],
         )?;
         cx.heap.roots().truncate(mark);
         if ops::to_boolean(cx.heap, found) {
@@ -1087,10 +1126,7 @@ fn reduce_impl(cx: &mut Cx<'_>, site: CallSite, right: bool) -> Result<Value, Th
     } else {
         loop {
             if step >= length {
-                return Err(error::type_error(
-                    cx,
-                    "reduce of empty array with no initial value",
-                ));
+                return Err(error::type_error(cx, "empty array"));
             }
             let index = order(step);
             step += 1;
@@ -1170,7 +1206,7 @@ fn flatten(
                 next = flatten(cx, target, inner, inner_length, next, depth - 1.0, None)?;
             } else {
                 if next >= MAX_LENGTH {
-                    return Err(error::type_error(cx, "array too long"));
+                    return Err(error::type_error(cx, "Array too long"));
                 }
                 create_at(cx, target, next, element)?;
                 next += 1;
@@ -1216,56 +1252,8 @@ pub(super) fn flat_map(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> 
 
 // ---- sort ----
 
-/// The comparison of `SortCompare`: `undefined` last, then the comparator's
-/// sign (NaN as 0), or the string order.
-fn compare(cx: &mut Cx<'_>, comparator: Value, x: Value, y: Value) -> Result<Ordering, Throw> {
-    match (x.is_undefined(), y.is_undefined()) {
-        (true, true) => return Ok(Ordering::Equal),
-        (true, false) => return Ok(Ordering::Greater),
-        (false, true) => return Ok(Ordering::Less),
-        _ => {}
-    }
-    if !comparator.is_undefined() {
-        let result = crate::vm::call(cx, comparator, Value::UNDEFINED, &[x, y])?;
-        let number = match result.as_int32() {
-            Some(int) => f64::from(int),
-            None => ops::to_number(cx, result)?,
-        };
-        return Ok(if number < 0.0 {
-            Ordering::Less
-        } else if number > 0.0 {
-            Ordering::Greater
-        } else {
-            Ordering::Equal
-        });
-    }
-    if let (Some(a), Some(b)) = (x.as_int32(), y.as_int32()) {
-        // Both strings are decimal: compare their texts.
-        return Ok(a.to_string().cmp(&b.to_string()));
-    }
-    let (a, b) = (ops::to_string(cx, x)?, ops::to_string(cx, y)?);
-    let a = cx
-        .heap
-        .string(a.as_string().unwrap())
-        .repr()
-        .units()
-        .collect::<Vec<_>>();
-    let b = cx
-        .heap
-        .string(b.as_string().unwrap())
-        .repr()
-        .units()
-        .collect::<Vec<_>>();
-    Ok(a.cmp(&b))
-}
-
-/// A stable merge sort with a fallible comparison; `values` stay rooted by
+/// A stable merge sort with any fallible comparison; `values` stay rooted by
 /// the caller.
-fn merge_sort(cx: &mut Cx<'_>, comparator: Value, values: &mut Vec<Value>) -> Result<(), Throw> {
-    merge_sort_by(cx, values, |cx, x, y| compare(cx, comparator, x, y))
-}
-
-/// [`merge_sort`] with any fallible comparison.
 pub(crate) fn merge_sort_by(
     cx: &mut Cx<'_>,
     values: &mut Vec<Value>,
@@ -1318,35 +1306,264 @@ pub(crate) fn merge_sort_by(
     Ok(())
 }
 
-/// `SortIndexedProperties(obj, len, SortCompare, skip-holes)`: the values,
-/// sorted and rooted.
-fn sorted_values(
+/// One element of QuickJS's `js_array_sort`: the value, its string once the
+/// default comparison has converted it, and its original index.
+struct Slot {
+    value: Value,
+    text: Option<Value>,
+    position: u64,
+}
+
+/// QuickJS's `js_array_cmp_generic`: the comparator's sign (skipped for
+/// raw-identical values) or the order of the lazily converted strings, then
+/// the original positions. After a throw every comparison is 0.
+fn compare_slots(
+    cx: &mut Cx<'_>,
+    comparator: Value,
+    failure: &mut Option<Throw>,
+    slots: &mut [Slot],
+    a: usize,
+    b: usize,
+) -> i32 {
+    if failure.is_some() {
+        return 0;
+    }
+    let result = (|| -> Result<i32, Throw> {
+        if !comparator.is_undefined() {
+            let (x, y) = (slots[a].value, slots[b].value);
+            if x == y {
+                return Ok(0);
+            }
+            let result = crate::vm::call(cx, comparator, Value::UNDEFINED, &[x, y])?;
+            let number = match result.as_int32() {
+                Some(int) => f64::from(int),
+                None => ops::to_number(cx, result)?,
+            };
+            return Ok(i32::from(number > 0.0) - i32::from(number < 0.0));
+        }
+        for index in [a, b] {
+            if slots[index].text.is_none() {
+                let text = ops::to_string(cx, slots[index].value)?;
+                root(cx, text);
+                slots[index].text = Some(text);
+            }
+        }
+        let (x, y) = (slots[a].text.unwrap(), slots[b].text.unwrap());
+        let x = cx.heap.string(x.as_string().unwrap()).repr().units();
+        let y = cx.heap.string(y.as_string().unwrap()).repr().units();
+        Ok(match x.cmp(y) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        })
+    })();
+    match result {
+        Ok(0) => {
+            let (x, y) = (slots[a].position, slots[b].position);
+            i32::from(x > y) - i32::from(x < y)
+        }
+        Ok(order) => order,
+        Err(throw) => {
+            *failure = Some(throw);
+            0
+        }
+    }
+}
+
+/// QuickJS's `heapsortx` over `base[start..start + n]`, `rqsort`'s fallback
+/// past depth 50.
+fn heapsort<T>(
+    base: &mut [T],
+    start: usize,
+    n: usize,
+    cmp: &mut impl FnMut(&mut [T], usize, usize) -> i32,
+) {
+    if n <= 1 {
+        return;
+    }
+    let sift = |base: &mut [T], cmp: &mut dyn FnMut(&mut [T], usize, usize) -> i32, mut r, end| {
+        loop {
+            let mut c = r * 2 + 1;
+            if c >= end {
+                break;
+            }
+            if c < end - 1 && cmp(base, start + c, start + c + 1) <= 0 {
+                c += 1;
+            }
+            if cmp(base, start + r, start + c) > 0 {
+                break;
+            }
+            base.swap(start + r, start + c);
+            r = c;
+        }
+    };
+    let mut i = n / 2;
+    while i > 0 {
+        i -= 1;
+        sift(base, cmp, i, n);
+    }
+    let mut i = n - 1;
+    while i > 0 {
+        base.swap(start, start + i);
+        sift(base, cmp, 0, i);
+        i -= 1;
+    }
+}
+
+/// QuickJS's `rqsort` (cutils.c): a three-way quicksort with a median of
+/// three pivot and insertion sort below seven elements, whose comparison
+/// sequence the comparator observes.
+pub(crate) fn rqsort<T>(base: &mut [T], mut cmp: impl FnMut(&mut [T], usize, usize) -> i32) {
+    fn swap_block<T>(base: &mut [T], a: usize, b: usize, span: usize) {
+        for offset in 0..span {
+            base.swap(a + offset, b + offset);
+        }
+    }
+    if base.len() < 2 {
+        return;
+    }
+    let mut stack: Vec<(usize, usize, u32)> = vec![(0, base.len(), 0)];
+    while let Some((mut ptr, mut nmemb, mut depth)) = stack.pop() {
+        while nmemb > 6 {
+            depth += 1;
+            if depth > 50 {
+                heapsort(base, ptr, nmemb, &mut cmp);
+                nmemb = 0;
+                break;
+            }
+            let m4 = nmemb >> 2;
+            let (a, b, c) = (ptr + m4, ptr + 2 * m4, ptr + 3 * m4);
+            let m = if cmp(base, a, b) < 0 {
+                if cmp(base, b, c) < 0 {
+                    b
+                } else if cmp(base, a, c) < 0 {
+                    c
+                } else {
+                    a
+                }
+            } else if cmp(base, b, c) > 0 {
+                b
+            } else if cmp(base, a, c) < 0 {
+                a
+            } else {
+                c
+            };
+            base.swap(ptr, m);
+            let mut i = 1usize;
+            let mut lt = 1usize;
+            let mut pi = ptr + 1;
+            let mut plt = ptr + 1;
+            let mut gt = nmemb;
+            let top = ptr + nmemb;
+            let mut pj = top;
+            let mut pgt = top;
+            loop {
+                while pi < pj {
+                    let c = cmp(base, ptr, pi);
+                    if c < 0 {
+                        break;
+                    }
+                    if c == 0 {
+                        base.swap(plt, pi);
+                        lt += 1;
+                        plt += 1;
+                    }
+                    i += 1;
+                    pi += 1;
+                }
+                loop {
+                    pj -= 1;
+                    if pi >= pj {
+                        break;
+                    }
+                    let c = cmp(base, ptr, pj);
+                    if c > 0 {
+                        break;
+                    }
+                    if c == 0 {
+                        gt -= 1;
+                        pgt -= 1;
+                        base.swap(pgt, pj);
+                    }
+                }
+                if pi >= pj {
+                    break;
+                }
+                base.swap(pi, pj);
+                i += 1;
+                pi += 1;
+            }
+            let span = (plt - ptr).min(pi - plt);
+            lt = i - lt;
+            swap_block(base, ptr, pi - span, span);
+            let span2 = pgt - pi;
+            let span = (top - pgt).min(span2);
+            pgt = top - span2;
+            gt = nmemb - (gt - i);
+            swap_block(base, pi, top - span, span);
+            if lt > nmemb - gt {
+                stack.push((ptr, lt, depth));
+                ptr = pgt;
+                nmemb -= gt;
+            } else {
+                stack.push((pgt, nmemb - gt, depth));
+                nmemb = lt;
+            }
+        }
+        let top = ptr + nmemb;
+        let mut pi = ptr + 1;
+        while pi < top {
+            let mut pj = pi;
+            while pj > ptr && cmp(base, pj - 1, pj) > 0 {
+                base.swap(pj, pj - 1);
+                pj -= 1;
+            }
+            pi += 1;
+        }
+    }
+}
+
+/// The elements `js_array_sort` sorts: every present non-`undefined` value
+/// with its index (read by `HasProperty` then `Get`), rooted, and the count
+/// of `undefined` values.
+fn sort_slots(
     cx: &mut Cx<'_>,
     object: ObjectId,
     length: u64,
     comparator: Value,
-    skip_holes: bool,
-) -> Result<Vec<Value>, Throw> {
-    let mut values = Vec::new();
+) -> Result<(Vec<Slot>, u64), Throw> {
+    let mut slots = Vec::new();
+    let mut undefined = 0u64;
     for index in 0..length {
-        if skip_holes && !has_at(cx, object, index)? {
+        if !has_at(cx, object, index)? {
             continue;
         }
         let value = get_at(cx, object, index)?;
+        if value.is_undefined() {
+            undefined += 1;
+            continue;
+        }
         root(cx, value);
-        values.push(value);
+        slots.push(Slot {
+            value,
+            text: None,
+            position: index,
+        });
     }
-    merge_sort(cx, comparator, &mut values)?;
-    Ok(values)
+    let mut failure = None;
+    rqsort(&mut slots, |slots, a, b| {
+        compare_slots(cx, comparator, &mut failure, slots, a, b)
+    });
+    match failure {
+        Some(throw) => Err(throw),
+        None => Ok((slots, undefined)),
+    }
 }
 
 fn comparator(cx: &mut Cx<'_>, site: &CallSite) -> Result<Value, Throw> {
     let comparator = site.arg(cx, 0);
     if !comparator.is_undefined() && !ops::is_callable(cx.heap, comparator) {
-        return Err(error::type_error(
-            cx,
-            "the comparison function must be a function",
-        ));
+        return Err(error::type_error(cx, "not a function"));
     }
     Ok(comparator)
 }
@@ -1355,27 +1572,57 @@ pub(super) fn sort(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let comparator = comparator(cx, &site)?;
     let object = this_object(cx, &site)?;
     let length = length_of(cx, object)?;
-    let values = sorted_values(cx, object, length, comparator, true)?;
-    let count = values.len() as u64;
-    for (index, &value) in values.iter().enumerate() {
-        set_at(cx, object, index as u64, value)?;
+    let (slots, undefined) = sort_slots(cx, object, length, comparator)?;
+    // 23.1.3.30 step 7: `Set` of every sorted index.
+    let count = slots.len() as u64;
+    for (index, slot) in slots.iter().enumerate() {
+        set_at(cx, object, index as u64, slot.value)?;
+    }
+    for index in count..count + undefined {
+        set_at(cx, object, index, Value::UNDEFINED)?;
     }
     // `DeletePropertyOrThrow` of every index past the sorted items, present
     // or not.
-    for index in count..length {
+    for index in count + undefined..length {
         delete_at(cx, object, index)?;
     }
     Ok(Value::object(object))
 }
 
+/// `js_array_toSorted`: a dense copy (holes read as `undefined`), sorted as
+/// `js_array_sort` sorts it.
 pub(super) fn to_sorted(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let comparator = comparator(cx, &site)?;
     let object = this_object(cx, &site)?;
     let length = length_of(cx, object)?;
-    let target = array_create(cx, length)?;
-    let values = sorted_values(cx, object, length, comparator, false)?;
-    for (index, &value) in values.iter().enumerate() {
-        create_at(cx, target, index as u64, value)?;
+    let target = fast_array_create(cx, length)?;
+    let mut slots = Vec::new();
+    let mut undefined = 0u64;
+    for index in 0..length {
+        let value = try_get_at(cx, object, index)?;
+        if value.is_undefined() {
+            undefined += 1;
+            continue;
+        }
+        root(cx, value);
+        slots.push(Slot {
+            value,
+            text: None,
+            position: index,
+        });
+    }
+    let mut failure = None;
+    rqsort(&mut slots, |slots, a, b| {
+        compare_slots(cx, comparator, &mut failure, slots, a, b)
+    });
+    if let Some(throw) = failure {
+        return Err(throw);
+    }
+    for (index, slot) in slots.iter().enumerate() {
+        create_at(cx, target, index as u64, slot.value)?;
+    }
+    for index in slots.len() as u64..slots.len() as u64 + undefined {
+        create_at(cx, target, index, Value::UNDEFINED)?;
     }
     Ok(Value::object(target))
 }
@@ -1383,9 +1630,9 @@ pub(super) fn to_sorted(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw>
 pub(super) fn to_reversed(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let object = this_object(cx, &site)?;
     let length = length_of(cx, object)?;
-    let target = array_create(cx, length)?;
+    let target = fast_array_create(cx, length)?;
     for index in 0..length {
-        let value = get_at(cx, object, length - 1 - index)?;
+        let value = try_get_at(cx, object, length - 1 - index)?;
         create_at(cx, target, index, value)?;
     }
     Ok(Value::object(target))
@@ -1408,12 +1655,12 @@ pub(super) fn to_spliced(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw
     };
     let new_length = length + insert - skip;
     if new_length > MAX_LENGTH {
-        return Err(error::type_error(cx, "array too long"));
+        return Err(error::type_error(cx, "invalid array length"));
     }
-    let target = array_create(cx, new_length)?;
+    let target = fast_array_create(cx, new_length)?;
     let mut to = 0u64;
     for index in 0..start {
-        let value = get_at(cx, object, index)?;
+        let value = try_get_at(cx, object, index)?;
         create_at(cx, target, to, value)?;
         to += 1;
     }
@@ -1423,11 +1670,24 @@ pub(super) fn to_spliced(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw
         to += 1;
     }
     for index in start + skip..length {
-        let value = get_at(cx, object, index)?;
+        let value = try_get_at(cx, object, index)?;
         create_at(cx, target, to, value)?;
         to += 1;
     }
     Ok(Value::object(target))
+}
+
+/// QuickJS's `invalid array index: {idx}`, `idx` the saturated `int64`
+/// index made relative to `length`.
+#[cold]
+#[inline(never)]
+fn invalid_index(cx: &mut Cx<'_>, length: u64, relative: f64) -> Throw {
+    // `as` saturates as `JS_ToInt64Sat` does.
+    let mut index = relative as i64;
+    if index < 0 {
+        index = index.saturating_add(length as i64);
+    }
+    error::range_error(cx, &format!("invalid array index: {index}"))
 }
 
 pub(super) fn with(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
@@ -1441,15 +1701,15 @@ pub(super) fn with(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
         length as f64 + relative
     };
     if actual >= length as f64 || actual < 0.0 {
-        return Err(error::range_error(cx, "invalid array index"));
+        return Err(invalid_index(cx, length, relative));
     }
     let replacement = site.arg(cx, 1);
-    let target = array_create(cx, length)?;
+    let target = fast_array_create(cx, length)?;
     for index in 0..length {
         let value = if index == actual as u64 {
             replacement
         } else {
-            get_at(cx, object, index)?
+            try_get_at(cx, object, index)?
         };
         create_at(cx, target, index, value)?;
     }

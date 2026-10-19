@@ -89,15 +89,6 @@ enum BigIntRepr {
 pub struct JsBigInt(BigIntRepr);
 
 impl JsBigInt {
-    /// Immediate limbs have no allocation; shared heap limbs survive one drop.
-    #[cfg(test)]
-    pub(crate) fn release_keeps_storage_alive(&self) -> bool {
-        match &self.0 {
-            BigIntRepr::Short(_) => true,
-            BigIntRepr::Heap(value) => Rc::strong_count(value) > 1,
-        }
-    }
-
     /// Test the tagged representation identity observed by QuickJS's raw
     /// `JSValue` equality shortcuts. Heap values must share the same cell;
     /// numeric equality alone is deliberately insufficient.
@@ -134,6 +125,13 @@ impl JsBigInt {
             return Err(BigIntError::BigIntTooLarge);
         }
         Ok(Self::normalize(value))
+    }
+
+    /// Parse plain decimal text (an optional `-` and digits) with no size
+    /// limit: a value another engine already holds, which may be one limb
+    /// past the allocation guard as `js_bigint_extend` leaves it.
+    pub(crate) fn from_decimal_unchecked(text: &str) -> Option<Self> {
+        BigInt::parse_bytes(text.as_bytes(), 10).map(Self::normalize)
     }
 
     /// Convert an exactly integral finite binary64 value to a BigInt.

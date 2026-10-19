@@ -1,14 +1,12 @@
-//! The realm's builtins (new-core phase 3, section 6.2): exactly what the
-//! V8 v7 programs call, plus the members a program reaches through them, as
-//! leaf natives. One file per builtin object.
+//! The realm's builtins, as natives. One file per builtin object.
 //!
 //! Every native reads its receiver and arguments through [`CallSite`]. A
 //! conversion that may run JavaScript (`ToString` of an object, `ToNumber`
-//! through `valueOf`) goes through the re-entrant [`call`](crate::vm::call);
-//! a native that holds a value across an allocation roots it first (the
-//! phase 1 rule, enforced by `gc-stress`). Natives that call back into
-//! JavaScript for their own work (`sort` with a comparator, `replace` with a
-//! function) are phase 4's Step/Resume machines and are not here.
+//! through `valueOf`) goes through the re-entrant [`call`](crate::vm::call); a
+//! native that holds a value across an allocation roots it first (the rooting
+//! rule, enforced by `gc-stress`). Natives that call back into JavaScript for
+//! their own work (`sort` with a comparator, `replace` with a function) use the
+//! same re-entrant call.
 
 pub mod agent;
 mod array;
@@ -52,6 +50,33 @@ use crate::vm::{Cx, Throw, ops};
 
 /// A native's entry point.
 pub(crate) type NativeFn = fn(&mut Cx<'_>, CallSite) -> Result<Value, Throw>;
+
+impl Native {
+    /// Whether QuickJS runs it without a stack frame of its own, so that a
+    /// backtrace does not list it: a promise resolving function (a class
+    /// with its own call handler) or a `JS_NewCFunctionData` closure.
+    pub(crate) const fn frameless(self) -> bool {
+        matches!(
+            self,
+            Native::PromiseResolveFunction
+                | Native::PromiseRejectFunction
+                | Native::PromiseCapabilityExecutor
+                | Native::PromiseThenFinally
+                | Native::PromiseCatchFinally
+                | Native::PromiseValueThunk
+                | Native::PromiseThrower
+                | Native::PromiseAllResolveElement
+                | Native::PromiseAllSettledResolveElement
+                | Native::PromiseAllSettledRejectElement
+                | Native::PromiseAnyRejectElement
+                | Native::ProxyRevoke
+                | Native::AsyncFromSyncUnwrap
+                | Native::AsyncFromSyncCloseRejected
+                | Native::ModuleAsyncRejected
+                | Native::ModuleImportRejected
+        )
+    }
+}
 
 macro_rules! natives {
     ($($(#[$doc:meta])* $name:ident => $function:path, $js:expr, $length:expr $(, $constructor:ident)?;)*) => {
@@ -103,9 +128,8 @@ natives! {
     /// qjs's `print`: the arguments' strings joined by a space, then a
     /// newline.
     Print => global::print, "print", 1;
-    /// `Function.prototype.call`. The loop rewrites a call of it into a call
-    /// of its receiver (section 5.2); the native runs only where no call
-    /// site is rewritten.
+    /// `Function.prototype.call`. The loop rewrites a call of it into a call of
+    /// its receiver; the native runs only where no call site is rewritten.
     FunctionCall => function::call, "call", 1;
     /// `Function.prototype.apply`, rewritten by the loop as `call` is.
     FunctionApply => function::apply, "apply", 2;
@@ -115,6 +139,9 @@ natives! {
     FunctionToString => function::to_string, "toString", 0;
     FunctionBind => function::bind, "bind", 1;
     FunctionHasInstance => function::has_instance, "[Symbol.hasInstance]", 1;
+    FunctionFileName => function::file_name, "fileName", 0;
+    FunctionLineNumber => function::line_number, "lineNumber", 0;
+    FunctionColumnNumber => function::column_number, "columnNumber", 0;
     ThrowTypeError => function::throw_type_error, "", 0;
 
     ParseInt => global::parse_int, "parseInt", 2;
@@ -536,7 +563,8 @@ natives! {
     FinalizationRegistryUnregister => collection::finalization_registry_unregister, "unregister", 1;
 
     IteratorConstructor => iterator_helpers::constructor, "Iterator", 0, constructor;
-    IteratorConstructorAccessor => iterator_helpers::constructor_accessor, "", 0;
+    IteratorConstructorGetter => iterator_helpers::constructor_getter, "constructor", 0;
+    IteratorConstructorSetter => iterator_helpers::constructor_setter, "constructor", 1;
     IteratorToStringTagGetter => iterator_helpers::to_string_tag_getter, "[Symbol.toStringTag]", 0;
     IteratorToStringTagSetter => iterator_helpers::to_string_tag_setter, "[Symbol.toStringTag]", 1;
     IteratorFrom => iterator_helpers::from, "from", 1;
@@ -556,8 +584,6 @@ natives! {
     IteratorToArray => iterator_helpers::to_array, "toArray", 0;
     IteratorHelperNext => iterator_helpers::helper_next, "next", 0;
     IteratorHelperReturn => iterator_helpers::helper_return, "return", 0;
-    IteratorConcatNext => iterator_helpers::concat_next, "next", 0;
-    IteratorConcatReturn => iterator_helpers::concat_return, "return", 0;
 
     ArrayBufferConstructor => buffer::array_buffer_constructor, "ArrayBuffer", 1, constructor;
     ArrayBufferIsView => buffer::is_view, "isView", 1;
@@ -695,6 +721,8 @@ natives! {
     ConsoleLog => global::print, "log", 1;
     Load => crate::vm::compile::load, "load", 1;
     Read => crate::vm::compile::read, "read", 1;
+    LoadScript => crate::vm::compile::load_script, "__loadScript", 1;
+    PerformanceNow => global::performance_now, "now", 0;
 }
 
 impl Native {
@@ -742,7 +770,7 @@ pub(crate) fn relative(index: f64, length: usize) -> usize {
 /// and one-character slices do not allocate.
 pub(crate) fn string_units(cx: &mut Cx<'_>, units: &[u16]) -> Result<Value, Throw> {
     if units.len() > string::MAX_STRING {
-        return Err(vm_error::range_error(cx, "invalid string length"));
+        return Err(vm_error::string_too_long(cx));
     }
     let result = if units.len() == 1 {
         cx.heap.intern_units(units)
@@ -796,7 +824,7 @@ pub(crate) fn this_string(cx: &mut Cx<'_>, site: &CallSite) -> Result<StringId, 
         return Ok(id);
     }
     if this.is_undefined() || this.is_null() {
-        return Err(vm_error::type_error(cx, "not an object"));
+        return Err(vm_error::type_error(cx, "null or undefined are forbidden"));
     }
     to_string_id(cx, this)
 }
@@ -1002,14 +1030,31 @@ fn getter(cx: &mut Cx<'_>, object: ObjectId, name: &str, native: Native) -> Resu
     accessor(cx, object, key, name, Some(native), None)
 }
 
-/// A constructor with its `prototype` (non-writable) and the prototype's
-/// `constructor`, defined on the global object as its table name.
-fn install_constructor(
-    cx: &mut Cx<'_>,
-    native: Native,
-    prototype: ObjectId,
-) -> Result<ObjectId, HeapError> {
+/// A constructor function, defined on the global object as its table name.
+/// Its `prototype` link comes last ([`link_constructor`]), after its static
+/// members and the prototype's methods, as QuickJS's `JS_NewCConstructor`
+/// orders them.
+fn install_constructor(cx: &mut Cx<'_>, native: Native) -> Result<ObjectId, HeapError> {
     let function = native_function(cx, native)?;
+    let global = cx.realm.global();
+    define(
+        cx,
+        global,
+        native.js_name(),
+        Value::object(function),
+        hidden(),
+    )?;
+    Ok(function)
+}
+
+/// Defines `function.prototype` (non-writable) and then
+/// `prototype.constructor` (QuickJS's `JS_SetConstructor2`), each the last
+/// string-keyed property of its object.
+fn link_constructor(
+    cx: &mut Cx<'_>,
+    function: ObjectId,
+    prototype: ObjectId,
+) -> Result<(), HeapError> {
     let names = cx.realm.names;
     cx.heap.add_property(
         function,
@@ -1022,16 +1067,7 @@ fn install_constructor(
         Names::key(names.constructor),
         hidden(),
         Value::object(function),
-    )?;
-    let global = cx.realm.global();
-    define(
-        cx,
-        global,
-        native.js_name(),
-        Value::object(function),
-        hidden(),
-    )?;
-    Ok(function)
+    )
 }
 
 /// An ordinary object inheriting from `prototype`, rooted.
@@ -1121,9 +1157,95 @@ fn install_rooted(cx: &mut Cx<'_>) -> Result<ObjectId, HeapError> {
     atomics::install(cx)?;
     error::install(cx)?;
     regexp::record_flag_cache(cx)?;
+    to_string_tag(cx, global, "global")?;
+    order_globals(cx, global)?;
     let message = cx.heap.intern("out of memory")?;
     let error = vm_error::new_error(cx, ErrorKind::Internal, Value::string(message))?;
     Ok(error.as_object().unwrap())
+}
+
+/// The global object's properties in QuickJS's order: its
+/// `JS_AddIntrinsicBasicObjects`, `JS_AddIntrinsicBaseObjects` and the
+/// `JS_AddIntrinsic*` calls of `JS_NewContext`, which define them in an
+/// order the install's dependencies do not allow.
+const GLOBAL_ORDER: &[&str] = &[
+    "Error",
+    "EvalError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "TypeError",
+    "URIError",
+    "InternalError",
+    "AggregateError",
+    "Array",
+    "Object",
+    "Function",
+    "Iterator",
+    "parseInt",
+    "parseFloat",
+    "isNaN",
+    "isFinite",
+    "decodeURI",
+    "decodeURIComponent",
+    "encodeURI",
+    "encodeURIComponent",
+    "escape",
+    "unescape",
+    "Infinity",
+    "NaN",
+    "undefined",
+    "eval",
+    "Number",
+    "Boolean",
+    "String",
+    "Math",
+    "Reflect",
+    "Symbol",
+    "globalThis",
+    "BigInt",
+    "Date",
+    "RegExp",
+    "JSON",
+    "Proxy",
+    "Map",
+    "Set",
+    "WeakMap",
+    "WeakSet",
+    "ArrayBuffer",
+    "SharedArrayBuffer",
+    "Uint8ClampedArray",
+    "Int8Array",
+    "Uint8Array",
+    "Int16Array",
+    "Uint16Array",
+    "Int32Array",
+    "Uint32Array",
+    "BigInt64Array",
+    "BigUint64Array",
+    "Float16Array",
+    "Float32Array",
+    "Float64Array",
+    "DataView",
+    "Atomics",
+    "Promise",
+    "WeakRef",
+    "FinalizationRegistry",
+];
+
+/// Puts the global object's properties in [`GLOBAL_ORDER`].
+fn order_globals(cx: &mut Cx<'_>, global: ObjectId) -> Result<(), HeapError> {
+    let mut keys = Vec::with_capacity(GLOBAL_ORDER.len());
+    for name in GLOBAL_ORDER {
+        keys.push(cx.heap.property_key(name)?);
+    }
+    debug_assert!(
+        keys.iter()
+            .all(|&key| cx.heap.lookup_own(global, key).is_some()),
+        "every global in GLOBAL_ORDER is installed"
+    );
+    cx.heap.reorder_dictionary(global, &keys);
+    Ok(())
 }
 
 /// Defines `print` on the global object.
@@ -1169,14 +1291,7 @@ pub(crate) fn install_std(cx: &mut Cx<'_>) -> Result<(), HeapError> {
 pub(crate) fn install_script_args(cx: &mut Cx<'_>, args: &[String]) -> Result<(), HeapError> {
     let mark = cx.heap.roots().mark();
     let result = (|| {
-        let prototype = cx.realm.intrinsic(Intrinsic::ArrayPrototype);
-        let array = cx.heap.alloc_array(Some(prototype), args.len() as u32)?;
-        cx.heap.roots().push(Value::object(array));
-        for (index, arg) in args.iter().enumerate() {
-            let text = cx.heap.alloc_string(arg)?;
-            cx.heap
-                .set_element(array, index as u32, Value::string(text))?;
-        }
+        let array = script_args_array(cx, args)?;
         let global = cx.realm.global();
         define(cx, global, "scriptArgs", Value::object(array), hidden())
     })();
@@ -1184,16 +1299,65 @@ pub(crate) fn install_script_args(cx: &mut Cx<'_>, args: &[String]) -> Result<()
     result
 }
 
-/// A typed array's length, or a `TypeError` when it is out of bounds
-/// (section 6.1 row 9).
+/// An array of `args` as strings, rooted.
+fn script_args_array(cx: &mut Cx<'_>, args: &[String]) -> Result<ObjectId, HeapError> {
+    let prototype = cx.realm.intrinsic(Intrinsic::ArrayPrototype);
+    let array = cx.heap.alloc_array(Some(prototype), args.len() as u32)?;
+    cx.heap.roots().push(Value::object(array));
+    for (index, arg) in args.iter().enumerate() {
+        let text = cx.heap.alloc_string(arg)?;
+        cx.heap
+            .set_element(array, index as u32, Value::string(text))?;
+    }
+    Ok(array)
+}
+
+/// QuickJS's `js_std_add_helpers` as `qjs` runs it: `console` (with `log`),
+/// `performance` (with `now`), `scriptArgs` when given, `print`, then
+/// `__loadScript`, in that order, each writable, enumerable and
+/// configurable (`JS_SetPropertyStr`).
+pub(crate) fn install_qjs_helpers(
+    cx: &mut Cx<'_>,
+    script_args: Option<&[String]>,
+) -> Result<(), HeapError> {
+    let mark = cx.heap.roots().mark();
+    let result = (|| {
+        let global = cx.realm.global();
+        let all = PropertyFlags::data(true, true, true);
+        let prototype = cx.realm.intrinsic(Intrinsic::ObjectPrototype);
+        let console = plain_object(cx, Some(prototype), 1)?;
+        let log = native_function(cx, Native::ConsoleLog)?;
+        define(cx, console, "log", Value::object(log), all)?;
+        define(cx, global, "console", Value::object(console), all)?;
+        let performance = plain_object(cx, Some(prototype), 1)?;
+        let now = native_function(cx, Native::PerformanceNow)?;
+        define(cx, performance, "now", Value::object(now), all)?;
+        define(cx, global, "performance", Value::object(performance), all)?;
+        if let Some(args) = script_args {
+            let array = script_args_array(cx, args)?;
+            define(cx, global, "scriptArgs", Value::object(array), all)?;
+        }
+        let print = native_function(cx, Native::Print)?;
+        define(cx, global, "print", Value::object(print), all)?;
+        let load_script = native_function(cx, Native::LoadScript)?;
+        define(cx, global, "__loadScript", Value::object(load_script), all)
+    })();
+    cx.heap.roots().truncate(mark);
+    result
+}
+
+/// A typed array's length, or a `TypeError` when it is out of bounds.
 pub(crate) fn typed_array_length_or_throw(cx: &mut Cx<'_>, object: ObjectId) -> Result<u64, Throw> {
     match crate::vm::typed::length(cx.heap, object) {
         Some(length) => Ok(length as u64),
-        None => Err(vm_error::type_error(cx, "TypedArray is out of bounds")),
+        None => Err(vm_error::type_error(
+            cx,
+            "ArrayBuffer is detached or resized",
+        )),
     }
 }
 
-/// `$262.detachArrayBuffer(buffer)` (section 6.1 row 9).
+/// `$262.detachArrayBuffer(buffer)`.
 pub(crate) fn detach_array_buffer(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     // QuickJS's `JS_DetachArrayBuffer`: anything but an ArrayBuffer is
     // ignored, and the result is `undefined`.
@@ -1208,9 +1372,10 @@ pub(crate) fn detach_array_buffer(cx: &mut Cx<'_>, site: CallSite) -> Result<Val
 }
 
 pub(crate) use bigint::to_bigint;
+pub(crate) use buffer::detach as detach_buffer;
 pub(crate) use date::iso_string as date_iso_string;
 pub(crate) use generator::async_from_sync_iterator;
-pub(crate) use json::{json_parse_text, json5_parse_text};
+pub(crate) use json::json_module_text;
 pub(crate) use regexp::RegExpFlagCache;
 
 /// An ordinary object inheriting from `%Object.prototype%`, rooted.

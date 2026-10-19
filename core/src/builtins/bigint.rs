@@ -1,13 +1,12 @@
-//! `BigInt` (phase 4, section 6.1 row 5): the function (callable, not
-//! constructible), `asIntN`, `asUintN`, and `BigInt.prototype`'s
-//! `toString(radix)`, `toLocaleString` and `valueOf`.
+//! `BigInt`: the function (callable, not constructible), `asIntN`, `asUintN`,
+//! and `BigInt.prototype`'s `toString(radix)`, `toLocaleString` and `valueOf`.
 
-use super::{Native, install_constructor, methods, string_text, to_string_tag};
+use super::{Native, install_constructor, link_constructor, methods, string_text, to_string_tag};
 use crate::heap::HeapError;
 use crate::heap::object::ObjectKind;
 use crate::runtime::Intrinsic;
 use crate::value::{Kind, Value};
-use crate::vm::bigint::{Big, BigError};
+use crate::vm::bigint::{Big, BigError, qjs};
 use crate::vm::native::CallSite;
 use crate::vm::object as internal;
 use crate::vm::{Cx, Throw, error, ops};
@@ -16,19 +15,20 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     let object_prototype = cx.realm.intrinsic(Intrinsic::ObjectPrototype);
     let prototype = super::plain_object(cx, Some(object_prototype), 4)?;
     cx.set_intrinsic(Intrinsic::BigIntPrototype, prototype);
-    let bigint = install_constructor(cx, Native::BigIntConstructor, prototype)?;
+    let bigint = install_constructor(cx, Native::BigIntConstructor)?;
     cx.set_intrinsic(Intrinsic::BigInt, bigint);
-    methods(cx, bigint, &[Native::BigIntAsIntN, Native::BigIntAsUintN])?;
+    methods(cx, bigint, &[Native::BigIntAsUintN, Native::BigIntAsIntN])?;
     methods(
         cx,
         prototype,
         &[
-            Native::BigIntToLocaleString,
             Native::BigIntToString,
+            Native::BigIntToLocaleString,
             Native::BigIntValueOf,
         ],
     )?;
-    to_string_tag(cx, prototype, "BigInt")
+    to_string_tag(cx, prototype, "BigInt")?;
+    link_constructor(cx, bigint, prototype)
 }
 
 fn alloc(cx: &mut Cx<'_>, value: Result<Big, BigError>) -> Result<Value, Throw> {
@@ -38,32 +38,47 @@ fn alloc(cx: &mut Cx<'_>, value: Result<Big, BigError>) -> Result<Value, Throw> 
             .alloc_bigint(value.negative, &value.limbs)
             .map(Value::bigint)
             .map_err(|error| error::heap_error(cx, error)),
-        Err(_) => Err(error::range_error(cx, "BigInt is too large")),
+        Err(_) => Err(too_large(cx)),
     }
+}
+
+#[cold]
+#[inline(never)]
+fn too_large(cx: &mut Cx<'_>) -> Throw {
+    error::range_error(cx, "BigInt is too large to allocate")
 }
 
 /// `ToBigInt(value)`.
 pub(crate) fn to_bigint(cx: &mut Cx<'_>, value: Value) -> Result<Value, Throw> {
+    convert(cx, value, false)
+}
+
+/// `ToBigInt(value)`; `constructor` selects the `BigInt(value)` messages
+/// (QuickJS's `JS_ToBigIntCtorFree`) over `ToBigInt`'s.
+fn convert(cx: &mut Cx<'_>, value: Value, constructor: bool) -> Result<Value, Throw> {
     let primitive = ops::to_primitive(cx, value, ops::Hint::Number)?;
+    let failure = if constructor {
+        "cannot convert to BigInt"
+    } else {
+        "cannot convert to bigint"
+    };
     match primitive.kind() {
         Kind::BigInt => Ok(primitive),
         Kind::Bool => alloc(cx, Ok(Big::from_u64(u64::from(primitive == Value::TRUE)))),
         Kind::String => {
             let text = ops::string_text(cx.heap, primitive);
-            match Big::parse(&text) {
-                Some(value) => alloc(cx, Ok(value)),
+            match Big::parse_checked(&text) {
+                Some(value) => alloc(cx, value),
                 None => Err(error::throw(
                     cx,
                     crate::ErrorKind::Syntax,
-                    "invalid BigInt syntax",
+                    "invalid bigint literal",
                 )),
             }
         }
-        Kind::Undefined | Kind::Null | Kind::Empty => {
-            Err(error::type_error(cx, "cannot convert to BigInt"))
+        Kind::Undefined | Kind::Null | Kind::Empty | Kind::Number | Kind::Int32 | Kind::Symbol => {
+            Err(error::type_error(cx, failure))
         }
-        Kind::Number | Kind::Int32 => Err(error::type_error(cx, "cannot convert number to BigInt")),
-        Kind::Symbol => Err(error::type_error(cx, "cannot convert symbol to BigInt")),
         Kind::Object => unreachable!("ToPrimitive returned an object"),
     }
 }
@@ -71,21 +86,27 @@ pub(crate) fn to_bigint(cx: &mut Cx<'_>, value: Value) -> Result<Value, Throw> {
 /// `BigInt(value)`.
 pub(super) fn constructor(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     if site.construct {
-        return Err(error::type_error(cx, "BigInt is not a constructor"));
+        return Err(error::not_a_constructor(cx, site.new_target));
     }
     let value = site.arg(cx, 0);
     let primitive = ops::to_primitive(cx, value, ops::Hint::Number)?;
     if let Some(number) = primitive.as_f64() {
-        if !number.is_finite() || number.trunc() != number {
+        if !number.is_finite() {
             return Err(error::range_error(
                 cx,
-                "cannot convert a non-integer number to BigInt",
+                "cannot convert NaN or Infinity to BigInt",
+            ));
+        }
+        if number.trunc() != number {
+            return Err(error::range_error(
+                cx,
+                "cannot convert to BigInt: not an integer",
             ));
         }
         let big = Big::from_f64(number).expect("an integer");
         return alloc(cx, Ok(big));
     }
-    to_bigint(cx, primitive)
+    convert(cx, primitive, true)
 }
 
 /// `thisBigIntValue`.
@@ -106,6 +127,8 @@ pub(super) fn value_of(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> 
     this_bigint(cx, &site)
 }
 
+/// `BigInt.prototype.toLocaleString` (21.2.3.2): without ECMA-402, the
+/// value's `toString`.
 pub(super) fn to_locale_string(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let value = this_bigint(cx, &site)?;
     ops::to_string(cx, value)
@@ -123,6 +146,9 @@ pub(super) fn to_string(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw>
         return Err(error::range_error(cx, "radix must be between 2 and 36"));
     }
     let big = ops::big(cx.heap, value);
+    if qjs::to_string_check(&big, radix as u32).is_err() {
+        return Err(too_large(cx));
+    }
     string_text(cx, &radix_text(&big, radix as u32))
 }
 
@@ -136,6 +162,27 @@ pub(crate) fn radix_text(value: &Big, radix: u32) -> String {
     }
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let mut out = Vec::new();
+    if radix.is_power_of_two() {
+        // Read the digits off the bits, low first.
+        let width = radix.trailing_zeros() as u64;
+        let limbs = &value.limbs;
+        let bits = limbs.len() as u64 * 64 - u64::from(limbs.last().unwrap().leading_zeros());
+        let mut position = 0;
+        while position < bits {
+            let (index, offset) = ((position / 64) as usize, position % 64);
+            let mut digit = limbs[index] >> offset;
+            if offset + width > 64 && index + 1 < limbs.len() {
+                digit |= limbs[index + 1] << (64 - offset);
+            }
+            out.push(DIGITS[(digit & u64::from(radix - 1)) as usize]);
+            position += width;
+        }
+        if value.negative {
+            out.push(b'-');
+        }
+        out.reverse();
+        return String::from_utf8(out).expect("ASCII digits");
+    }
     let mut rest = Big::new(false, value.limbs.clone());
     let divisor = Big::from_u64(u64::from(radix));
     while !rest.is_zero() {
@@ -150,47 +197,18 @@ pub(crate) fn radix_text(value: &Big, radix: u32) -> String {
     String::from_utf8(out).expect("ASCII digits")
 }
 
-/// `asIntN` and `asUintN`: `bigint mod 2^bits`, as a signed value for
-/// `asIntN`.
+/// `asIntN` and `asUintN`, as QuickJS computes them ([`qjs::as_n`]).
 fn as_n(cx: &mut Cx<'_>, site: CallSite, signed: bool) -> Result<Value, Throw> {
     let bits = site.arg(cx, 0);
     let bits = to_index(cx, bits)?;
     let value = site.arg(cx, 1);
     let value = to_bigint(cx, value)?;
     cx.heap.roots().push(value);
-    if bits == 0 {
-        return alloc(cx, Ok(Big::zero()));
-    }
     let big = ops::big(cx.heap, value);
-    // Values that fit need no reduction.
-    let magnitude_bits = big.limbs.len() as u64 * 64
-        - u64::from(big.limbs.last().map_or(64, |top| top.leading_zeros()));
-    if !signed && !big.negative && magnitude_bits <= bits {
-        return Ok(value);
+    match qjs::as_n(&big, bits, signed) {
+        Ok(result) if result == big => Ok(value),
+        result => alloc(cx, result),
     }
-    if signed && magnitude_bits < bits {
-        return Ok(value);
-    }
-    if bits > (1 << 30) {
-        return Err(error::range_error(cx, "BigInt is too large"));
-    }
-    let modulus = Big::from_u64(1).shl(&Big::from_u64(bits));
-    let Ok(modulus) = modulus else {
-        return Err(error::range_error(cx, "BigInt is too large"));
-    };
-    let (_, mut remainder) = big.div_rem(&modulus).expect("a non-zero modulus");
-    if remainder.negative {
-        remainder = remainder.add(&modulus).expect("within the limit");
-    }
-    if signed {
-        let half = Big::from_u64(1)
-            .shl(&Big::from_u64(bits - 1))
-            .expect("within the limit");
-        if remainder.cmp(&half) != std::cmp::Ordering::Less {
-            remainder = remainder.sub(&modulus).expect("within the limit");
-        }
-    }
-    alloc(cx, Ok(remainder))
 }
 
 pub(super) fn as_int_n(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {

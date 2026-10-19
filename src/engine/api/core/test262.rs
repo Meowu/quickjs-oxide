@@ -1,9 +1,8 @@
-//! The new core's side of the Test262 runner (phase 4, section 7.1): one
+//! The engine's side of the Test262 runner: one
 //! worker runtime with `$262`, `print` captured instead of written, the
 //! harness and the test as separate scripts, an exact module resolver
 //! supplied by the runner, and diagnostics read without running
-//! JavaScript. The Test262 runner is its only user (new-core phase 6,
-//! section 2.5).
+//! JavaScript. The Test262 runner is its only user.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -373,7 +372,9 @@ fn load_module(
         .iter()
         .any(|(key, value)| key == "type" && value == "json");
     if json {
-        return Ok(ModuleSource::Json(source.encode_utf16().collect()));
+        return Ok(ModuleSource::Json(
+            source.encode_utf16().collect::<Vec<u16>>().into(),
+        ));
     }
     let failed = |error: CompileError, diagnostic: Option<Diagnostic>| {
         *state.load_error.borrow_mut() = diagnostic;

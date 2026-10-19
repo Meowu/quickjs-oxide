@@ -2,7 +2,7 @@ use crate::object_graph_observation::global_callable;
 use crate::runtime_completion_oracle::observe_array_aware_eval as observe_rust_eval;
 use crate::runtime_observation::property_callable_with_read_context as property_callable;
 use crate::runtime_observation::{host_runtime, host_runtime_context};
-use quickjs_oxide::engine::api::{CallableRef, Context, Runtime, Value};
+use quickjs_oxide::engine::api::core::{CallableRef, Context, Runtime, Value};
 
 // This differential pins the first coherent `%Object%` vertical slice to
 // QuickJS 2026-06-04. Source cases deliberately use only the selected static
@@ -26,7 +26,9 @@ const DEFINE_PROPERTIES_PROXY_ORDER: &str = r#"(function(){
 })()"#;
 
 #[test]
-fn object_define_properties_pins_quickjs_proxy_batch_order_without_an_oracle() {
+/// ObjectDefineProperties (20.1.2.3.1): each key's [[GetOwnProperty]] and
+/// Get in turn; QuickJS reads every descriptor first (QUICKJS-SPEC-004).
+fn object_define_properties_reads_each_descriptor_then_its_value() {
     let (runtime, mut context) = host_runtime_context();
     assert_eq!(
         observe_rust_eval(
@@ -35,8 +37,8 @@ fn object_define_properties_pins_quickjs_proxy_batch_order_without_an_oracle() {
             DEFINE_PROPERTIES_PROXY_ORDER,
             "Object.defineProperties Proxy batch order",
         ),
-        "return|string|ownKeys,getOwnPropertyDescriptor,getOwnPropertyDescriptor,get,get|\
-         ownKeys,getOwnPropertyDescriptor,getOwnPropertyDescriptor,get,get",
+        "return|string|ownKeys,getOwnPropertyDescriptor,get,getOwnPropertyDescriptor,get|\
+         ownKeys,getOwnPropertyDescriptor,get,getOwnPropertyDescriptor,get",
     );
 }
 

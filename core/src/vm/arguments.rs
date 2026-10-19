@@ -1,5 +1,5 @@
-//! A frame's actual arguments (phase 3, section 5.1) and the argument lists
-//! of `apply`, `call` and spread calls (section 5.2).
+//! A frame's actual arguments and the argument lists of `apply`, `call` and
+//! spread calls.
 //!
 //! A function that reads its actual arguments (the `ARGUMENTS` unit flag)
 //! finds the first `parameter_count` of them in its parameter registers and
@@ -17,7 +17,7 @@ use crate::shape::PropertyFlags;
 use crate::value::{ObjectId, ScopeId, Value};
 
 /// The most arguments a list expands to, QuickJS's `JS_MAX_LOCAL_VARS`.
-const MAX_ARGUMENTS: usize = 65_535;
+const MAX_ARGUMENTS: usize = 65_534;
 
 /// Actual argument `index` of a frame: a parameter register (read through
 /// its cell when the parameter is captured) or a kept extra argument.
@@ -184,6 +184,19 @@ pub(crate) fn mapped_cell(cx_heap: &crate::Heap, object: ObjectId, index: u32) -
     cell.as_object().map(|cell| ScopeId(cell.index()))
 }
 
+/// How many leading indices of an `arguments` object were mapped at its
+/// creation (0 for an unmapped one).
+pub(crate) fn mapped_count(cx_heap: &crate::Heap, object: ObjectId) -> u32 {
+    let header = cx_heap.header(object);
+    if header.kind != ObjectKind::Arguments || header.payload == NONE {
+        return 0;
+    }
+    cx_heap
+        .scope_get(ScopeId(header.payload), 0, 0)
+        .as_int32()
+        .map_or(0, |count| count as u32)
+}
+
 /// Ends the aliasing of a mapped index (`delete arguments[i]`): the cell
 /// stays with the parameter, the `arguments` object forgets it.
 pub(crate) fn unmap(cx_heap: &mut crate::Heap, object: ObjectId, index: u32) {
@@ -261,7 +274,7 @@ fn expand(cx: &mut Cx<'_>, first: usize, list: Value) -> Result<usize, Throw> {
         return Ok(0);
     }
     let Some(object) = list.as_object() else {
-        return Err(error::type_error(cx, "not an object"));
+        return Err(error::type_error(cx, "not a object"));
     };
     let mark = cx.heap.roots().mark();
     cx.heap.roots().push(list);
@@ -273,7 +286,10 @@ fn expand(cx: &mut Cx<'_>, first: usize, list: Value) -> Result<usize, Throw> {
 fn expand_rooted(cx: &mut Cx<'_>, first: usize, object: ObjectId) -> Result<usize, Throw> {
     let length = array_like_length(cx, object)?;
     if length > MAX_ARGUMENTS {
-        return Err(error::range_error(cx, "too many arguments"));
+        return Err(error::range_error(
+            cx,
+            "too many arguments in function call (only 65534 allowed)",
+        ));
     }
     let end = first + length;
     if !cx.heap.vm.reserve(end) {
@@ -333,13 +349,16 @@ pub(crate) fn list_from_array_like(cx: &mut Cx<'_>, list: Value) -> Result<usize
         return Ok(start);
     }
     let Some(object) = list.as_object() else {
-        return Err(error::type_error(cx, "not an object"));
+        return Err(error::type_error(cx, "not a object"));
     };
     cx.heap.roots().push(list);
     let start = cx.heap.roots().len();
     let length = array_like_length(cx, object)?;
     if length > MAX_ARGUMENTS {
-        return Err(error::range_error(cx, "too many arguments"));
+        return Err(error::range_error(
+            cx,
+            "too many arguments in function call (only 65534 allowed)",
+        ));
     }
     for index in 0..length {
         let value = element(cx, object, index as u32)?;
@@ -349,8 +368,12 @@ pub(crate) fn list_from_array_like(cx: &mut Cx<'_>, list: Value) -> Result<usize
 }
 
 /// `AppendSpread`: appends the values `source` iterates to `array` from
-/// `index`; returns the next index. A pristine array or an `arguments`
-/// object whose iteration is unmodified is copied directly.
+/// `index`; returns the next index. A pristine array is walked directly.
+/// Anything else is GetIterator (one `@@iterator` read) and
+/// IteratorStepValue until done (13.2.4.1, 13.3.8.1); a throw while
+/// stepping does not close the iterator. A fast array whose method is
+/// `%Array.prototype.values%` and whose iterator's `next` is the intrinsic
+/// one is copied as it stands, which no code can observe.
 #[inline(never)]
 pub(crate) fn append_spread(
     cx: &mut Cx<'_>,
@@ -363,15 +386,66 @@ pub(crate) fn append_spread(
     let mark = cx.heap.roots().mark();
     cx.heap.roots().push(source);
     let result = (|| {
-        let mut iter = super::iter::get_iterator(cx, source)?;
-        while let Some(value) = super::iter::step(cx, &mut iter)? {
-            cx.heap
+        let mut push = |cx: &mut Cx<'_>, value: Value| {
+            let result = cx
+                .heap
                 .set_element(array, next, value)
-                .map_err(|_| error::oom(cx.realm))?;
+                .map_err(|_| error::oom(cx.realm));
             next += 1;
+            result
+        };
+        if super::iter::is_pristine_array(cx, source) {
+            let mut iter = super::iter::get_iterator(cx, source)?;
+            while let Some(value) = super::iter::step(cx, &mut iter)? {
+                push(cx, value)?;
+            }
+            return Ok(());
         }
-        Ok(Value::int32(next as i32))
+        let key = crate::runtime::WellKnown::key(cx.realm.symbols.iterator);
+        let Some(method) = super::object::get_method(cx, source, key)? else {
+            return Err(error::type_error(cx, "value is not iterable"));
+        };
+        cx.heap.roots().push(method);
+        let array_values = method == Value::object(cx.realm.intrinsic(Intrinsic::ArrayValues));
+        let mut iter = super::iter::from_method(cx, source, method)?;
+        if array_values
+            && let super::iter::Iter::Protocol { next: step, .. } = iter
+            && step.as_object().is_some_and(|step| {
+                cx.heap.object_kind(step) == ObjectKind::Function
+                    && cx.heap.function_record(step).native
+                        == crate::builtins::Native::ArrayIteratorNext.index()
+            })
+            && let Some(length) = fast_array_length(cx, source)
+        {
+            let source = source.as_object().unwrap();
+            for index in 0..length {
+                let value = cx.heap.get_element(source, index);
+                push(cx, value)?;
+            }
+            return Ok(());
+        }
+        while let Some(value) = super::iter::step(cx, &mut iter)? {
+            push(cx, value)?;
+        }
+        Ok(())
     })();
     cx.heap.roots().truncate(mark);
-    result
+    result.map(|()| Value::int32(next as i32))
+}
+
+/// The length of `value` when it is a fast array in QuickJS's sense (dense,
+/// with an element at every index below its length).
+fn fast_array_length(cx: &Cx<'_>, value: Value) -> Option<u32> {
+    let array = value.as_object()?;
+    let heap = &*cx.heap;
+    if heap.object_kind(array) != ObjectKind::Array
+        || heap.header(array).has(crate::heap::object::flags::SPARSE)
+        || heap.holey.contains(&array.0)
+    {
+        return None;
+    }
+    let length = heap.array_length(array);
+    (0..length)
+        .all(|index| !heap.get_element(array, index).is_empty())
+        .then_some(length)
 }

@@ -5,7 +5,7 @@
 
 use std::cmp::Ordering;
 
-use super::bigint::{Big, BigError};
+use super::bigint::{Big, BigError, qjs};
 use super::error;
 use super::number;
 use super::property;
@@ -143,8 +143,8 @@ pub(crate) const MAX_STRING_LEN: usize = (1 << 30) - 1;
 
 /// `a + b` for two strings.
 ///
-/// A result of at least [`ROPE_MIN`] units is a rope (section 3.3); a
-/// shorter one is copied, which keeps short keys flat.
+/// A result of at least [`ROPE_MIN`] units is a rope; a shorter one is copied,
+/// which keeps short keys flat.
 pub(crate) fn concat(cx: &mut Cx<'_>, a: StringId, b: StringId) -> Result<Value, Throw> {
     let (left_len, right_len) = (cx.heap.string_len(a), cx.heap.string_len(b));
     if right_len == 0 {
@@ -155,7 +155,7 @@ pub(crate) fn concat(cx: &mut Cx<'_>, a: StringId, b: StringId) -> Result<Value,
     }
     if left_len + right_len >= ROPE_MIN {
         if left_len + right_len > MAX_STRING_LEN {
-            return Err(error::range_error(cx, "invalid string length"));
+            return Err(error::string_too_long(cx));
         }
         return cx
             .heap
@@ -211,10 +211,7 @@ fn to_primitive_object(cx: &mut Cx<'_>, object: ObjectId, hint: Hint) -> Result<
     };
     if !exotic.is_undefined() && !exotic.is_null() {
         if !is_callable(cx.heap, exotic) {
-            return Err(error::type_error(
-                cx,
-                "Symbol.toPrimitive is not a function",
-            ));
+            return Err(error::type_error(cx, "not a function"));
         }
         let hint = match hint {
             Hint::Default => names.default,
@@ -291,8 +288,11 @@ pub(crate) fn to_string(cx: &mut Cx<'_>, value: Value) -> Result<Value, Throw> {
         Kind::Null => Ok(Value::string(names.null)),
         Kind::Symbol => Err(error::type_error(cx, "cannot convert symbol to string")),
         Kind::BigInt => {
-            let text = big(cx.heap, value).to_string_radix10();
-            alloc_text(cx, &text)
+            let value = big(cx.heap, value);
+            if qjs::to_string_check(&value, 10).is_err() {
+                return Err(error::range_error(cx, "BigInt is too large to allocate"));
+            }
+            alloc_text(cx, &value.to_string_radix10())
         }
         Kind::Object => {
             let primitive = to_primitive(cx, value, Hint::String)?;
@@ -397,17 +397,28 @@ fn big_value(cx: &mut Cx<'_>, value: Result<Big, BigError>) -> Result<Value, Thr
             .alloc_bigint(value.negative, &value.limbs)
             .map(Value::bigint)
             .map_err(|error| heap_error(cx, error)),
-        Err(BigError::DivisionByZero) => Err(error::range_error(cx, "Division by zero")),
-        Err(BigError::NegativeExponent) => Err(error::range_error(cx, "Negative exponent")),
-        Err(BigError::TooLarge) => Err(error::range_error(cx, "BigInt is too large")),
+        Err(BigError::DivisionByZero) => Err(error::range_error(cx, "BigInt division by zero")),
+        Err(BigError::NegativeExponent) => Err(error::range_error(cx, "BigInt negative exponent")),
+        Err(BigError::TooLarge) => Err(error::range_error(cx, "BigInt is too large to allocate")),
+        Err(BigError::PowTooLarge) => Err(error::range_error(cx, "BigInt is too large")),
     }
 }
 
-fn mixed(cx: &mut Cx<'_>) -> Throw {
-    error::type_error(
-        cx,
-        "cannot mix BigInt and other types, use explicit conversions",
-    )
+/// A BigInt and a number in one operator: QuickJS converts the BigInt to a
+/// number and fails (`>>>` refuses any BigInt operand first).
+#[cold]
+#[inline(never)]
+fn mixed(cx: &mut Cx<'_>, op: Arith) -> Throw {
+    if op == Arith::Shr {
+        return shr_bigint(cx);
+    }
+    error::type_error(cx, "cannot convert bigint to number")
+}
+
+#[cold]
+#[inline(never)]
+fn shr_bigint(cx: &mut Cx<'_>) -> Throw {
+    error::type_error(cx, "bigint operands are forbidden for >>>")
 }
 
 // ---- arithmetic ----
@@ -474,27 +485,22 @@ fn numeric(cx: &mut Cx<'_>, op: Arith, x: Value, y: Value) -> Result<Value, Thro
         (true, true) => {
             let (a, b) = (big(cx.heap, a), big(cx.heap, b));
             let result = match op {
-                Arith::Add => a.add(&b),
-                Arith::Sub => a.sub(&b),
-                Arith::Mul => a.mul(&b),
-                Arith::Div => a.div_rem(&b).map(|(quotient, _)| quotient),
-                Arith::Mod => a.div_rem(&b).map(|(_, remainder)| remainder),
-                Arith::Pow => a.pow(&b),
-                Arith::Shl => a.shl(&b),
-                Arith::Sar => a.shl(&b.neg()),
-                Arith::Shr => {
-                    return Err(error::type_error(
-                        cx,
-                        "bigints have no unsigned right shift, use >> instead",
-                    ));
-                }
-                Arith::BitAnd => Ok(a.bit_and(&b)),
-                Arith::BitOr => Ok(a.bit_or(&b)),
-                Arith::BitXor => Ok(a.bit_xor(&b)),
+                Arith::Add => qjs::add(&a, &b, false),
+                Arith::Sub => qjs::add(&a, &b, true),
+                Arith::Mul => qjs::mul(&a, &b),
+                Arith::Div => qjs::div_rem(&a, &b, false),
+                Arith::Mod => qjs::div_rem(&a, &b, true),
+                Arith::Pow => qjs::pow(&a, &b),
+                Arith::Shl => qjs::shift(&a, &b, false),
+                Arith::Sar => qjs::shift(&a, &b, true),
+                Arith::Shr => return Err(shr_bigint(cx)),
+                Arith::BitAnd => qjs::logic(&a, &b, Big::bit_and),
+                Arith::BitOr => qjs::logic(&a, &b, Big::bit_or),
+                Arith::BitXor => qjs::logic(&a, &b, Big::bit_xor),
             };
             big_value(cx, result)
         }
-        _ => Err(mixed(cx)),
+        _ => Err(mixed(cx, op)),
     }
 }
 
@@ -532,18 +538,23 @@ pub(crate) enum Unary {
 #[inline(never)]
 pub(crate) fn unary(cx: &mut Cx<'_>, op: Unary, x: Value) -> Result<Value, Throw> {
     if op == Unary::Plus {
-        return Ok(number::number(to_number(cx, x)?));
+        let value = to_numeric(cx, x)?;
+        let Some(number) = value.as_f64() else {
+            return Err(error::type_error(cx, "bigint argument with unary +"));
+        };
+        return Ok(number::number(number));
     }
     let value = to_numeric(cx, x)?;
     if value.as_bigint().is_some() {
         let value = big(cx.heap, value);
         let one = Big::from_i64(1);
         let result = match op {
-            Unary::Neg => Ok(value.neg()),
+            Unary::Neg => qjs::neg(&value),
             Unary::ToNumeric => Ok(value),
-            Unary::Inc => value.add(&one),
-            Unary::Dec => value.sub(&one),
-            Unary::BitNot => Ok(value.bit_not()),
+            Unary::Inc => qjs::add(&value, &one, false),
+            // BigInt::subtract (13.4.5.1): x - 1 for every BigInt.
+            Unary::Dec => qjs::add(&value, &one, true),
+            Unary::BitNot => qjs::not(&value),
             Unary::Plus => unreachable!(),
         };
         return big_value(cx, result);
@@ -801,17 +812,52 @@ pub(crate) fn instance_of(cx: &mut Cx<'_>, x: Value, f: Value) -> Result<bool, T
         });
     if !intrinsic && !handler.is_undefined() && !handler.is_null() {
         if !is_callable(cx.heap, handler) {
-            return Err(error::type_error(
-                cx,
-                "Symbol.hasInstance is not a function",
-            ));
+            return Err(error::type_error(cx, "not a function"));
         }
         let result = super::call(cx, handler, f, &[x])?;
         return Ok(to_boolean(cx.heap, result));
     }
-    if !is_callable(cx.heap, f) {
-        return Err(error::type_error(cx, "invalid 'instanceof' right operand"));
+    if !intrinsic {
+        // QuickJS's legacy case: no `@@hasInstance` at all.
+        if !is_callable(cx.heap, f) {
+            return Err(error::type_error(cx, "invalid 'instanceof' right operand"));
+        }
+        return ordinary_instance_of(cx, x, f, function);
     }
+    // The intrinsic `@@hasInstance` runs as a native in QuickJS: a throw
+    // inside lists it in the backtrace.
+    let handler = match handler.as_object() {
+        Some(_) => handler,
+        None => {
+            let key = crate::runtime::WellKnown::key(cx.realm.symbols.has_instance);
+            cx.heap
+                .lookup_own(function_prototype, key)
+                .map_or(Value::UNDEFINED, |(slot, _)| {
+                    cx.heap.get_slot(function_prototype, slot)
+                })
+        }
+    };
+    cx.heap.vm.natives.push(super::NativeSite {
+        depth: cx.heap.vm.frames.len() as u32,
+        pc: super::NO_PC,
+        callee: handler,
+    });
+    let result = if is_callable(cx.heap, f) {
+        ordinary_instance_of(cx, x, f, function)
+    } else {
+        Ok(false)
+    };
+    cx.heap.vm.natives.pop();
+    result
+}
+
+/// `OrdinaryHasInstance(f, x)` for a callable `f` (the object `function`).
+fn ordinary_instance_of(
+    cx: &mut Cx<'_>,
+    x: Value,
+    f: Value,
+    function: ObjectId,
+) -> Result<bool, Throw> {
     let Some(object) = x.as_object() else {
         return Ok(false);
     };
@@ -820,7 +866,7 @@ pub(crate) fn instance_of(cx: &mut Cx<'_>, x: Value, f: Value) -> Result<bool, T
     }
     let names = cx.realm.names;
     // The constructor's own data `prototype` is read straight from its slot
-    // (phase 3 M5, on Earley-Boyer's `instanceof` tests).
+    // (measured on Earley-Boyer's `instanceof` tests).
     let prototype = match cx.heap.lookup_own(function, Names::key(names.prototype)) {
         Some((slot, flags)) if !flags.has(crate::shape::PropertyFlags::ACCESSOR) => {
             cx.heap.get_slot(function, slot)

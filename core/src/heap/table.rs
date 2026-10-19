@@ -1,5 +1,4 @@
-//! The ordered hash table of `Map`, `Set`, `WeakMap` and `WeakSet` (phase
-//! 4, section 3.2).
+//! The ordered hash table of `Map`, `Set`, `WeakMap` and `WeakSet`.
 //!
 //! The entries live in the record's internal slots, one or two values each
 //! (`width`), in insertion order; a deleted entry's key is `Value::EMPTY`.
@@ -54,6 +53,17 @@ impl Table {
 
     pub fn width(&self) -> usize {
         self.width
+    }
+
+    /// Whether deleted entry `entry` is a QuickJS zombie: the record a live
+    /// iterator last returned, which QuickJS keeps linked (and its printer
+    /// shows as an empty item) until the iterator moves on.
+    pub fn is_zombie(&self, entry: usize) -> bool {
+        self.cursors.iter().any(|cursor| {
+            cursor
+                .upgrade()
+                .is_some_and(|cursor| cursor.get() as usize == entry + 1)
+        })
     }
 
     /// Entries, live or deleted: the bound of an iteration cursor.

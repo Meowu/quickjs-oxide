@@ -1,8 +1,7 @@
-//! `Math` (phase 4, section 6.1 row 5): every function and constant. The
-//! transcendental functions call the platform libm through Rust's `f64`
-//! methods, as the current core does (on the reference machine both use
-//! glibc). `round` is QuickJS's half-up on the bits, `random` its
-//! xorshift64*, `sumPrecise` an exact (Shewchuk) summation.
+//! `Math`: every function and constant. The transcendental functions call the
+//! platform libm through Rust's `f64` methods (glibc's on the reference
+//! machine, as QuickJS's). `round` is QuickJS's half-up on the bits, `random`
+//! its xorshift64*, `sumPrecise` an exact (Shewchuk) summation.
 
 use super::{Native, define, methods, plain_object, to_string_tag};
 use crate::heap::HeapError;
@@ -16,62 +15,63 @@ use crate::vm::{Cx, Throw, error, iter, ops};
 pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     let prototype = cx.realm.intrinsic(Intrinsic::ObjectPrototype);
     let math = plain_object(cx, Some(prototype), 48)?;
+    // QuickJS's `js_math_funcs`, in order.
+    methods(
+        cx,
+        math,
+        &[
+            Native::MathMin,
+            Native::MathMax,
+            Native::MathAbs,
+            Native::MathFloor,
+            Native::MathCeil,
+            Native::MathRound,
+            Native::MathSqrt,
+            Native::MathAcos,
+            Native::MathAsin,
+            Native::MathAtan,
+            Native::MathAtan2,
+            Native::MathCos,
+            Native::MathExp,
+            Native::MathLog,
+            Native::MathPow,
+            Native::MathSin,
+            Native::MathTan,
+            Native::MathTrunc,
+            Native::MathSign,
+            Native::MathCosh,
+            Native::MathSinh,
+            Native::MathTanh,
+            Native::MathAcosh,
+            Native::MathAsinh,
+            Native::MathAtanh,
+            Native::MathExpm1,
+            Native::MathLog1p,
+            Native::MathLog2,
+            Native::MathLog10,
+            Native::MathCbrt,
+            Native::MathHypot,
+            Native::MathRandom,
+            Native::MathF16round,
+            Native::MathFround,
+            Native::MathImul,
+            Native::MathClz32,
+            Native::MathSumPrecise,
+        ],
+    )?;
     let constant = PropertyFlags::data(false, false, false);
     for (name, value) in [
         ("E", std::f64::consts::E),
         ("LN10", std::f64::consts::LN_10),
         ("LN2", std::f64::consts::LN_2),
-        ("LOG10E", std::f64::consts::LOG10_E),
         ("LOG2E", std::f64::consts::LOG2_E),
+        ("LOG10E", std::f64::consts::LOG10_E),
         ("PI", std::f64::consts::PI),
         ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
         ("SQRT2", std::f64::consts::SQRT_2),
     ] {
         define(cx, math, name, Value::number(value), constant)?;
     }
-    methods(
-        cx,
-        math,
-        &[
-            Native::MathAbs,
-            Native::MathAcos,
-            Native::MathAcosh,
-            Native::MathAsin,
-            Native::MathAsinh,
-            Native::MathAtan,
-            Native::MathAtanh,
-            Native::MathAtan2,
-            Native::MathCbrt,
-            Native::MathCeil,
-            Native::MathClz32,
-            Native::MathCos,
-            Native::MathCosh,
-            Native::MathExp,
-            Native::MathExpm1,
-            Native::MathFloor,
-            Native::MathFround,
-            Native::MathF16round,
-            Native::MathHypot,
-            Native::MathImul,
-            Native::MathLog,
-            Native::MathLog1p,
-            Native::MathLog10,
-            Native::MathLog2,
-            Native::MathMax,
-            Native::MathMin,
-            Native::MathPow,
-            Native::MathRandom,
-            Native::MathRound,
-            Native::MathSign,
-            Native::MathSin,
-            Native::MathSinh,
-            Native::MathSqrt,
-            Native::MathSumPrecise,
-            Native::MathTan,
-            Native::MathTanh,
-            Native::MathTrunc,
-        ],
-    )?;
     to_string_tag(cx, math, "Math")?;
     let global = cx.realm.global();
     define(
@@ -138,8 +138,8 @@ unary! {
     trunc => f64::trunc;
 }
 
-/// fdlibm's `atanh`, as the current engine computes it: `f64::atanh`'s
-/// single expression loses thousands of ULPs next to -1.
+/// fdlibm's `atanh`: `f64::atanh`'s single expression loses thousands of ULPs
+/// next to -1.
 fn fdlibm_atanh(value: f64) -> f64 {
     let magnitude = value.abs();
     // Tiny inputs are their own correctly rounded result (and keep -0).
@@ -326,161 +326,200 @@ pub(super) fn random(cx: &mut Cx<'_>, _: CallSite) -> Result<Value, Throw> {
 pub(super) fn sum_precise(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let items = site.arg(cx, 0);
     if items.is_undefined() || items.is_null() {
-        return Err(error::type_error(cx, "not an object"));
+        return Err(error::not_iterable_nullish(cx, items));
     }
     let mut record = iter::get_iterator(cx, items)?;
     let mut values = Vec::new();
     while let Some(value) = iter::step(cx, &mut record)? {
+        if values.len() as u64 + 1 >= (1u64 << 53) {
+            let error = error::range_error(cx, "too many values");
+            iter::close(cx, &record, Err(error))?;
+        }
         let Some(value) = value.as_f64() else {
-            let error = error::type_error(cx, "Math.sumPrecise: not a number");
+            let error = error::type_error(cx, "not a number");
             iter::close(cx, &record, Err(error))?;
             unreachable!("close rethrows");
         };
         values.push(value);
-        if values.len() as u64 > (1u64 << 53) {
-            let error = error::range_error(cx, "too many values");
-            iter::close(cx, &record, Err(error))?;
-        }
     }
-    Ok(number(exact_sum(&values)))
+    let mut sum = SumPrecise::new();
+    for value in values {
+        sum.add(value);
+    }
+    Ok(number(sum.result()))
 }
 
-/// The correctly rounded sum (the proposal's specification: -0 for no
-/// values or only -0s, infinities and NaN by their rules, Shewchuk's
-/// partials otherwise with the overflow handled by a 2^1024 offset).
-fn exact_sum(values: &[f64]) -> f64 {
-    let mut positive_infinity = false;
-    let mut negative_infinity = false;
-    let mut all_negative_zero = true;
-    for &value in values {
-        if value.is_nan() {
-            return f64::NAN;
-        }
-        if value == f64::INFINITY {
-            positive_infinity = true;
-        } else if value == f64::NEG_INFINITY {
-            negative_infinity = true;
-        }
-        if !(value == 0.0 && value.is_sign_negative()) {
-            all_negative_zero = false;
-        }
-    }
-    if positive_infinity && negative_infinity {
-        return f64::NAN;
-    }
-    if positive_infinity {
-        return f64::INFINITY;
-    }
-    if negative_infinity {
-        return f64::NEG_INFINITY;
-    }
-    if all_negative_zero {
-        return -0.0;
-    }
-    // Shewchuk's algorithm, overflowing partials counted in units of
-    // 2^1024 (the proposal's reference implementation).
-    // 2^1023 and 2^971, the unit in the last place of `f64::MAX`.
-    const TWO_1023: f64 = f64::from_bits(0x7FE0_0000_0000_0000);
-    const MAX_ULP: f64 = f64::from_bits(0x7CA0_0000_0000_0000);
-    let mut partials: Vec<f64> = Vec::new();
-    let mut overflow = 0i64;
-    for &value in values {
-        let mut x = value;
-        let mut used = 0;
-        for index in 0..partials.len() {
-            let mut y = partials[index];
-            if x.abs() < y.abs() {
-                std::mem::swap(&mut x, &mut y);
-            }
-            let (mut high, mut low) = two_sum(x, y);
-            if high.is_infinite() {
-                let sign = if high > 0.0 { 1.0 } else { -1.0 };
-                overflow += sign as i64;
-                x = (x - sign * TWO_1023) - sign * TWO_1023;
-                if x.abs() < y.abs() {
-                    std::mem::swap(&mut x, &mut y);
-                }
-                (high, low) = two_sum(x, y);
-            }
-            if low != 0.0 {
-                partials[used] = low;
-                used += 1;
-            }
-            x = high;
-        }
-        partials.truncate(used);
-        if x != 0.0 {
-            partials.push(x);
+/// The exact sum of `Math.sumPrecise` (ES2026): a fixed-point accumulator
+/// in 56-bit limbs (as QuickJS's `SumPreciseState`), renormalized before a
+/// limb can leave the `i64` range. Each addition adds less than 2^56 to a
+/// limb, so 127 additions after a renormalization stay below 2^63 (QuickJS
+/// waits 250, and its limbs wrap).
+struct SumPrecise {
+    state: SumState,
+    counter: u32,
+    limbs: usize,
+    acc: [i64; SUM_ACC_LEN],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SumState {
+    Finite,
+    Infinity,
+    MinusInfinity,
+    NaN,
+}
+
+const SP_LIMB_BITS: u32 = 56;
+const SP_RND_BITS: u32 = SP_LIMB_BITS - 53;
+const SP_LIMB_MASK: i64 = (1 << SP_LIMB_BITS) - 1;
+const SUM_ACC_LEN: usize = 39;
+const SUM_COUNTER_INIT: u32 = 127;
+
+impl SumPrecise {
+    fn new() -> SumPrecise {
+        SumPrecise {
+            state: SumState::Finite,
+            counter: SUM_COUNTER_INIT,
+            limbs: 0,
+            acc: [0; SUM_ACC_LEN],
         }
     }
-    let mut n = partials.len() as isize - 1;
-    let mut high = 0.0;
-    let mut low = 0.0;
-    if overflow != 0 {
-        let next = if n >= 0 { partials[n as usize] } else { 0.0 };
-        n -= 1;
-        if overflow.abs() > 1 || (overflow > 0 && next > 0.0) || (overflow < 0 && next < 0.0) {
-            return if overflow > 0 {
-                f64::INFINITY
+
+    fn renorm(&mut self) {
+        let mut carry = 0i64;
+        for index in 0..self.limbs {
+            let value = self.acc[index].wrapping_add(carry);
+            self.acc[index] = value & SP_LIMB_MASK;
+            carry = value >> SP_LIMB_BITS;
+        }
+        if carry != 0 && self.limbs < SUM_ACC_LEN {
+            self.acc[self.limbs] = carry;
+            self.limbs += 1;
+        }
+    }
+
+    fn add(&mut self, value: f64) {
+        let bits = value.to_bits();
+        let negative = bits >> 63 == 1;
+        let exponent = ((bits >> 52) & 0x7ff) as u32;
+        let mut mantissa = bits & ((1 << 52) - 1);
+        let (position, shift);
+        if exponent == 2047 {
+            self.state = if mantissa != 0
+                || self.state == SumState::NaN
+                || (self.state == SumState::MinusInfinity && !negative)
+                || (self.state == SumState::Infinity && negative)
+            {
+                SumState::NaN
+            } else if negative {
+                SumState::MinusInfinity
             } else {
-                f64::NEG_INFINITY
+                SumState::Infinity
             };
-        }
-        (high, low) = two_sum(overflow as f64 * TWO_1023, next / 2.0);
-        low *= 2.0;
-        if (2.0 * high).is_infinite() {
-            if high > 0.0 {
-                if high == TWO_1023
-                    && low == -(MAX_ULP / 2.0)
-                    && n >= 0
-                    && partials[n as usize] < 0.0
-                {
-                    return f64::MAX;
+            return;
+        } else if exponent == 0 {
+            if mantissa == 0 {
+                if self.limbs == 0 && !negative {
+                    self.limbs = 1;
                 }
-                return f64::INFINITY;
+                return;
             }
-            if high == -TWO_1023 && low == MAX_ULP / 2.0 && n >= 0 && partials[n as usize] > 0.0 {
-                return -f64::MAX;
-            }
-            return f64::NEG_INFINITY;
+            position = 0;
+            shift = 0;
+        } else {
+            mantissa |= 1 << 52;
+            position = ((exponent - 1) / SP_LIMB_BITS) as usize;
+            shift = (exponent - 1) % SP_LIMB_BITS;
         }
-        if low != 0.0 {
-            let at = (n + 1) as usize;
-            if at < partials.len() {
-                partials[at] = low;
-            } else {
-                partials.push(low);
-            }
-            n += 1;
-            low = 0.0;
+        let low = ((mantissa << shift) as i64) & SP_LIMB_MASK;
+        let high = (mantissa >> (SP_LIMB_BITS - shift)) as i64;
+        if negative {
+            self.acc[position] = self.acc[position].wrapping_sub(low);
+            self.acc[position + 1] = self.acc[position + 1].wrapping_sub(high);
+        } else {
+            self.acc[position] = self.acc[position].wrapping_add(low);
+            self.acc[position + 1] = self.acc[position + 1].wrapping_add(high);
         }
-        high *= 2.0;
-    }
-    while n >= 0 {
-        let x = high;
-        let y = partials[n as usize];
-        n -= 1;
-        (high, low) = two_sum(x, y);
-        if low != 0.0 {
-            break;
+        self.limbs = self.limbs.max(position + 2);
+        self.counter -= 1;
+        if self.counter == 0 {
+            self.counter = SUM_COUNTER_INIT;
+            self.renorm();
         }
     }
-    if n >= 0
-        && ((low < 0.0 && partials[n as usize] < 0.0) || (low > 0.0 && partials[n as usize] > 0.0))
-    {
-        let y = low * 2.0;
-        let x = high + y;
-        let rounded = x - high;
-        if y == rounded {
-            high = x;
-        }
-    }
-    high
-}
 
-/// `(a + b, the rounding error)`.
-fn two_sum(a: f64, b: f64) -> (f64, f64) {
-    let high = a + b;
-    let low = b - (high - a);
-    (high, low)
+    fn result(&mut self) -> f64 {
+        match self.state {
+            SumState::Finite => {}
+            SumState::Infinity => return f64::INFINITY,
+            SumState::MinusInfinity => return f64::NEG_INFINITY,
+            SumState::NaN => return f64::NAN,
+        }
+        self.renorm();
+        let mut n = self.limbs;
+        if n == 0 {
+            return -0.0;
+        }
+        while n > 0 && self.acc[n - 1] == 0 {
+            n -= 1;
+        }
+        if n == 0 {
+            return 0.0;
+        }
+        let negative = self.acc[n - 1] < 0;
+        if negative {
+            let mut carry = 1u64;
+            for index in 0..n - 1 {
+                let value = (SP_LIMB_MASK as u64)
+                    .wrapping_sub(self.acc[index] as u64)
+                    .wrapping_add(carry);
+                carry = value >> SP_LIMB_BITS;
+                self.acc[index] = (value & SP_LIMB_MASK as u64) as i64;
+            }
+            self.acc[n - 1] = self.acc[n - 1]
+                .wrapping_neg()
+                .wrapping_add(carry as i64)
+                .wrapping_sub(1);
+            while n > 1 && self.acc[n - 1] == 0 {
+                n -= 1;
+            }
+        }
+        let sign = u64::from(negative) << 63;
+        if n == 1 && (self.acc[0] as u64) < (1 << 52) {
+            return f64::from_bits(sign | self.acc[0] as u64);
+        }
+        let mut p = n - 1;
+        let mut m = self.acc[p] as u64;
+        let shift = m.leading_zeros() as i64 - (64 - i64::from(SP_LIMB_BITS));
+        let mut e = (n as i64) * i64::from(SP_LIMB_BITS) - shift - 52;
+        if shift != 0 {
+            m = m.wrapping_shl(shift as u32);
+            if p > 0 {
+                p -= 1;
+                let shift1 = SP_LIMB_BITS as i64 - shift;
+                let below = self.acc[p] as u64;
+                let nonzero = below & ((1u64 << shift1) - 1);
+                m = m | (below >> shift1) | u64::from(nonzero != 0);
+            }
+        }
+        if m & ((1 << SP_RND_BITS) - 1) == 1 << (SP_RND_BITS - 1) {
+            while p > 0 {
+                p -= 1;
+                if self.acc[p] != 0 {
+                    m |= 1;
+                    break;
+                }
+            }
+        }
+        let addend = (1u64 << (SP_RND_BITS - 1)) - 1 + ((m >> SP_RND_BITS) & 1);
+        m = m.wrapping_add(addend) >> SP_RND_BITS;
+        if m == 1 << 53 {
+            e += 1;
+        }
+        if e >= 2047 {
+            f64::from_bits(sign | (2047 << 52))
+        } else {
+            f64::from_bits(sign | ((e as u64) << 52) | (m & ((1 << 52) - 1)))
+        }
+    }
 }

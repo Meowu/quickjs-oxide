@@ -1,9 +1,8 @@
-//! `$262.agent` (phase 4, section 6.1 row 12): Test262's multi-agent host,
-//! as QuickJS's `run-test262` implements it. Each agent is a thread with
-//! its own runtime running a script through the embedder's
-//! [`ScriptRunner`]; a broadcast hands every agent the shared bytes of a
-//! `SharedArrayBuffer` (an `Arc`, so no heap crosses threads) and waits
-//! until each has taken them; reports are strings in a shared queue.
+//! `$262.agent`: Test262's multi-agent host, as QuickJS's `run-test262`
+//! implements it. Each agent is a thread with its own runtime running a script
+//! through the embedder's [`ScriptRunner`]; a broadcast hands every agent the
+//! shared bytes of a `SharedArrayBuffer` (an `Arc`, so no heap crosses threads)
+//! and waits until each has taken them; reports are strings in a shared queue.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -73,7 +72,7 @@ pub struct AgentSelf {
 
 static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
-fn monotonic_ms() -> f64 {
+pub(super) fn monotonic_ms() -> f64 {
     START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
 }
 
@@ -197,7 +196,7 @@ pub(super) fn broadcast(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw>
                 Store::Owned(_) => unreachable!("a shared buffer"),
             }
         }
-        _ => return Err(error::type_error(cx, "not a SharedArrayBuffer")),
+        _ => return Err(error::object_expected(cx, "ArrayBuffer")),
     };
     let value = site.arg(cx, 1);
     let value = ops::to_number(cx, value)?;
@@ -249,7 +248,7 @@ pub(super) fn monotonic_now(_cx: &mut Cx<'_>, _site: CallSite) -> Result<Value, 
 pub(super) fn receive_broadcast(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let callback = site.arg(cx, 0);
     if !ops::is_callable(cx.heap, callback) {
-        return Err(error::type_error(cx, "not a function"));
+        return Err(error::type_error(cx, "expecting function"));
     }
     cx.heap.add_fixed_root(callback);
     if let Some(agent) = &mut cx.host.agent {

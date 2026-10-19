@@ -1,6 +1,6 @@
-//! The class, `super` and private-name opcodes (phase 4, section 5.1), the
-//! object spread copies and the environment references of destructuring
-//! (section 5.2). All run out of line through [`class_op`].
+//! The class, `super` and private-name opcodes, the object spread copies and
+//! the environment references of destructuring. All run out of line through
+//! [`class_op`].
 //!
 //! A class with private methods brands its instances: its home object holds
 //! a fresh private symbol under the realm's brand key, and the instance
@@ -67,9 +67,24 @@ fn class_op_rooted(
             let constructor = function(reg(cx, frame, insn.a));
             let home = reg(cx, frame, insn.b);
             let initializer = function(reg(cx, frame, insn.c));
+            let home = home.as_object().expect("a home object");
             cx.heap.function_record_mut(constructor).fields = initializer.index();
-            cx.heap.function_record_mut(initializer).home_object =
-                home.as_object().expect("a home object").index();
+            cx.heap.function_record_mut(initializer).home_object = home.index();
+            // The class body has ended: QuickJS's `OP_add_brand` gives the
+            // prototype its brand only now, so a computed key evaluated
+            // before sees none.
+            let record = cx.heap.function_record(initializer);
+            if record.bytecode != NONE
+                && cx
+                    .code
+                    .get(
+                        cx.heap
+                            .bytecode_unit(crate::value::BytecodeId(record.bytecode)),
+                    )
+                    .has(flags::BRAND)
+            {
+                ensure_brand(cx, home)?;
+            }
         }
         Opcode::InitFields => {
             let receiver = reg(cx, frame, insn.a);
@@ -109,12 +124,8 @@ fn class_op_rooted(
             let Some(base) = base.as_object() else {
                 return Err(super_base_error(cx, base, key));
             };
-            // QuickJS's call form reads with `base` as the receiver.
-            let receiver = if insn.imm != 0 {
-                Value::object(base)
-            } else {
-                receiver
-            };
+            // The reference's thisValue is the receiver in the call form
+            // too (QuickJS's reads with `base`).
             let value = object::get(cx, base, key, receiver)?;
             set_reg(cx, frame, insn.a, value);
         }
@@ -123,20 +134,21 @@ fn class_op_rooted(
             let base = reg(cx, frame, insn.a + 1);
             let key = reg(cx, frame, insn.a + 2);
             let value = reg(cx, frame, insn.a + 3);
-            let key = ops::to_property_key(cx, key)?;
+            // QuickJS rejects the base before converting the key.
             let Some(base) = base.as_object() else {
-                return Err(super_base_error(cx, base, key));
+                return Err(error::type_error(cx, "not an object"));
             };
+            let key = ops::to_property_key(cx, key)?;
             let done = object::set(cx, base, key, value, receiver)?;
             if !done && unit.has(flags::STRICT) {
-                return Err(object::read_only(cx, key));
+                return Err(property::set_failed(cx, base, key));
             }
         }
         Opcode::InitDerived => {
             let new_target = reg(cx, frame, insn.b);
             let parent = object::get_prototype_of(cx, frame.function)?;
             if !object::is_constructor(cx, parent) {
-                return Err(error::type_error(cx, "parent class must be a constructor"));
+                return Err(error::construct_error(cx, parent));
             }
             cx.heap.roots().push(parent);
             let args: Vec<Value> = (0..frame.argc as usize)
@@ -208,7 +220,6 @@ fn class_op_rooted(
             let method = function(reg(cx, frame, insn.a));
             let home = reg(cx, frame, insn.b).as_object().expect("a home object");
             cx.heap.function_record_mut(method).home_object = home.index();
-            ensure_brand(cx, home)?;
         }
         Opcode::NamePrivateMethod => {
             let method = function(reg(cx, frame, insn.a));
@@ -257,7 +268,7 @@ fn class_op_rooted(
                     cx,
                     &format!(
                         "private class field '{}' already exists",
-                        property::key_text(cx.heap, key)
+                        property::atom_text(cx.heap, key)
                     ),
                 ));
             }
@@ -299,13 +310,15 @@ fn class_op_rooted(
             let Some(target) = target.as_object() else {
                 return Err(error::type_error(cx, "invalid 'in' operand"));
             };
-            let has = has_brand(cx, target, method);
+            let has = brand_check(cx, Value::object(target), method)?;
             set_reg(cx, frame, insn.a, Value::bool(has));
         }
         Opcode::CopyData => {
             let target = reg(cx, frame, insn.a)
                 .as_object()
                 .expect("a literal object");
+            // A primitive source is converted (`{..."ab"}` copies 0 and 1;
+            // QuickJS spreads nothing from a primitive).
             let source = reg(cx, frame, insn.b);
             object::copy_data_properties(cx, target, source, &[])?;
         }
@@ -425,7 +438,7 @@ fn private_target(cx: &mut Cx<'_>, target: Value) -> Result<ObjectId, Throw> {
 fn missing_private(cx: &mut Cx<'_>, key: PropertyKey) -> Throw {
     let message = format!(
         "private class field '{}' does not exist",
-        property::key_text(cx.heap, key)
+        property::atom_text(cx.heap, key)
     );
     error::type_error(cx, &message)
 }
@@ -443,7 +456,7 @@ fn this_bound(cx: &mut Cx<'_>) -> Throw {
 fn super_base_error(cx: &mut Cx<'_>, base: Value, key: PropertyKey) -> Throw {
     let message = format!(
         "cannot read property '{}' of {}",
-        property::key_text(cx.heap, key),
+        property::atom_text(cx.heap, key),
         if base.is_null() { "null" } else { "undefined" }
     );
     error::type_error(cx, &message)
@@ -451,8 +464,13 @@ fn super_base_error(cx: &mut Cx<'_>, base: Value, key: PropertyKey) -> Throw {
 
 #[cold]
 fn binding_error(cx: &mut Cx<'_>, kind: ErrorKind, key: PropertyKey, after: &str) -> Throw {
-    let message = format!("'{}'{after}", property::key_text(cx.heap, key));
-    error::throw(cx, kind, &message)
+    // QuickJS quotes the name except in `{name} is not initialized`.
+    let message = if after == " is not initialized" {
+        error::atom_message(cx.heap, "", key, after)
+    } else {
+        error::atom_message(cx.heap, "'", key, &format!("'{after}"))
+    };
+    error::throw_units(cx, kind, &message)
 }
 
 /// `DefineClass`: the prototype object of the class made from `closure`,
@@ -468,7 +486,7 @@ fn make_class(
         if parent.is_null() {
             (None, cx.realm.intrinsic(Intrinsic::FunctionPrototype))
         } else if !object::is_constructor(cx, parent) {
-            return Err(error::type_error(cx, "parent class must be a constructor"));
+            return Err(error::type_error(cx, "parent class must be constructor"));
         } else {
             let parent_object = parent.as_object().unwrap();
             let names = cx.realm.names;
@@ -562,7 +580,7 @@ fn add_brand(cx: &mut Cx<'_>, home: ObjectId, target: ObjectId) -> Result<(), Th
     let brand = ensure_brand(cx, home)?;
     let key = private_key(brand);
     if cx.heap.lookup_own(target, key).is_some() {
-        return Err(error::type_error(cx, "private method already exists"));
+        return Err(error::type_error(cx, "private method is already present"));
     }
     cx.heap
         .add_property(
@@ -574,25 +592,30 @@ fn add_brand(cx: &mut Cx<'_>, home: ObjectId, target: ObjectId) -> Result<(), Th
         .map_err(|error| error::heap_error(cx, error))
 }
 
-fn has_brand(cx: &Cx<'_>, target: ObjectId, method: Value) -> bool {
-    let Some(method) = method.as_object() else {
-        return false;
+/// QuickJS's `JS_CheckBrand`: whether `target` carries the brand of the
+/// class whose method is `method`, after its checks in their order.
+#[cold]
+#[inline(never)]
+fn brand_check(cx: &mut Cx<'_>, target: Value, method: Value) -> Result<bool, Throw> {
+    let home = method
+        .as_object()
+        .filter(|&method| cx.heap.object_kind(method) == crate::ObjectKind::Function)
+        .map(|method| cx.heap.function_record(method).home_object)
+        .filter(|&home| home != NONE);
+    let Some(home) = home else {
+        return Err(error::type_error(cx, "not an object"));
     };
-    let home = cx.heap.function_record(method).home_object;
-    if home == NONE {
-        return false;
-    }
     let key = PropertyKey::symbol(cx.realm.brand);
     let Some((slot, _)) = cx.heap.lookup_own(ObjectId(home), key) else {
-        return false;
+        return Err(error::type_error(cx, "expecting <brand> private field"));
     };
     let brand = cx.heap.get_slot(ObjectId(home), slot);
-    cx.heap.lookup_own(target, private_key(brand)).is_some()
+    let target = private_target(cx, target)?;
+    Ok(cx.heap.lookup_own(target, private_key(brand)).is_some())
 }
 
 fn check_brand(cx: &mut Cx<'_>, target: Value, method: Value) -> Result<(), Throw> {
-    let target = private_target(cx, target)?;
-    if !has_brand(cx, target, method) {
+    if !brand_check(cx, target, method)? {
         return Err(error::type_error(cx, "invalid brand on object"));
     }
     Ok(())

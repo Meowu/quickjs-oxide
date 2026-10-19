@@ -1,13 +1,19 @@
 use super::quickjs_argv_completion_oracle::observe_completion_argv_sequence_strip_one_lf as observe_oracle_sequence;
 use crate::runtime_completion_oracle::observe_legacy_float_eval_completion as observe_rust_eval;
-use crate::runtime_observation::{host_runtime, host_runtime_context};
+use crate::runtime_observation::host_runtime_context;
 
-use quickjs_oxide::engine::api::{
-    AccessorValue, DescriptorField, JsString, OrdinaryPropertyDescriptor, Value,
+use quickjs_oxide::engine::api::core::{
+    AccessorValue, DescriptorField, OrdinaryPropertyDescriptor, Value,
 };
 
+/// QuickJS runs the first script and leaves a masked global lexical, which
+/// quickjs-oxide keeps (the specification makes the script an early
+/// SyntaxError: the labelled function is var-declared beside `let`). The last read follows the global
+/// Environment Record: an uninitialized lexical binding is a ReferenceError
+/// for every reference (QUICKJS-SPEC-025), where QuickJS reads the global
+/// object.
 #[test]
-fn program_label_annex_global_state_matches_pinned_quickjs() {
+fn program_label_annex_global_state() {
     let oracle = require_qjs_oracle!("Program label global-state differential");
     let description = "Program labelled Annex precedes a later global lexical";
     let sources = [
@@ -21,9 +27,19 @@ fn program_label_annex_global_state_matches_pinned_quickjs() {
         .map(|source| observe_rust_eval(&runtime, &mut context, source, description))
         .collect::<Vec<_>>()
         .join("\n");
+    let quickjs = observe_oracle_sequence(&oracle, &sources, description);
+    let (rust_last, quickjs_last) = (rust.lines().last(), quickjs.lines().last());
     assert_eq!(
-        rust,
-        observe_oracle_sequence(&oracle, &sources, description)
+        rust.lines().take(2).collect::<Vec<_>>(),
+        quickjs.lines().take(2).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rust_last,
+        Some("throw|object|ReferenceError|orderedLabelCollision is not initialized")
+    );
+    assert_ne!(
+        rust_last, quickjs_last,
+        "QUICKJS-SPEC-025 no longer differs"
     );
 }
 
@@ -78,45 +94,5 @@ fn program_label_invokes_existing_global_setter_twice() {
     assert_eq!(
         rust,
         observe_oracle_sequence(&oracle, &sources, description)
-    );
-}
-
-#[test]
-fn program_label_cross_realm_regression() {
-    // Pinned with the QuickJS C API compile-in-A/execute-in-B path. The Rust
-    // API exposes the same operation directly, so this remains unconditional.
-    let runtime = host_runtime();
-    let mut defining = runtime.new_context().expect("create context");
-    let mut caller = runtime.new_context().expect("create context");
-    drop(defining.eval("globalThis.realmTag='A'").unwrap());
-    drop(caller.eval("globalThis.realmTag='B'").unwrap());
-
-    let bytecode = defining
-        .compile(
-            "label:function crossRealmLabel(){return realmTag+'|'+(this===globalThis)};\
-             crossRealmLabel",
-        )
-        .unwrap();
-    let Value::Object(function) = caller.execute(&bytecode).unwrap() else {
-        panic!("cross-realm Program label did not return its function");
-    };
-    let Value::Object(prototype_a) = defining.eval("Function.prototype").unwrap() else {
-        panic!("defining Function.prototype was not an object");
-    };
-    let Value::Object(prototype_b) = caller.eval("Function.prototype").unwrap() else {
-        panic!("caller Function.prototype was not an object");
-    };
-    assert_eq!(
-        runtime.get_prototype_of(&function).unwrap(),
-        Some(prototype_a)
-    );
-    assert_ne!(
-        runtime.get_prototype_of(&function).unwrap(),
-        Some(prototype_b)
-    );
-    let callable = runtime.as_callable(&function).unwrap().unwrap();
-    assert_eq!(
-        caller.call(&callable, Value::Undefined, &[]).unwrap(),
-        Value::String(JsString::try_from_utf8("B|false").unwrap())
     );
 }

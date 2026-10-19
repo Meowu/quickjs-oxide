@@ -1,7 +1,7 @@
-//! The generator and async-function intrinsics (section 6.1 rows 7 and 8):
-//! `%GeneratorFunction%` and its prototypes with `%GeneratorPrototype%`'s
-//! `next`, `return` and `throw`; `%AsyncFunction%`; the async generator
-//! counterparts, whose natives are in `vm::async_generator`.
+//! The generator and async-function intrinsics: `%GeneratorFunction%` and its
+//! prototypes with `%GeneratorPrototype%`'s `next`, `return` and `throw`;
+//! `%AsyncFunction%`; the async generator counterparts, whose natives are in
+//! `vm::async_generator`.
 
 use super::{Native, methods, plain_object, to_string_tag};
 use crate::heap::HeapError;
@@ -51,6 +51,12 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         ],
     )?;
     to_string_tag(cx, generator_prototype, "Generator")?;
+    to_string_tag(cx, generator_function_prototype, "GeneratorFunction")?;
+    let generator_function = super::native_function(cx, Native::GeneratorFunctionConstructor)?;
+    let function = cx.realm.intrinsic(Intrinsic::Function);
+    cx.heap.set_prototype(generator_function, Some(function))?;
+    constructor_link(cx, generator_function, generator_function_prototype)?;
+    // QuickJS links `%GeneratorPrototype%` after the constructor.
     cx.heap.add_property(
         generator_function_prototype,
         Names::key(names.prototype),
@@ -63,11 +69,6 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         PropertyFlags::data(false, false, true),
         Value::object(generator_function_prototype),
     )?;
-    to_string_tag(cx, generator_function_prototype, "GeneratorFunction")?;
-    let generator_function = super::native_function(cx, Native::GeneratorFunctionConstructor)?;
-    let function = cx.realm.intrinsic(Intrinsic::Function);
-    cx.heap.set_prototype(generator_function, Some(function))?;
-    constructor_link(cx, generator_function, generator_function_prototype)?;
     cx.set_intrinsic(Intrinsic::GeneratorFunction, generator_function);
 
     // %AsyncFunction% and %AsyncFunction.prototype%.
@@ -112,18 +113,6 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         ],
     )?;
     to_string_tag(cx, async_generator_prototype, "AsyncGenerator")?;
-    cx.heap.add_property(
-        async_generator_function_prototype,
-        Names::key(names.prototype),
-        PropertyFlags::data(false, false, true),
-        Value::object(async_generator_prototype),
-    )?;
-    cx.heap.add_property(
-        async_generator_prototype,
-        Names::key(names.constructor),
-        PropertyFlags::data(false, false, true),
-        Value::object(async_generator_function_prototype),
-    )?;
     to_string_tag(
         cx,
         async_generator_function_prototype,
@@ -137,6 +126,18 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         cx,
         async_generator_function,
         async_generator_function_prototype,
+    )?;
+    cx.heap.add_property(
+        async_generator_function_prototype,
+        Names::key(names.prototype),
+        PropertyFlags::data(false, false, true),
+        Value::object(async_generator_prototype),
+    )?;
+    cx.heap.add_property(
+        async_generator_prototype,
+        Names::key(names.constructor),
+        PropertyFlags::data(false, false, true),
+        Value::object(async_generator_function_prototype),
     )?;
     cx.set_intrinsic(Intrinsic::AsyncGeneratorFunction, async_generator_function);
     Ok(())
@@ -178,7 +179,7 @@ fn this_generator(cx: &mut Cx<'_>, site: &CallSite) -> Result<ObjectId, Throw> {
     match this.as_object() {
         Some(object) if cx.heap.internal_tag(object) == InternalTag::Generator => {
             if suspend::state(cx, object) == suspend::EXECUTING {
-                return Err(error::type_error(cx, "generator is already running"));
+                return Err(error::type_error(cx, "cannot invoke a running generator"));
             }
             Ok(object)
         }
@@ -331,7 +332,7 @@ fn continuation(
     close_on_rejection: bool,
 ) -> Result<Value, Throw> {
     let Some(result_object) = result.as_object() else {
-        let error = error::type_error(cx, "iterator result is not an object");
+        let error = error::type_error(cx, "iterator must return an object");
         return reject_with(cx, capability, error);
     };
     root(cx, result);
@@ -432,7 +433,7 @@ pub(super) fn async_from_sync_throw(cx: &mut Cx<'_>, site: CallSite) -> Result<V
         if let Err(throw) = iter::close(cx, &record, Ok(())) {
             return reject_with(cx, capability, throw);
         }
-        let error = error::type_error(cx, "iterator does not have a throw method");
+        let error = error::type_error(cx, "throw is not a method");
         return reject_with(cx, capability, error);
     };
     let args: Vec<Value> = site.arg_list(cx);

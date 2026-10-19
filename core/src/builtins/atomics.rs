@@ -1,7 +1,6 @@
-//! `Atomics` (phase 4, section 6.1 row 9). Every operation on shared memory
-//! runs inside the process-wide coordinator of `vm::waiter`, which orders
-//! them sequentially consistently across agents; `wait` and `notify` queue
-//! on the same coordinator.
+//! `Atomics`. Every operation on shared memory runs inside the process-wide
+//! coordinator of `vm::waiter`, which orders them sequentially consistently
+//! across agents; `wait` and `notify` queue on the same coordinator.
 
 use std::time::Duration;
 
@@ -26,17 +25,17 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         &[
             Native::AtomicsAdd,
             Native::AtomicsAnd,
-            Native::AtomicsCompareExchange,
-            Native::AtomicsExchange,
-            Native::AtomicsIsLockFree,
-            Native::AtomicsLoad,
-            Native::AtomicsNotify,
             Native::AtomicsOr,
-            Native::AtomicsStore,
             Native::AtomicsSub,
-            Native::AtomicsWait,
             Native::AtomicsXor,
+            Native::AtomicsExchange,
+            Native::AtomicsCompareExchange,
+            Native::AtomicsLoad,
+            Native::AtomicsStore,
+            Native::AtomicsIsLockFree,
             Native::AtomicsPause,
+            Native::AtomicsWait,
+            Native::AtomicsNotify,
         ],
     )?;
     to_string_tag(cx, atomics, "Atomics")?;
@@ -50,21 +49,29 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     )
 }
 
-/// `ValidateIntegerTypedArray(ta, waitable)`: the typed array, its kind and
-/// its length then.
+/// `ValidateIntegerTypedArray(ta, waitable)` (25.4.3.1): the typed array,
+/// its kind and its length then. ValidateTypedArray comes first (detached
+/// or out of bounds: `TypeError`), then the element type; `wait` then
+/// requires a shared buffer (DoWait step 3).
 fn validate(
     cx: &mut Cx<'_>,
     value: Value,
     waitable: bool,
+    wait: bool,
 ) -> Result<(ObjectId, ElementKind, usize), Throw> {
     let Some(object) = value
         .as_object()
         .filter(|&object| cx.heap.object_kind(object) == ObjectKind::TypedArray)
     else {
-        return Err(error::type_error(cx, "not a TypedArray"));
+        return Err(error::type_error(cx, "integer TypedArray expected"));
     };
     let Some(length) = typed::length(cx.heap, object) else {
-        return Err(error::type_error(cx, "TypedArray is out of bounds"));
+        let message = if detached(cx, object) {
+            "ArrayBuffer is detached"
+        } else {
+            "TypedArray is out of bounds"
+        };
+        return Err(error::type_error(cx, message));
     };
     let kind = typed::view(cx.heap, object).0.kind;
     let valid = if waitable {
@@ -79,14 +86,28 @@ fn validate(
         )
     };
     if !valid {
-        return Err(error::type_error(cx, "invalid TypedArray type"));
+        return Err(error::type_error(cx, "integer TypedArray expected"));
+    }
+    if wait && location(cx, object, 0).is_none() {
+        return Err(error::type_error(cx, "not a SharedArrayBuffer TypedArray"));
     }
     Ok((object, kind, length))
 }
 
+fn detached(cx: &Cx<'_>, object: ObjectId) -> bool {
+    let (_, store) = typed::view(cx.heap, object);
+    typed::buffer(cx.heap, store).detached
+}
+
 /// `ValidateAtomicAccess` against the length validation saw: the element's
-/// byte index in the buffer.
-fn access(cx: &mut Cx<'_>, object: ObjectId, length: usize, index: Value) -> Result<usize, Throw> {
+/// byte index in the buffer. The operations that convert a value
+/// revalidate after it (RevalidateAtomicAccess); `load` right away.
+fn index_in(
+    cx: &mut Cx<'_>,
+    object: ObjectId,
+    length: usize,
+    index: Value,
+) -> Result<usize, Throw> {
     let index = to_index(cx, index)? as usize;
     if index >= length {
         return Err(error::range_error(cx, "out-of-bound access"));
@@ -95,10 +116,16 @@ fn access(cx: &mut Cx<'_>, object: ObjectId, length: usize, index: Value) -> Res
     Ok(view.byte_offset + index * view.kind.size())
 }
 
-/// `RevalidateAtomicAccess` after the conversions ran.
-fn revalidate(cx: &mut Cx<'_>, object: ObjectId, byte_index: usize) -> Result<(), Throw> {
+/// `RevalidateAtomicAccess` after the conversions ran; `message` is the
+/// TypeError for an array now out of bounds.
+fn revalidate(
+    cx: &mut Cx<'_>,
+    object: ObjectId,
+    byte_index: usize,
+    message: &str,
+) -> Result<(), Throw> {
     let Some(length) = typed::length(cx.heap, object) else {
-        return Err(error::type_error(cx, "TypedArray is out of bounds"));
+        return Err(error::type_error(cx, message));
     };
     let view = typed::view(cx.heap, object).0;
     if byte_index >= view.byte_offset + length * view.kind.size() {
@@ -168,12 +195,12 @@ fn read_modify_write(
     operation: fn(u64, u64) -> u64,
 ) -> Result<Value, Throw> {
     let array = site.arg(cx, 0);
-    let (object, kind, length) = validate(cx, array, false)?;
+    let (object, kind, length) = validate(cx, array, false, false)?;
     let index = site.arg(cx, 1);
-    let byte_index = access(cx, object, length, index)?;
+    let byte_index = index_in(cx, object, length, index)?;
     let value = site.arg(cx, 2);
     let (bits, _) = operand(cx, kind, value)?;
-    revalidate(cx, object, byte_index)?;
+    revalidate(cx, object, byte_index, "ArrayBuffer is detached")?;
     let mask = mask(kind);
     let old = modify(cx, object, byte_index, |old| {
         Some(operation(old, bits) & mask)
@@ -207,13 +234,13 @@ pub(super) fn exchange(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> 
 
 pub(super) fn compare_exchange(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let array = site.arg(cx, 0);
-    let (object, kind, length) = validate(cx, array, false)?;
+    let (object, kind, length) = validate(cx, array, false, false)?;
     let index = site.arg(cx, 1);
-    let byte_index = access(cx, object, length, index)?;
+    let byte_index = index_in(cx, object, length, index)?;
     let (expected, replacement) = (site.arg(cx, 2), site.arg(cx, 3));
     let (expected, _) = operand(cx, kind, expected)?;
     let (replacement, _) = operand(cx, kind, replacement)?;
-    revalidate(cx, object, byte_index)?;
+    revalidate(cx, object, byte_index, "ArrayBuffer is detached")?;
     let mask = mask(kind);
     let old = modify(cx, object, byte_index, |old| {
         (old & mask == expected & mask).then_some(replacement & mask)
@@ -223,22 +250,22 @@ pub(super) fn compare_exchange(cx: &mut Cx<'_>, site: CallSite) -> Result<Value,
 
 pub(super) fn load(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let array = site.arg(cx, 0);
-    let (object, kind, length) = validate(cx, array, false)?;
+    let (object, kind, length) = validate(cx, array, false, false)?;
     let index = site.arg(cx, 1);
-    let byte_index = access(cx, object, length, index)?;
-    revalidate(cx, object, byte_index)?;
+    let byte_index = index_in(cx, object, length, index)?;
+    revalidate(cx, object, byte_index, "ArrayBuffer is detached")?;
     let old = modify(cx, object, byte_index, |_| None);
     decode(cx, kind, old & mask(kind))
 }
 
 pub(super) fn store(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let array = site.arg(cx, 0);
-    let (object, kind, length) = validate(cx, array, false)?;
+    let (object, kind, length) = validate(cx, array, false, false)?;
     let index = site.arg(cx, 1);
-    let byte_index = access(cx, object, length, index)?;
+    let byte_index = index_in(cx, object, length, index)?;
     let value = site.arg(cx, 2);
     let (bits, result) = operand(cx, kind, value)?;
-    revalidate(cx, object, byte_index)?;
+    revalidate(cx, object, byte_index, "ArrayBuffer is detached")?;
     let mask = mask(kind);
     modify(cx, object, byte_index, |_| Some(bits & mask));
     Ok(result)
@@ -267,12 +294,9 @@ fn location(cx: &Cx<'_>, object: ObjectId, byte_index: usize) -> Option<WaitLoca
 /// `Atomics.wait(typedArray, index, value, timeout)`.
 pub(super) fn wait(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let array = site.arg(cx, 0);
-    let (object, kind, length) = validate(cx, array, true)?;
-    if location(cx, object, 0).is_none() {
-        return Err(error::type_error(cx, "not a SharedArrayBuffer"));
-    }
+    let (object, kind, length) = validate(cx, array, true, true)?;
     let index = site.arg(cx, 1);
-    let byte_index = access(cx, object, length, index)?;
+    let byte_index = index_in(cx, object, length, index)?;
     let place = location(cx, object, byte_index).expect("a shared buffer");
     let value = site.arg(cx, 2);
     let expected = if kind.is_bigint() {
@@ -312,9 +336,9 @@ pub(super) fn wait(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
 /// `Atomics.notify(typedArray, index, count)`.
 pub(super) fn notify(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let array = site.arg(cx, 0);
-    let (object, _, length) = validate(cx, array, true)?;
+    let (object, _, length) = validate(cx, array, true, false)?;
     let index = site.arg(cx, 1);
-    let byte_index = access(cx, object, length, index)?;
+    let byte_index = index_in(cx, object, length, index)?;
     let count = site.arg(cx, 2);
     let count = if count.is_undefined() {
         usize::MAX

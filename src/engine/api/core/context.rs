@@ -1,4 +1,4 @@
-//! The realm's handle (phase 6, section 2.1): evaluation, calls, objects and
+//! The realm's handle: evaluation, calls, objects and
 //! properties, the intrinsics, the pending exception.
 
 use std::rc::Rc;
@@ -39,6 +39,45 @@ impl Default for EvalOptions {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FunctionBytecodeRef {
     function: ObjectRef,
+    /// The front end's stack code, which the front end's tests inspect.
+    #[cfg(test)]
+    pub(crate) stack: StackCode,
+}
+
+/// A function of a compiled script's stack code: the script's unlinked tree
+/// and the child-constant path from its root.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct StackCode {
+    pub(crate) root: std::rc::Rc<crate::engine::code::function::UnlinkedFunction>,
+    pub(crate) path: Vec<usize>,
+}
+
+#[cfg(test)]
+impl StackCode {
+    pub(crate) fn function(&self) -> &crate::engine::code::function::UnlinkedFunction {
+        self.path.iter().fold(&self.root, |function, index| {
+            function.constants()[*index]
+                .as_child()
+                .expect("a child-function constant")
+        })
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for StackCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StackCode")
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+impl PartialEq for StackCode {
+    fn eq(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.root, &other.root) && self.path == other.path
+    }
 }
 
 /// A compiled module, run by `Context::execute_module`.
@@ -181,6 +220,16 @@ impl Context {
         match lowered {
             Ok(lowered) => Ok(FunctionBytecodeRef {
                 function: entry.lift_object(lowered.function),
+                #[cfg(test)]
+                stack: StackCode {
+                    root: std::rc::Rc::new(
+                        crate::engine::compiler::compile_unlinked_script_bytes_with_filename(
+                            source, filename, debug_info,
+                        )
+                        .expect("the script compiled once"),
+                    ),
+                    path: Vec::new(),
+                },
             }),
             Err(ScriptCompileError::Front(error)) => {
                 Err(throw_compile_error(&mut entry, &error, source, filename))
@@ -225,6 +274,14 @@ impl Context {
         filename: &str,
     ) -> Result<ModuleBytecodeRef, RuntimeError> {
         self.compile_module_bytes_with_filename(source.as_bytes(), filename)
+    }
+
+    pub fn compile_module_bytes_with_options(
+        &mut self,
+        source: &[u8],
+        options: &CompileOptions,
+    ) -> Result<ModuleBytecodeRef, RuntimeError> {
+        self.compile_module_bytes_with_filename(source, &options.filename)
     }
 
     pub fn compile_module_bytes_with_filename(
@@ -475,6 +532,15 @@ impl Context {
         entry.complete_with(result)
     }
 
+    /// QuickJS's `JS_DetachArrayBuffer`: detaches an ArrayBuffer; anything
+    /// else is ignored.
+    pub fn detach_array_buffer(&mut self, value: &Value) -> Result<(), RuntimeError> {
+        let mut entry = self.enter()?;
+        let value = entry.lower(value)?;
+        let result = entry.inner.core.detach_array_buffer(value);
+        entry.complete_with(result)
+    }
+
     // ---- intrinsics ----
 
     fn intrinsic(&self, intrinsic: Intrinsic) -> Result<ObjectRef, RuntimeError> {
@@ -561,12 +627,12 @@ impl Context {
     /// `load` and `read`.
     pub fn install_qjs_helpers(&mut self, helpers: &QjsHelpers) -> Result<(), RuntimeError> {
         let mut entry = self.enter()?;
-        entry.inner.core.install_print()?;
+        entry
+            .inner
+            .core
+            .install_qjs_helpers(helpers.script_args.as_deref())?;
         if helpers.std {
             entry.inner.core.install_std()?;
-        }
-        if let Some(args) = &helpers.script_args {
-            entry.inner.core.install_script_args(args)?;
         }
         Ok(())
     }
@@ -618,34 +684,18 @@ fn throw_compile_error(
         ErrorKind::Unsupported => return RuntimeError::Unsupported("constructs of this source"),
         ErrorKind::Internal | ErrorKind::Io => return RuntimeError::Compile(error.clone()),
     };
-    let thrown = match entry.inner.core.new_error(kind, error.message()) {
+    let created = match syntax_location(error, source) {
+        Some((line, column)) => {
+            entry
+                .inner
+                .core
+                .new_located_error(kind, error.message(), filename, line, column)
+        }
+        None => entry.inner.core.new_error(kind, error.message()),
+    };
+    let thrown = match created {
         Ok(thrown) => thrown,
         Err(error) => return error.into(),
     };
-    if let (Some((line, column)), Some(object)) =
-        (syntax_location(error, source), thrown.as_object())
-    {
-        let stack = format!("    at {filename}:{line}:{column}\n");
-        let handle = entry.inner.core.hold(thrown);
-        let stack = entry.inner.core.new_string(&stack);
-        let key = entry
-            .inner
-            .core
-            .key_from_units(&"stack".encode_utf16().collect::<Vec<_>>());
-        if let (Ok(stack), Ok(key)) = (stack, key) {
-            let descriptor = oxide_core::PropertyDescriptor {
-                value: Some(stack),
-                writable: Some(true),
-                enumerable: Some(false),
-                configurable: Some(true),
-                ..Default::default()
-            };
-            let _ = entry
-                .inner
-                .core
-                .define_own_property(object, key, &descriptor);
-        }
-        entry.inner.core.release(handle);
-    }
     entry.thrown(oxide_core::Throw(thrown))
 }

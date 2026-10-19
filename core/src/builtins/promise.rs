@@ -1,9 +1,10 @@
-//! `Promise` (section 6.1 row 7): the constructor, `then`, `catch`,
-//! `finally` and the static combinators, over `vm::jobs`. `Symbol.species`
-//! is dropped (phase 0): `then` and `finally` use `%Promise%`.
+//! `Promise`: the constructor, `then`, `catch`, `finally` and the static
+//! combinators, over `vm::jobs`. `Symbol.species` is dropped: `then` and
+//! `finally` use `%Promise%`.
 
 use super::{
-    Native, accessor, install_constructor, methods, native_closure, native_data, to_string_tag,
+    Native, accessor, install_constructor, link_constructor, methods, native_closure, native_data,
+    to_string_tag,
 };
 use crate::heap::HeapError;
 use crate::runtime::{Intrinsic, Names, WellKnown};
@@ -18,19 +19,19 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     let object_prototype = cx.realm.intrinsic(Intrinsic::ObjectPrototype);
     let prototype = super::plain_object(cx, Some(object_prototype), 8)?;
     cx.set_intrinsic(Intrinsic::PromisePrototype, prototype);
-    let promise = install_constructor(cx, Native::PromiseConstructor, prototype)?;
+    let promise = install_constructor(cx, Native::PromiseConstructor)?;
     cx.set_intrinsic(Intrinsic::Promise, promise);
     methods(
         cx,
         promise,
         &[
+            Native::PromiseResolveStatic,
+            Native::PromiseRejectStatic,
             Native::PromiseAll,
             Native::PromiseAllSettled,
             Native::PromiseAny,
-            Native::PromiseRace,
-            Native::PromiseRejectStatic,
-            Native::PromiseResolveStatic,
             Native::PromiseTry,
+            Native::PromiseRace,
             Native::PromiseWithResolvers,
         ],
     )?;
@@ -52,7 +53,8 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
             Native::PromiseFinally,
         ],
     )?;
-    to_string_tag(cx, prototype, "Promise")
+    to_string_tag(cx, prototype, "Promise")?;
+    link_constructor(cx, promise, prototype)
 }
 
 fn root(cx: &mut Cx<'_>, value: Value) {
@@ -67,11 +69,11 @@ pub(super) fn species_getter(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, T
 /// `new Promise(executor)`.
 pub(super) fn constructor(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     if !site.construct {
-        return Err(error::type_error(cx, "Promise constructor requires 'new'"));
+        return Err(error::type_error(cx, "must be called with new"));
     }
     let executor = site.arg(cx, 0);
     if !ops::is_callable(cx.heap, executor) {
-        return Err(error::type_error(cx, "Promise executor is not a function"));
+        return Err(error::type_error(cx, "not a function"));
     }
     let prototype =
         internal::prototype_from_constructor(cx, site.new_target, Intrinsic::PromisePrototype)?;
@@ -107,7 +109,7 @@ fn this_promise(cx: &mut Cx<'_>, site: &CallSite) -> Result<ObjectId, Throw> {
     if jobs::is_promise(cx, this) {
         return Ok(this.as_object().unwrap());
     }
-    Err(error::type_error(cx, "not a promise"))
+    Err(error::object_expected(cx, "Promise"))
 }
 
 /// `Promise.prototype.then(onFulfilled, onRejected)`.
@@ -271,7 +273,7 @@ fn combinator(cx: &mut Cx<'_>, site: CallSite, kind: Combinator) -> Result<Value
     let iterable = site.arg(cx, 0);
     let outcome = (|| {
         let resolve = internal::get_method(cx, constructor, Names::key(cx.realm.names.resolve))?
-            .ok_or_else(|| error::type_error(cx, "Promise.resolve is not a function"))?;
+            .ok_or_else(|| error::type_error(cx, "not a function"))?;
         root(cx, resolve);
         let mut record = iter::get_iterator(cx, iterable)?;
         let result = perform(cx, kind, constructor, resolve, capability, &mut record);
@@ -305,9 +307,11 @@ fn perform(
     capability: [Value; 3],
     record: &mut iter::Iter,
 ) -> Result<Value, (Throw, bool)> {
+    // The `values` List (or `errors`), as an array no script sees: the
+    // result is a fresh array made from it (CreateArrayFromList).
     let values = internal::array_create(cx, 0).map_err(|throw| (throw, false))?;
     root(cx, Value::object(values));
-    // The shared state of the element closures: the values array, the
+    // The shared state of the element closures: the values list, the
     // remaining count, the capability.
     let shared = native_data(
         cx,
@@ -333,9 +337,7 @@ fn perform(
         root(cx, value);
         let step = (|| {
             if kind != Combinator::Race {
-                cx.heap
-                    .set_element(values, index, Value::UNDEFINED)
-                    .map_err(|error| error::heap_error(cx, error))?;
+                define_element(cx, values, index, Value::UNDEFINED)?;
             }
             let next_promise = crate::vm::call(cx, resolve, constructor, &[value])?;
             root(cx, next_promise);
@@ -346,23 +348,26 @@ fn perform(
                     capability[2],
                 ),
                 Combinator::AllSettled => {
-                    let fulfilled = element_closure(
+                    // 27.2.4.2.1 step 8: both halves share one
+                    // `alreadyCalled` record.
+                    let called = native_data(cx, &[Value::FALSE])?;
+                    root(cx, Value::object(called));
+                    let fulfilled = settled_closure(
                         cx,
                         Native::PromiseAllSettledResolveElement,
                         shared,
                         index,
+                        called,
                     )?;
                     root(cx, fulfilled);
-                    // Both halves share one already-called flag: the second
-                    // closure reuses the first's element record.
-                    let data = cx
-                        .heap
-                        .function_scope(fulfilled.as_object().unwrap())
-                        .expect("element data")
-                        .object();
-                    let rejected =
-                        native_closure(cx, Native::PromiseAllSettledRejectElement, data)?;
-                    (fulfilled, Value::object(rejected))
+                    let rejected = settled_closure(
+                        cx,
+                        Native::PromiseAllSettledRejectElement,
+                        shared,
+                        index,
+                        called,
+                    )?;
+                    (fulfilled, rejected)
                 }
                 Combinator::Any => (
                     capability[1],
@@ -391,16 +396,12 @@ fn perform(
         .set_internal_slot(shared, 1, Value::int32(remaining));
     if remaining == 0 {
         let finish = (|| {
+            let array = array_from_list(cx, values)?;
             if kind == Combinator::Any {
-                let error = aggregate_error(cx, values)?;
+                let error = aggregate_error(cx, array)?;
                 crate::vm::call(cx, capability[2], Value::UNDEFINED, &[error])?;
             } else {
-                crate::vm::call(
-                    cx,
-                    capability[1],
-                    Value::UNDEFINED,
-                    &[Value::object(values)],
-                )?;
+                crate::vm::call(cx, capability[1], Value::UNDEFINED, &[array])?;
             }
             Ok(())
         })();
@@ -410,9 +411,37 @@ fn perform(
     Ok(capability[0])
 }
 
-/// An `AggregateError` whose `errors` are the array's elements.
-fn aggregate_error(cx: &mut Cx<'_>, errors: ObjectId) -> Result<Value, Throw> {
-    let error = crate::vm::error::new_error(cx, crate::ErrorKind::Aggregate, Value::UNDEFINED)
+/// Sets element `index` of a values list.
+fn define_element(
+    cx: &mut Cx<'_>,
+    values: ObjectId,
+    index: u32,
+    value: Value,
+) -> Result<(), Throw> {
+    let key = internal::index_key(cx, index)?;
+    internal::create_data_property(cx, values, key, value)?;
+    Ok(())
+}
+
+/// CreateArrayFromList of a values list: a fresh array with its elements.
+fn array_from_list(cx: &mut Cx<'_>, list: ObjectId) -> Result<Value, Throw> {
+    let length_key = Names::key(cx.realm.names.length);
+    let length = internal::get(cx, list, length_key, Value::object(list))?
+        .as_f64()
+        .unwrap_or(0.0) as u32;
+    let array = internal::array_create(cx, 0)?;
+    root(cx, Value::object(array));
+    for index in 0..length {
+        let key = internal::index_key(cx, index)?;
+        let value = internal::get(cx, list, key, Value::object(list))?;
+        internal::create_data_property(cx, array, key, value)?;
+    }
+    Ok(Value::object(array))
+}
+
+/// An `AggregateError` whose `errors` is the array `errors`.
+fn aggregate_error(cx: &mut Cx<'_>, errors: Value) -> Result<Value, Throw> {
+    let error = crate::vm::error::new_bare_error(cx, crate::ErrorKind::Aggregate)
         .map_err(|error| error::heap_error(cx, error))?;
     root(cx, error);
     let key = Names::key(cx.realm.names.errors);
@@ -421,7 +450,7 @@ fn aggregate_error(cx: &mut Cx<'_>, errors: ObjectId) -> Result<Value, Throw> {
             error.as_object().unwrap(),
             key,
             PropertyFlags::data(true, false, true),
-            Value::object(errors),
+            errors,
         )
         .map_err(|error| error::heap_error(cx, error))?;
     Ok(error)
@@ -446,13 +475,49 @@ fn element_closure(
     native_closure(cx, native, data).map(Value::object)
 }
 
+/// An `allSettled` element closure, whose already-called flag is the record
+/// `called` it shares with its other half.
+fn settled_closure(
+    cx: &mut Cx<'_>,
+    native: Native,
+    shared: ObjectId,
+    index: u32,
+    called: ObjectId,
+) -> Result<Value, Throw> {
+    let data = native_data(
+        cx,
+        &[
+            Value::object(shared),
+            Value::int32(index as i32),
+            Value::object(called),
+        ],
+    )?;
+    native_closure(cx, native, data).map(Value::object)
+}
+
+/// Whether the element function has been called (its own flag, or the
+/// record it shares).
+fn already_called(cx: &mut Cx<'_>, site: &CallSite) -> bool {
+    match site.data(cx, 2).as_object() {
+        Some(record) => cx.heap.internal_slot(record, 0) == Value::TRUE,
+        None => site.data(cx, 2) == Value::TRUE,
+    }
+}
+
+fn set_called(cx: &mut Cx<'_>, site: &CallSite) {
+    match site.data(cx, 2).as_object() {
+        Some(record) => cx.heap.set_internal_slot(record, 0, Value::TRUE),
+        None => site.set_data(cx, 2, Value::TRUE),
+    }
+}
+
 /// The common part of the element functions: once only, store the element,
 /// and settle when the last one arrives.
 fn element(cx: &mut Cx<'_>, site: CallSite, element: Value, any: bool) -> Result<Value, Throw> {
-    if site.data(cx, 2) == Value::TRUE {
+    if already_called(cx, &site) {
         return Ok(Value::UNDEFINED);
     }
-    site.set_data(cx, 2, Value::TRUE);
+    set_called(cx, &site);
     let shared = site.data(cx, 0).as_object().expect("shared state");
     let index = site.data(cx, 1).as_int32().unwrap_or(0) as u32;
     let values = cx
@@ -460,20 +525,19 @@ fn element(cx: &mut Cx<'_>, site: CallSite, element: Value, any: bool) -> Result
         .internal_slot(shared, 0)
         .as_object()
         .expect("values");
-    cx.heap
-        .set_element(values, index, element)
-        .map_err(|error| error::heap_error(cx, error))?;
+    define_element(cx, values, index, element)?;
     let remaining = cx.heap.internal_slot(shared, 1).as_int32().unwrap_or(0) - 1;
     cx.heap
         .set_internal_slot(shared, 1, Value::int32(remaining));
     if remaining == 0 {
+        let array = array_from_list(cx, values)?;
         if any {
             let reject = cx.heap.internal_slot(shared, 4);
-            let error = aggregate_error(cx, values)?;
+            let error = aggregate_error(cx, array)?;
             return crate::vm::call(cx, reject, Value::UNDEFINED, &[error]);
         }
         let resolve = cx.heap.internal_slot(shared, 3);
-        return crate::vm::call(cx, resolve, Value::UNDEFINED, &[Value::object(values)]);
+        return crate::vm::call(cx, resolve, Value::UNDEFINED, &[array]);
     }
     Ok(Value::UNDEFINED)
 }
@@ -507,7 +571,7 @@ fn settled_record(cx: &mut Cx<'_>, rejected: bool, value: Value) -> Result<Value
 
 pub(super) fn all_settled_resolve_element(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let value = site.arg(cx, 0);
-    if site.data(cx, 2) == Value::TRUE {
+    if already_called(cx, &site) {
         return Ok(Value::UNDEFINED);
     }
     let record = settled_record(cx, false, value)?;
@@ -516,7 +580,7 @@ pub(super) fn all_settled_resolve_element(cx: &mut Cx<'_>, site: CallSite) -> Re
 
 pub(super) fn all_settled_reject_element(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let value = site.arg(cx, 0);
-    if site.data(cx, 2) == Value::TRUE {
+    if already_called(cx, &site) {
         return Ok(Value::UNDEFINED);
     }
     let record = settled_record(cx, true, value)?;

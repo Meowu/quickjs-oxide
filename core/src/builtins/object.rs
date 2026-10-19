@@ -1,7 +1,9 @@
-//! `Object` (phase 4, section 6.1 row 1): the constructor and its static
-//! functions, and `Object.prototype` with the Annex B accessors.
+//! `Object`: the constructor and its static functions, and `Object.prototype`
+//! with the Annex B accessors.
 
-use super::{Native, accessor, install_constructor, methods, string_text, this_object};
+use super::{
+    Native, accessor, install_constructor, link_constructor, methods, string_text, this_object,
+};
 use crate::heap::HeapError;
 use crate::heap::atom::{KeyKind, PropertyKey};
 use crate::heap::object::{ObjectKind, flags};
@@ -13,51 +15,48 @@ use crate::vm::{Cx, Throw, error, iter, ops};
 
 pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     let prototype = cx.realm.intrinsic(Intrinsic::ObjectPrototype);
-    let object = install_constructor(cx, Native::ObjectConstructor, prototype)?;
+    // QuickJS's `js_object_funcs` and `js_object_proto_funcs`, in order.
+    let object = install_constructor(cx, Native::ObjectConstructor)?;
     cx.set_intrinsic(Intrinsic::Object, object);
     methods(
         cx,
         object,
         &[
-            Native::ObjectAssign,
             Native::ObjectCreate,
-            Native::ObjectDefineProperties,
+            Native::ObjectGetPrototypeOf,
+            Native::ObjectSetPrototypeOf,
             Native::ObjectDefineProperty,
-            Native::ObjectEntries,
-            Native::ObjectFreeze,
-            Native::ObjectFromEntries,
-            Native::ObjectGetOwnPropertyDescriptor,
-            Native::ObjectGetOwnPropertyDescriptors,
+            Native::ObjectDefineProperties,
             Native::ObjectGetOwnPropertyNames,
             Native::ObjectGetOwnPropertySymbols,
-            Native::ObjectGetPrototypeOf,
             Native::ObjectGroupBy,
-            Native::ObjectHasOwn,
-            Native::ObjectIs,
-            Native::ObjectIsExtensible,
-            Native::ObjectIsFrozen,
-            Native::ObjectIsSealed,
             Native::ObjectKeys,
-            Native::ObjectPreventExtensions,
-            Native::ObjectSeal,
-            Native::ObjectSetPrototypeOf,
             Native::ObjectValues,
+            Native::ObjectEntries,
+            Native::ObjectIsExtensible,
+            Native::ObjectPreventExtensions,
+            Native::ObjectGetOwnPropertyDescriptor,
+            Native::ObjectGetOwnPropertyDescriptors,
+            Native::ObjectIs,
+            Native::ObjectAssign,
+            Native::ObjectSeal,
+            Native::ObjectFreeze,
+            Native::ObjectIsSealed,
+            Native::ObjectIsFrozen,
+            Native::ObjectFromEntries,
+            Native::ObjectHasOwn,
         ],
     )?;
     methods(
         cx,
         prototype,
         &[
+            Native::ObjectToString,
+            Native::ObjectToLocaleString,
+            Native::ObjectValueOf,
             Native::ObjectHasOwnProperty,
             Native::ObjectIsPrototypeOf,
             Native::ObjectPropertyIsEnumerable,
-            Native::ObjectToLocaleString,
-            Native::ObjectToString,
-            Native::ObjectValueOf,
-            Native::ObjectDefineGetter,
-            Native::ObjectDefineSetter,
-            Native::ObjectLookupGetter,
-            Native::ObjectLookupSetter,
         ],
     )?;
     let proto = Names::key(cx.realm.names.proto);
@@ -68,7 +67,18 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         "__proto__",
         Some(Native::ObjectProtoGetter),
         Some(Native::ObjectProtoSetter),
-    )
+    )?;
+    methods(
+        cx,
+        prototype,
+        &[
+            Native::ObjectDefineGetter,
+            Native::ObjectDefineSetter,
+            Native::ObjectLookupGetter,
+            Native::ObjectLookupSetter,
+        ],
+    )?;
+    link_constructor(cx, object, prototype)
 }
 
 fn root(cx: &mut Cx<'_>, value: Value) {
@@ -76,11 +86,31 @@ fn root(cx: &mut Cx<'_>, value: Value) {
 }
 
 /// The argument as an object, or a `TypeError`.
-fn object_arg(cx: &mut Cx<'_>, value: Value, what: &str) -> Result<ObjectId, Throw> {
+fn object_arg(cx: &mut Cx<'_>, value: Value, _what: &str) -> Result<ObjectId, Throw> {
     match value.as_object() {
         Some(object) => Ok(object),
-        None => Err(error::type_error(cx, &format!("{what}: not an object"))),
+        None => Err(error::type_error(cx, "not an object")),
     }
+}
+
+/// A refused `[[SetPrototypeOf]]` on `object`, with QuickJS's reason.
+#[cold]
+#[inline(never)]
+fn prototype_refused(cx: &mut Cx<'_>, object: ObjectId) -> Throw {
+    let message = if cx.heap.object_kind(object) == ObjectKind::Proxy {
+        "proxy: bad prototype"
+    } else if object == cx.realm.intrinsic(Intrinsic::ObjectPrototype) {
+        "prototype is immutable"
+    } else if !cx
+        .heap
+        .header(object)
+        .has(crate::heap::object::flags::EXTENSIBLE)
+    {
+        "object is not extensible"
+    } else {
+        "circular prototype chain"
+    };
+    error::type_error(cx, message)
 }
 
 /// `Object(value)` and `new Object(value)`: a new object for `undefined`
@@ -213,7 +243,7 @@ pub(super) fn proto_setter(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Thr
         return Ok(Value::UNDEFINED);
     };
     if !internal::set_prototype_of(cx, object, prototype)? {
-        return Err(error::type_error(cx, "cannot set prototype"));
+        return Err(prototype_refused(cx, object));
     }
     Ok(Value::UNDEFINED)
 }
@@ -292,14 +322,9 @@ pub(super) fn assign(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
         }
         let from = internal::to_object(cx, source)?;
         root(cx, Value::object(from));
-        for key in internal::own_property_keys(cx, from)? {
-            if let Some(descriptor) = internal::get_own_property(cx, from, key)?
-                && descriptor.enumerable == Some(true)
-            {
-                let value = internal::get(cx, from, key, Value::object(from))?;
-                internal::put(cx, target, key, value, true)?;
-            }
-        }
+        internal::copy_own_enumerable(cx, from, &[], |cx, key, value| {
+            internal::put(cx, target, key, value, true)
+        })?;
     }
     Ok(Value::object(target))
 }
@@ -308,10 +333,7 @@ pub(super) fn assign(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
 pub(super) fn create(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let prototype = site.arg(cx, 0);
     if prototype.as_object().is_none() && !prototype.is_null() {
-        return Err(error::type_error(
-            cx,
-            "object prototype may only be an Object or null",
-        ));
+        return Err(error::type_error(cx, "not a prototype"));
     }
     let object = cx
         .heap
@@ -333,19 +355,30 @@ fn define_properties_from(
 ) -> Result<(), Throw> {
     let properties = internal::to_object(cx, properties)?;
     root(cx, Value::object(properties));
+    // ObjectDefineProperties (20.1.2.3.1): every key's descriptor is read
+    // and converted before any is defined.
     let mut descriptors = Vec::new();
     for key in internal::own_property_keys(cx, properties)? {
-        if let Some(descriptor) = internal::get_own_property(cx, properties, key)?
-            && descriptor.enumerable == Some(true)
-        {
-            let value = internal::get(cx, properties, key, Value::object(properties))?;
-            root(cx, value);
-            let descriptor = internal::to_property_descriptor(cx, value)?;
-            descriptors.push((key, descriptor));
+        root(cx, key.to_value());
+        let Some(own) = internal::get_own_property(cx, properties, key)? else {
+            continue;
+        };
+        if own.enumerable != Some(true) {
+            continue;
         }
+        let value = internal::get(cx, properties, key, Value::object(properties))?;
+        root(cx, value);
+        let descriptor = internal::to_property_descriptor(cx, value)?;
+        for field in [descriptor.value, descriptor.get, descriptor.set]
+            .into_iter()
+            .flatten()
+        {
+            root(cx, field);
+        }
+        descriptors.push((key, descriptor));
     }
-    for (key, descriptor) in descriptors {
-        internal::define_property_or_throw(cx, object, key, &descriptor)?;
+    for (key, descriptor) in &descriptors {
+        internal::define_property_or_throw(cx, object, *key, descriptor)?;
     }
     Ok(())
 }
@@ -449,7 +482,10 @@ fn integrity(cx: &mut Cx<'_>, site: CallSite, frozen: bool) -> Result<Value, Thr
         return Ok(value);
     };
     if !internal::set_integrity_level(cx, object, frozen)? {
-        return Err(error::type_error(cx, "cannot prevent extensions"));
+        return Err(error::type_error(
+            cx,
+            "proxy preventExtensions handler returned false",
+        ));
     }
     Ok(value)
 }
@@ -483,7 +519,10 @@ pub(super) fn prevent_extensions(cx: &mut Cx<'_>, site: CallSite) -> Result<Valu
     if let Some(object) = value.as_object()
         && !internal::prevent_extensions(cx, object)?
     {
-        return Err(error::type_error(cx, "cannot prevent extensions"));
+        return Err(error::type_error(
+            cx,
+            "proxy preventExtensions handler returned false",
+        ));
     }
     Ok(value)
 }
@@ -492,20 +531,19 @@ pub(super) fn prevent_extensions(cx: &mut Cx<'_>, site: CallSite) -> Result<Valu
 pub(super) fn from_entries(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let iterable = site.arg(cx, 0);
     if iterable.is_undefined() || iterable.is_null() {
-        return Err(error::type_error(cx, "not an object"));
+        return Err(error::not_iterable_nullish(cx, iterable));
     }
     let object = super::new_plain(cx, 4)?;
     root(cx, Value::object(object));
+    // AddEntriesFromIterable: GetIterator and IteratorStepValue throw
+    // without closing; only an entry's reads and the adder close.
     let mut entries = iter::get_iterator(cx, iterable)?;
     while let Some(entry) = iter::step(cx, &mut entries)? {
         let mark = cx.heap.roots().mark();
         root(cx, entry);
         let result = (|| {
             let Some(entry) = entry.as_object() else {
-                return Err(error::type_error(
-                    cx,
-                    "iterator value is not an entry object",
-                ));
+                return Err(error::type_error(cx, "not an object"));
             };
             let key = internal::get_property(cx, entry, PropertyKey::index(0).unwrap())?;
             root(cx, key);
@@ -583,6 +621,9 @@ pub(super) fn get_own_property_symbols(cx: &mut Cx<'_>, site: CallSite) -> Resul
 
 pub(super) fn get_prototype_of(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let value = site.arg(cx, 0);
+    if value.is_undefined() || value.is_null() {
+        return Err(error::type_error(cx, "not an object"));
+    }
     let object = internal::to_object(cx, value)?;
     root(cx, Value::object(object));
     internal::get_prototype_of(cx, object)
@@ -596,16 +637,13 @@ pub(super) fn set_prototype_of(cx: &mut Cx<'_>, site: CallSite) -> Result<Value,
     }
     let prototype = site.arg(cx, 1);
     if prototype.as_object().is_none() && !prototype.is_null() {
-        return Err(error::type_error(
-            cx,
-            "object prototype may only be an Object or null",
-        ));
+        return Err(error::type_error(cx, "not an object"));
     }
     let Some(object) = value.as_object() else {
         return Ok(value);
     };
     if !internal::set_prototype_of(cx, object, prototype)? {
-        return Err(error::type_error(cx, "cannot set prototype"));
+        return Err(prototype_refused(cx, object));
     }
     Ok(value)
 }
@@ -631,45 +669,48 @@ pub(super) fn is(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
 pub(super) fn group_by(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let items = site.arg(cx, 0);
     let callback = site.arg(cx, 1);
-    let groups = group(cx, items, callback, true)?;
-    let object = cx
-        .heap
-        .alloc_object(ObjectKind::Ordinary, None, 4)
-        .map_err(|error| error::heap_error(cx, error))?;
-    root(cx, Value::object(object));
-    for (key, members) in groups {
-        let array = internal::array_from_list(cx, &members)?;
-        let key = ops::to_property_key(cx, key)?;
-        internal::create_data_property_or_throw(cx, object, key, Value::object(array))?;
-    }
-    Ok(Value::object(object))
+    group(cx, items, callback, true, |cx| {
+        cx.heap
+            .alloc_object(ObjectKind::Ordinary, None, 4)
+            .map_err(|error| error::heap_error(cx, error))
+    })
 }
 
-/// `GroupBy(items, callback, keyCoercion)`: the groups in first-key order,
-/// keys and members rooted. `property` keys are property keys, otherwise
-/// `SameValueZero` (with -0 normalized).
+/// GroupBy (7.3.35) and the groups' object or map from `create`: the
+/// callback runs with `undefined` as `this`, each group is a List made into
+/// an array at the end (CreateArrayFromList). `property` keys are property
+/// keys, otherwise map keys (with -0 normalized).
 pub(crate) fn group(
     cx: &mut Cx<'_>,
     items: Value,
     callback: Value,
     property: bool,
-) -> Result<Vec<(Value, Vec<Value>)>, Throw> {
+    create: impl FnOnce(&mut Cx<'_>) -> Result<ObjectId, Throw>,
+) -> Result<Value, Throw> {
     if items.is_undefined() || items.is_null() {
-        return Err(error::type_error(cx, "not an object"));
+        return Err(error::not_iterable_nullish(cx, items));
     }
     if !ops::is_callable(cx.heap, callback) {
         return Err(error::type_error(cx, "not a function"));
     }
-    let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
     let mut iterator = iter::get_iterator(cx, items)?;
-    let mut index = 0u64;
+    // The groups in order of their first member; `index` maps a key to its
+    // group, by SameValue of the canonical property key or SameValueZero.
+    let index = super::collection::new_collection(
+        cx,
+        crate::heap::object::InternalTag::Map,
+        cx.realm.intrinsic(Intrinsic::MapPrototype),
+    )?;
+    root(cx, Value::object(index));
+    let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+    let mut k = 0u64;
     while let Some(value) = iter::step(cx, &mut iterator)? {
         root(cx, value);
         let key = crate::vm::call(
             cx,
             callback,
             Value::UNDEFINED,
-            &[value, Value::number(index as f64)],
+            &[value, Value::number(k as f64)],
         );
         let key = match key.and_then(|key| {
             if property {
@@ -687,14 +728,34 @@ pub(crate) fn group(
             }
         };
         root(cx, key);
-        match groups
-            .iter_mut()
-            .find(|(existing, _)| internal::same_value_zero(cx, *existing, key))
+        match cx
+            .heap
+            .table_get(index, key)
+            .and_then(|slot| slot.as_int32())
         {
-            Some((_, members)) => members.push(value),
-            None => groups.push((key, vec![value])),
+            Some(slot) => groups[slot as usize].1.push(value),
+            None => {
+                super::collection::set_entry(cx, index, key, Value::int32(groups.len() as i32))?;
+                groups.push((key, vec![value]));
+            }
         }
-        index += 1;
+        k += 1;
     }
-    Ok(groups)
+    let result = create(cx)?;
+    root(cx, Value::object(result));
+    for (key, elements) in groups {
+        let array = internal::array_create(cx, 0)?;
+        root(cx, Value::object(array));
+        for (position, element) in elements.into_iter().enumerate() {
+            let element_key = internal::index_key(cx, position as u32)?;
+            internal::create_data_property(cx, array, element_key, element)?;
+        }
+        if property {
+            let key = ops::to_property_key(cx, key)?;
+            internal::create_data_property(cx, result, key, Value::object(array))?;
+        } else {
+            super::collection::set_entry(cx, result, key, Value::object(array))?;
+        }
+    }
+    Ok(Value::object(result))
 }

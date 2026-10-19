@@ -1,6 +1,8 @@
 // One test per JavaScript fixture directory under `cases/`; the format and
 // comparison modes are documented in `support/js_cases.rs`.
-use crate::support::js_cases::{case_directories, run_case_directory};
+use crate::support::js_cases::{
+    assert_attributions_name_cases, case_directories, run_case_directory,
+};
 
 const DIRECTORIES: &[&str] = &[
     "arguments",
@@ -31,6 +33,7 @@ const DIRECTORIES: &[&str] = &[
     "primitive_intrinsics",
     "primitives",
     "program_declarations",
+    "promise",
     "proxy_reflect",
     "regexp",
     "string",
@@ -44,6 +47,11 @@ const DIRECTORIES: &[&str] = &[
 #[test]
 fn every_case_directory_has_a_test() {
     assert_eq!(case_directories(), DIRECTORIES);
+}
+
+#[test]
+fn every_attribution_names_a_case() {
+    assert_attributions_name_cases();
 }
 
 #[test]
@@ -184,6 +192,11 @@ fn primitives() {
 #[test]
 fn program_declarations() {
     run_case_directory("program_declarations");
+}
+
+#[test]
+fn promise() {
+    run_case_directory("promise");
 }
 
 #[test]

@@ -5,7 +5,7 @@ mod common;
 mod support;
 use common::runtime as runtime_oracle;
 use support::{
-    object_graph_observation, oracle_cases, primitive_probe, quickjs_argv_completion_oracle,
+    object_graph_observation, oracle_cases, quickjs_argv_completion_oracle,
     quickjs_array_completion_oracle, quickjs_oracle, quickjs_raw_source_oracle,
     quickjs_syntax_diagnostic_oracle, runtime_completion_oracle, runtime_observation,
 };
@@ -51,8 +51,6 @@ mod proxy_reflect;
 mod regexp;
 mod string;
 mod templates;
-#[cfg(feature = "test262-host")]
-mod test262_create_realm;
 #[cfg(feature = "test262-host")]
 mod test262_host_gc;
 #[cfg(feature = "test262-host")]

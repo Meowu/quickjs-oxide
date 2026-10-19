@@ -1,8 +1,8 @@
-//! The main loop (section 4.2): one `match` on the typed opcode, registers
-//! read as `registers[base + r]`, inline `Int32` and double fast paths, and
+//! The main loop: one `match` on the typed opcode, registers read as
+//! `registers[base + r]`, inline `Int32` and double fast paths, and
 //! `#[inline(never)]` slow paths in [`ops`] and [`property`]. Calls, returns
-//! and `new` on bytecode functions stay in the loop (section 4.3); a throw
-//! unwinds through the handler tables (section 4.4).
+//! and `new` on bytecode functions stay in the loop; a throw unwinds through
+//! the handler tables.
 
 use std::cmp::Ordering;
 
@@ -52,16 +52,40 @@ fn callee(heap: &Heap, value: Value) -> Callee {
     }
 }
 
-/// Pushes a frame for a bytecode function whose window starts at `base`,
-/// where `this` and `frame.argc` arguments already are. Clears the rest of
-/// the window (missing parameters, locals, temporaries) and coerces a sloppy
-/// function's `undefined` or `null` receiver to the global object. A
-/// function that reads its actual arguments keeps the ones past its
-/// parameters above its registers, where `NewArguments` and `Rest` find
-/// them (section 5.1).
+/// Pushes a frame for a bytecode function whose window starts at `base`, where
+/// `this` and `frame.argc` arguments already are. Clears the rest of the window
+/// (missing parameters, locals, temporaries) and coerces a sloppy function's
+/// `undefined` or `null` receiver to the global object. A function that reads
+/// its actual arguments keeps the ones past its parameters above its registers,
+/// where `NewArguments` and `Rest` find them.
 #[inline]
 fn enter(cx: &mut Cx<'_>, unit: &CodeUnit, frame: Frame) -> Result<(), Throw> {
     enter_frame(cx, unit, frame)
+}
+
+/// A call whose frame could not be entered (`throw`, a stack overflow): an
+/// async function's call returns its promise rejected with it, as
+/// QuickJS's `js_async_function_call` makes the promise before the body's
+/// `JS_CallInternal` overflows. A tail call keeps the throw.
+#[cold]
+#[inline(never)]
+fn entry_failed(
+    cx: &mut Cx<'_>,
+    unit: &CodeUnit,
+    throw: Throw,
+    tail: bool,
+) -> Result<Value, Throw> {
+    if tail || !unit.has(flags::ASYNC) || unit.has(flags::GENERATOR) {
+        return Err(throw);
+    }
+    let mark = cx.heap.roots().mark();
+    cx.heap.roots().push(throw.0);
+    let prototype = cx.realm.intrinsic(Intrinsic::PromisePrototype);
+    let promise = super::jobs::new_promise(cx, prototype);
+    cx.heap.roots().truncate(mark);
+    let promise = promise?;
+    super::jobs::reject_promise(cx, promise, throw.0);
+    Ok(Value::object(promise))
 }
 
 /// [`enter`], inlined into the loop's call.
@@ -147,11 +171,11 @@ pub(super) fn frame_end(frame: &Frame, unit: &CodeUnit) -> u32 {
     end
 }
 
-/// The opcodes of the phase 3 surface that no hot path runs: accessor and
-/// spill-scope accesses, `arguments`, rest parameters, `new.target`,
-/// regular-expression literals, `for-in` setup, spread elements and
-/// unsupported constructs. Kept out of the loop, which they would otherwise
-/// grow past its size gate; each writes its own result register.
+/// The opcodes that no hot path runs: accessor and spill-scope accesses,
+/// `arguments`, rest parameters, `new.target`, regular-expression literals,
+/// `for-in` setup, spread elements and unsupported constructs. Kept out of the
+/// loop, which they would otherwise grow past its size gate; each writes its
+/// own result register.
 #[inline(never)]
 fn rare_op(cx: &mut Cx<'_>, frame: &Frame, unit: &CodeUnit, insn: Insn) -> Result<(), Throw> {
     let base = frame.base as usize;
@@ -377,12 +401,15 @@ pub(crate) fn set_function_name(
     result
 }
 
-/// Rewrites a call of `Function.prototype.call` or `apply` (section 5.2):
-/// the receiver `function` becomes the callee, the window moves onto the
-/// `thisArg`, and `apply`'s list replaces it from the next register. Repeats
-/// while the new callee is one of the two. Returns the callee, the window,
-/// `this` and the argument count.
+/// Rewrites a call of `Function.prototype.call` or `apply`: the receiver
+/// `function` becomes the callee, the window moves onto the `thisArg`, and
+/// `apply`'s list replaces it from the next register. Repeats while the new
+/// callee is one of the two. Returns the callee, the window, `this`, the
+/// argument count, and for a bytecode callee the frame flag recording what it
+/// went through: `VIA_CALL` or `VIA_APPLY` for one, the side table
+/// (`VIA_CHAIN`) for a chain. A native callee finds them in `ViaCalls::calls`.
 #[inline(never)]
+#[allow(clippy::type_complexity)]
 fn rewrite_call(
     cx: &mut Cx<'_>,
     base: usize,
@@ -390,20 +417,64 @@ fn rewrite_call(
     mut function: Value,
     mut this: Value,
     mut argc: usize,
-) -> Result<(Callee, Value, usize, Value, usize), Throw> {
+) -> Result<(Callee, Value, usize, Value, usize, u8), Throw> {
+    // The first `call` or `apply` stays local: the common rewrite records
+    // nothing on the heap.
+    let mut first = (Value::UNDEFINED, 0);
+    let mut count = 0usize;
     loop {
         let target = callee(cx.heap, function);
         let Callee::Native(native @ (Native::FunctionCall | Native::FunctionApply)) = target else {
-            return Ok((target, function, window, this, argc));
+            match target {
+                Callee::Bytecode(..) if count == 1 => {
+                    return Ok((target, function, window, this, argc, first.1));
+                }
+                Callee::Bytecode(..) => {
+                    super::via::enter_bytecode(cx);
+                    return Ok((target, function, window, this, argc, frame_flags::VIA_CHAIN));
+                }
+                // A frameless native lists nothing; `call_other` lists them
+                // while anything else runs.
+                Callee::Native(native) if native.frameless() => super::via::abandon(cx),
+                _ if count == 1 => super::via::begin(cx, first.0),
+                _ => {}
+            }
+            return Ok((target, function, window, this, argc, 0));
         };
+        match count {
+            0 => {
+                let flag = if native == Native::FunctionCall {
+                    frame_flags::VIA_CALL
+                } else {
+                    frame_flags::VIA_APPLY
+                };
+                first = (function, flag);
+            }
+            1 => {
+                super::via::begin(cx, first.0);
+                super::via::record(cx, function);
+            }
+            _ => super::via::record(cx, function),
+        }
+        count += 1;
+        let apply = function;
         function = this;
         window += 1;
         let at = base + window;
-        argc = if native == Native::FunctionCall {
-            arguments::call_window(cx, at, argc)?
+        let result = if native == Native::FunctionCall {
+            arguments::call_window(cx, at, argc)
         } else {
-            arguments::apply_window(cx, at, argc)?
+            // A throw reading the list lists `apply` in the backtrace.
+            cx.heap.vm.natives.push(super::NativeSite {
+                depth: cx.heap.vm.frames.len() as u32,
+                pc: super::NO_PC,
+                callee: apply,
+            });
+            let result = arguments::apply_window(cx, at, argc);
+            cx.heap.vm.natives.pop();
+            result
         };
+        argc = result.inspect_err(|_| super::via::abandon(cx))?;
         this = cx.heap.vm.registers[at];
     }
 }
@@ -442,9 +513,9 @@ fn call_native(
     )
 }
 
-/// A construction's receiver and `new.target` for a bytecode callee
-/// (section 4.5): a derived constructor starts without one. `site` is the
-/// `New` instruction's cache, used only when `new.target` is the callee.
+/// A construction's receiver and `new.target` for a bytecode callee: a derived
+/// constructor starts without one. `site` is the `New` instruction's cache,
+/// used only when `new.target` is the callee.
 #[inline(never)]
 fn construct_this(
     cx: &mut Cx<'_>,
@@ -455,7 +526,7 @@ fn construct_this(
     site: Option<usize>,
 ) -> Result<(Value, Value), Throw> {
     if !unit.has(flags::CONSTRUCTOR) {
-        return Err(error::type_error(cx, "not a constructor"));
+        return Err(error::not_a_constructor(cx, function));
     }
     let new_target = cx.heap.vm.registers[at];
     if unit.has(flags::DERIVED) {
@@ -467,15 +538,12 @@ fn construct_this(
 }
 
 /// `ToPropertyKeyOf`'s conversion of an object key: a `null` or
-/// `undefined` base throws first.
+/// `undefined` base throws first, with QuickJS's `OP_get_array_el3`
+/// message.
 #[inline(never)]
 fn to_property_key_of(cx: &mut Cx<'_>, key: Value, base: Value) -> Result<PropertyKey, Throw> {
     if base.is_null() || base.is_undefined() {
-        let base = if base.is_null() { "null" } else { "undefined" };
-        return Err(error::type_error(
-            cx,
-            &format!("cannot read property of {base}"),
-        ));
+        return Err(error::type_error(cx, "value has no property"));
     }
     ops::to_property_key(cx, key)
 }
@@ -500,14 +568,25 @@ fn call_other(
         Value::UNDEFINED
     };
     match target {
+        Callee::Native(native) if native.frameless() && !construct => {
+            call_native(cx, native, at, this, argc, construct, function, new_target)
+        }
         Callee::Native(native) if !construct || native.is_constructor() => {
-            let site = (cx.heap.vm.frames.len() as u32, pc as u32);
-            let saved = std::mem::replace(&mut cx.heap.vm.native_site, site);
+            // Reached through a rewritten `call` or `apply`: those natives
+            // are listed below this one.
+            let via = super::via::list(cx, pc);
+            let site = super::NativeSite {
+                depth: cx.heap.vm.frames.len() as u32,
+                pc: pc as u32,
+                callee: function,
+            };
+            cx.heap.vm.natives.push(site);
             let result = call_native(cx, native, at, this, argc, construct, function, new_target);
-            cx.heap.vm.native_site = saved;
+            cx.heap.vm.natives.pop();
+            super::via::unlist(cx, via);
             result
         }
-        Callee::Native(_) => Err(error::type_error(cx, "not a constructor")),
+        Callee::Native(_) => Err(error::not_a_constructor(cx, function)),
         _ => {
             let callable = function.as_object().is_some_and(|object| {
                 let flag = if construct {
@@ -515,21 +594,41 @@ fn call_other(
                 } else {
                     crate::heap::object::flags::CALLABLE
                 };
+                // QuickJS enters any proxy, which reports a non-callable
+                // target after reading its `apply` trap.
                 cx.heap.header(object).has(flag)
+                    || (!construct && cx.heap.object_kind(object) == ObjectKind::Proxy)
             });
             if !callable {
-                return Err(error::type_error(
-                    cx,
-                    if construct {
-                        "not a constructor"
-                    } else {
-                        "not a function"
-                    },
-                ));
+                if construct {
+                    return Err(construct_failure(cx, function, pc));
+                }
+                let via = super::via::list(cx, pc);
+                let throw = error::type_error(cx, "not a function");
+                super::via::unlist(cx, via);
+                return Err(throw);
             }
-            call_exotic(cx, function, at, this, argc, construct, new_target)
+            let via = super::via::list(cx, pc);
+            let result = call_exotic(cx, function, at, this, argc, construct, new_target);
+            super::via::unlist(cx, via);
+            result
         }
     }
+}
+
+/// `new function(…)` from the loop at `pc` on a value that is not a
+/// constructor: QuickJS's `JS_CallConstructor` message, except that a
+/// spread `new` of a non-function goes through `apply`'s `not a function`.
+#[cold]
+#[inline(never)]
+fn construct_failure(cx: &mut Cx<'_>, function: Value, pc: usize) -> Throw {
+    let frame = *cx.heap.vm.frames.last().expect("a frame");
+    let spread =
+        cx.code.get(frame.unit).code.get(pc).map(|insn| insn.op) == Some(Opcode::NewSpread);
+    if spread && !ops::is_callable(cx.heap, function) {
+        return error::type_error(cx, "not a function");
+    }
+    error::construct_error(cx, function)
 }
 
 /// A call or construction of a callable that is neither bytecode nor a
@@ -557,8 +656,8 @@ fn call_exotic(
     }
 }
 
-/// Writes `new.target` into the register a unit that reads it reserves:
-/// its first local, right after the parameters (section 4.5).
+/// Writes `new.target` into the register a unit that reads it reserves: its
+/// first local, right after the parameters.
 #[inline]
 fn write_new_target(cx: &mut Cx<'_>, base: usize, unit: &CodeUnit, new_target: Value) {
     if unit.has(flags::NEW_TARGET) {
@@ -576,6 +675,7 @@ pub(super) fn call_from_rust(
 ) -> Result<Value, Throw> {
     match callee(cx.heap, function) {
         Callee::Bytecode(object, bytecode) => {
+            cx.heap.vm.frameless_native = false;
             let store: &CodeStore = cx.code;
             let unit_id = cx.heap.bytecode_unit(bytecode);
             let unit = store.get(unit_id);
@@ -592,11 +692,14 @@ pub(super) fn call_from_rust(
             if !cx.heap.vm.enter_native() {
                 return Err(error::stack_overflow(cx));
             }
-            let result = enter(cx, unit, frame).and_then(|()| run(cx));
+            let result = match enter(cx, unit, frame) {
+                Ok(()) => run(cx),
+                Err(throw) => entry_failed(cx, unit, throw, false),
+            };
             cx.heap.vm.leave_native();
             result
         }
-        Callee::Native(native) => native::call(
+        Callee::Native(native) => native_from_rust(
             cx,
             native,
             CallSite {
@@ -608,8 +711,28 @@ pub(super) fn call_from_rust(
                 new_target: Value::UNDEFINED,
             },
         ),
-        Callee::NotCallable => call_exotic_from_rust(cx, function, base, argc),
+        Callee::NotCallable => {
+            cx.heap.vm.frameless_native = false;
+            call_exotic_from_rust(cx, function, base, argc)
+        }
     }
+}
+
+/// A native called from Rust: running, it is listed in a backtrace (QuickJS
+/// gives every C function call a stack frame).
+#[inline(never)]
+fn native_from_rust(cx: &mut Cx<'_>, native: Native, site: CallSite) -> Result<Value, Throw> {
+    if std::mem::take(&mut cx.heap.vm.frameless_native) || native.frameless() {
+        return native::call(cx, native, site);
+    }
+    cx.heap.vm.natives.push(super::NativeSite {
+        depth: cx.heap.vm.frames.len() as u32,
+        pc: super::NO_PC,
+        callee: site.function,
+    });
+    let result = native::call(cx, native, site);
+    cx.heap.vm.natives.pop();
+    result
 }
 
 /// [`call_from_rust`] for a bound function or a callable proxy.
@@ -638,12 +761,7 @@ fn call_exotic_from_rust(
             cx.heap.vm.leave_native();
             result
         }
-        ObjectKind::Proxy
-            if cx
-                .heap
-                .header(object)
-                .has(crate::heap::object::flags::CALLABLE) =>
-        {
+        ObjectKind::Proxy => {
             let args = cx.heap.vm.registers[base + 1..base + 1 + argc].to_vec();
             super::proxy::call(cx, object, this, &args)
         }
@@ -675,7 +793,7 @@ pub(super) fn construct_from_rust(
             let unit_id = cx.heap.bytecode_unit(bytecode);
             let unit = store.get(unit_id);
             if !unit.has(flags::CONSTRUCTOR) {
-                return Err(error::type_error(cx, "not a constructor"));
+                return Err(error::not_a_constructor(cx, function));
             }
             let receiver = if unit.has(flags::DERIVED) {
                 Value::UNDEFINED
@@ -708,7 +826,7 @@ pub(super) fn construct_from_rust(
             cx.heap.vm.leave_native();
             result
         }
-        Callee::Native(native) if native.is_constructor() => native::call(
+        Callee::Native(native) if native.is_constructor() => native_from_rust(
             cx,
             native,
             CallSite {
@@ -720,7 +838,7 @@ pub(super) fn construct_from_rust(
                 new_target,
             },
         ),
-        Callee::Native(_) => Err(error::type_error(cx, "not a constructor")),
+        Callee::Native(_) => Err(error::not_a_constructor(cx, function)),
         Callee::NotCallable => construct_exotic(cx, function, base, argc, new_target),
     }
 }
@@ -739,7 +857,7 @@ fn construct_exotic(
             .header(object)
             .has(crate::heap::object::flags::CONSTRUCTOR)
     }) else {
-        return Err(error::type_error(cx, "not a constructor"));
+        return Err(error::construct_error(cx, function));
     };
     let args = cx.heap.vm.registers[base + 1..base + 1 + argc].to_vec();
     match cx.heap.object_kind(object) {
@@ -761,7 +879,7 @@ fn construct_exotic(
             result
         }
         ObjectKind::Proxy => super::proxy::construct(cx, object, &args, new_target),
-        _ => Err(error::type_error(cx, "not a constructor")),
+        _ => Err(error::construct_error(cx, function)),
     }
 }
 
@@ -769,8 +887,30 @@ fn construct_exotic(
 #[cold]
 #[inline(never)]
 fn key_error(cx: &mut Cx<'_>, kind: ErrorKind, insn: Insn, before: &str, after: &str) -> Throw {
-    let message = format!("{before}{}{after}", property::key_text(cx.heap, insn.key()));
-    error::throw(cx, kind, &message)
+    let mut message = error::atom_message(cx.heap, before, insn.key(), after);
+    // A binding whose name was stripped (`-s`, no direct eval) is QuickJS's
+    // `JS_ATOM_NULL` in `JS_ThrowReferenceErrorUninitialized`.
+    if message.len() == before.len() + after.len() && after == " is not initialized" {
+        message = format!("{before}lexical variable{after}")
+            .encode_utf16()
+            .collect();
+    }
+    error::throw_units(cx, kind, &message)
+}
+
+/// [`key_error`] of a script's declaration prologue: QuickJS checks the
+/// declarations before the script's frame exists.
+#[cold]
+#[inline(never)]
+fn prologue_error(
+    cx: &mut Cx<'_>,
+    kind: ErrorKind,
+    insn: Insn,
+    before: &str,
+    after: &str,
+) -> Throw {
+    let message = error::atom_message(cx.heap, before, insn.key(), after);
+    error::throw_prologue(cx, kind, &String::from_utf16_lossy(&message))
 }
 
 /// A new cell (a one-slot scope object) holding `value`, which must be
@@ -1007,11 +1147,11 @@ pub(crate) fn closure_over_captures(
     result
 }
 
-/// `New`'s receiver (phase 3, section 2.5): an ordinary object inheriting
-/// from the constructor's `prototype`, sized by the site's learned slot count.
-/// A hit is a shape compare on the constructor and a load of its `prototype`
-/// slot, read live; a miss looks it up and refills the entry with the
-/// constructor's static `this.x =` count.
+/// `New`'s receiver: an ordinary object inheriting from the constructor's
+/// `prototype`, sized by the site's learned slot count. A hit is a shape
+/// compare on the constructor and a load of its `prototype` slot, read live; a
+/// miss looks it up and refills the entry with the constructor's static
+/// `this.x =` count.
 #[inline]
 fn construct_receiver(
     cx: &mut Cx<'_>,
@@ -1084,20 +1224,20 @@ fn alloc_receiver(cx: &mut Cx<'_>, prototype: Value, slots: u32) -> Result<Value
         .map_err(|error| error::heap_error(cx, error))
 }
 
-/// The slots a constructed receiver or an empty literal reserves at least:
-/// such objects usually gain properties after creation (a tree node's
-/// children), and a transition into a free slot is a cache hit where a full
-/// range is a miss and a copy (phase 3 M5, on Splay).
+/// The slots a constructed receiver or an empty literal reserves at least: such
+/// objects usually gain properties after creation (a tree node's children), and
+/// a transition into a free slot is a cache hit where a full range is a miss
+/// and a copy (measured on Splay).
 const MIN_OPEN_SLOTS: u32 = 4;
 
 /// The most receiver slots a construct entry learns: an object past the
 /// dictionary threshold leaves the transition tree anyway.
 const MAX_LEARNED_SLOTS: u32 = 2 * crate::shape::DICTIONARY_THRESHOLD;
 
-/// Section 2.5's learning: when a constructor's frame returns to the `New`
-/// that entered it, the site's entry keeps the larger of its slot count and
-/// the slots the receiver grew to, so the next construction reserves what
-/// chained constructors added.
+/// Constructor-size learning: when a constructor's frame returns to the `New`
+/// that entered it, the site's entry keeps the larger of its slot count and the
+/// slots the receiver grew to, so the next construction reserves what chained
+/// constructors added.
 #[inline(never)]
 fn learn_receiver_size(cx: &mut Cx<'_>, done: &Frame) {
     if done.flags & frame_flags::ENTRY != 0 {
@@ -1129,12 +1269,11 @@ fn learn_receiver_size(cx: &mut Cx<'_>, done: &Frame) {
     }
 }
 
-/// `GetGlobal` and `GetGlobalOrUndefined` past the cache (section 2.4): a
-/// binding of the global lexical environment (section 5.7) first, then an
-/// own data property of the global object; both fill the entry with the
-/// global generation and the holder. A lexical binding in the TDZ throws
-/// and is not cached; anything else (an accessor, a global found on
-/// `%Object.prototype%`) is read uncached.
+/// `GetGlobal` and `GetGlobalOrUndefined` past the cache: a binding of the
+/// global lexical environment first, then an own data property of the global
+/// object; both fill the entry with the global generation and the holder. A
+/// lexical binding in the TDZ throws and is not cached; anything else (an
+/// accessor, a global found on `%Object.prototype%`) is read uncached.
 #[inline(never)]
 fn get_global(cx: &mut Cx<'_>, insn: Insn, site: usize) -> Result<Value, Throw> {
     let key = insn.key();
@@ -1274,7 +1413,10 @@ fn define_global(
     configurable: bool,
 ) -> Result<(), Throw> {
     let lexical = cx.realm.intrinsic(Intrinsic::GlobalLexical);
-    if let Some((slot, _)) = cx.heap.lookup_own(lexical, key) {
+    // Only an initialization writes a lexical binding of the name; a `var`
+    // that an Annex B or labelled function declared beside it stays the
+    // global object's (QuickJS's closure variables of each kind).
+    if overwrite && let Some((slot, _)) = cx.heap.lookup_own(lexical, key) {
         cx.heap.set_slot(lexical, slot, value);
         return Ok(());
     }
@@ -1296,7 +1438,10 @@ fn define_global(
         .header(global)
         .has(crate::heap::object::flags::EXTENSIBLE)
     {
-        let message = format!("cannot define variable '{}'", property::key_text(heap, key));
+        let message = format!(
+            "cannot define variable '{}'",
+            property::atom_text(heap, key)
+        );
         return Err(error::type_error(cx, &message));
     }
     heap.add_property(
@@ -1319,7 +1464,7 @@ fn delete_global(cx: &mut Cx<'_>, key: PropertyKey) -> Result<Value, Throw> {
     property::delete(cx, global, key, false).map(Value::bool)
 }
 
-/// The declaration forms and checks of a script's prologue (section 5.7).
+/// The declaration forms and checks of a script's prologue.
 #[inline(never)]
 fn declare_global(cx: &mut Cx<'_>, insn: Insn) -> Result<(), Throw> {
     let key = insn.key();
@@ -1331,6 +1476,11 @@ fn declare_global(cx: &mut Cx<'_>, insn: Insn) -> Result<(), Throw> {
             define_global(cx, key, Value::UNDEFINED, false, configurable)
         }
         Opcode::DeclareGlobalLet | Opcode::DeclareGlobalConst => {
+            // A name an Annex B function masked may be declared twice: the
+            // first declaration's binding and kind stay, as in QuickJS.
+            if cx.heap.lookup_own(lexical, key).is_some() {
+                return Ok(());
+            }
             let writable = insn.op == Opcode::DeclareGlobalLet;
             cx.heap
                 .add_property(
@@ -1341,9 +1491,9 @@ fn declare_global(cx: &mut Cx<'_>, insn: Insn) -> Result<(), Throw> {
                 )
                 .map_err(|error| error::heap_error(cx, error))
         }
-        Opcode::CheckGlobalVar => {
+        Opcode::CheckGlobalVar if insn.b & global_flags::LEXICAL_CONFLICT != 0 => {
             if cx.heap.lookup_own(lexical, key).is_some() {
-                return Err(key_error(
+                return Err(prologue_error(
                     cx,
                     ErrorKind::Syntax,
                     insn,
@@ -1351,6 +1501,10 @@ fn declare_global(cx: &mut Cx<'_>, insn: Insn) -> Result<(), Throw> {
                     "'",
                 ));
             }
+            Ok(())
+        }
+        Opcode::CheckGlobalVar => {
+            // CanDeclareGlobalFunction / CanDeclareGlobalVar (9.1.1.4.16-17).
             let declarable = match cx.heap.lookup_own(global, key) {
                 None => cx
                     .heap
@@ -1365,7 +1519,7 @@ fn declare_global(cx: &mut Cx<'_>, insn: Insn) -> Result<(), Throw> {
                 }
             };
             if !declarable {
-                return Err(key_error(
+                return Err(prologue_error(
                     cx,
                     ErrorKind::Type,
                     insn,
@@ -1382,7 +1536,7 @@ fn declare_global(cx: &mut Cx<'_>, insn: Insn) -> Result<(), Throw> {
                     .lookup_own(global, key)
                     .is_some_and(|(_, property)| !property.has(PropertyFlags::CONFIGURABLE));
             if restricted {
-                return Err(key_error(
+                return Err(prologue_error(
                     cx,
                     ErrorKind::Syntax,
                     insn,
@@ -1417,9 +1571,8 @@ fn run(cx: &mut Cx<'_>) -> Result<Value, Throw> {
     run_at(cx, 0)
 }
 
-/// Starts a resumed entry frame (section 4.3) by throwing `thrown` at the
-/// instruction before `pc`: its handler takes it, or the frame is popped
-/// and the throw returned.
+/// Starts a resumed entry frame by throwing `thrown` at the instruction before
+/// `pc`: its handler takes it, or the frame is popped and the throw returned.
 pub(super) fn run_throwing(cx: &mut Cx<'_>, pc: usize, thrown: Value) -> Result<Value, Throw> {
     let frame = *cx.heap.vm.frames.last().expect("an entry frame");
     let unit = cx.code.get(frame.unit);
@@ -1833,8 +1986,8 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
 
                 // ---- properties ----
                 Opcode::GetField => {
-                    // Section 2.2. The hit reads the heap's arenas as fields,
-                    // disjoint from the register file, so the window stays.
+                    // The hit reads the heap's arenas as fields, disjoint from
+                    // the register file, so the window stays.
                     let object = reg!(insn.b);
                     let site = ic_base + insn.c as usize;
                     let entry = cx.heap.ics.entries[site];
@@ -1855,7 +2008,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                     write!('dispatch, insn.a, property::get_cached(cx, object, insn.key(), site, fill))
                 }
                 Opcode::SetField => {
-                    // Section 2.3, with the arenas borrowed as in `GetField`.
+                    // The arenas are borrowed as in `GetField`.
                     let (object, value) = (reg!(insn.a), reg!(insn.b));
                     let site = ic_base + insn.c as usize;
                     let entry = cx.heap.ics.entries[site];
@@ -1893,7 +2046,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                         if !element.is_empty() {
                             set!('dispatch, insn.a, element)
                         }
-                        // Section 4.4: a typed array's element.
+                        // A typed array's element.
                         if cx.heap.object_kind(target) == ObjectKind::TypedArray
                             && let Some(element) = typed::fast_get(cx.heap, target, index as u32)
                         {
@@ -1954,7 +2107,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
 
                 // ---- globals ----
                 Opcode::GetGlobal | Opcode::GetGlobalOrUndefined => {
-                    // Section 2.4: one generation compare and a load.
+                    // One generation compare and a load.
                     let site = ic_base + global_site(insn);
                     let entry = cx.heap.ics.entries[site];
                     if entry.w0 == cx.heap.global_generation {
@@ -2038,7 +2191,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                     continue 'dispatch;
                 }
 
-                // ---- the phase 3 surface: rare forms, out of line ----
+                // ---- rare forms, out of line ----
                 Opcode::DefineGetter
                 | Opcode::DefineSetter
                 | Opcode::NewSpill
@@ -2164,15 +2317,16 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                             Err(throw) => break 'op Err(throw),
                         }
                     }
-                    // Section 5.2: `f.call(…)` and `f.apply(…)` move the window
-                    // onto their `thisArg` and dispatch on `f`.
+                    // `f.call(…)` and `f.apply(…)` move the window onto their
+                    // `thisArg` and dispatch on `f`.
                     let mut target = callee(cx.heap, function);
+                    let mut via = 0;
                     if let Callee::Native(Native::FunctionCall | Native::FunctionApply) = target
                         && !construct
                     {
                         match rewrite_call(cx, base, window, function, this, argc) {
                             Ok(rewritten) => {
-                                (target, function, window, this, argc) = rewritten;
+                                (target, function, window, this, argc, via) = rewritten;
                             }
                             Err(throw) => break 'op Err(throw),
                         }
@@ -2198,7 +2352,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                                 }
                             }
                             cx.heap.vm.registers[base + window] = this;
-                            let mut frame_flags = 0;
+                            let mut frame_flags = via;
                             if construct {
                                 frame_flags |= frame_flags::CONSTRUCT;
                             }
@@ -2216,7 +2370,11 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                                 flags: frame_flags,
                             };
                             if let Err(throw) = enter_frame(cx, callee_unit, callee_frame) {
-                                break 'op Err(throw);
+                                break 'op write!(
+                                    'dispatch,
+                                    insn.a,
+                                    entry_failed(cx, callee_unit, throw, tail)
+                                );
                             }
                             if construct {
                                 write_new_target(cx, base + window, callee_unit, new_target);
@@ -2261,8 +2419,12 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                         Value::UNDEFINED
                     };
                     // A plain call's frame (not an entry, a construction or
-                    // a tail call) returns to the frame below, loaded once.
-                    if frame.flags == 0 {
+                    // a tail call) returns to the frame below, loaded once;
+                    // the backtrace's `VIA_*` marks do not matter here.
+                    if frame.flags
+                        & (frame_flags::ENTRY | frame_flags::CONSTRUCT | frame_flags::TAIL)
+                        == 0
+                    {
                         cx.heap.vm.frames.pop();
                         let caller = *cx.heap.vm.frames.last().expect("a caller");
                         let caller_unit = store.get(caller.unit);
@@ -2290,7 +2452,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                 }
                 Opcode::Throw => Err(Throw(reg!(insn.a))),
 
-                // ---- suspension (section 4.3), out of line ----
+                // ---- suspension, out of line ----
                 Opcode::InitialYield
                 | Opcode::AsyncStart
                 | Opcode::Yield
@@ -2314,6 +2476,9 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
             continue 'dispatch;
         };
         let mut at = pc - 1;
+        // Unconditional: a test of `unpositioned` here costs the loop's code
+        // about 4%.
+        error::place_frame(cx, thrown, unit, at as u32);
         loop {
             if let Some(handler) = unit
                 .handlers
@@ -2433,10 +2598,9 @@ enum Test {
 }
 
 impl Test {
-    /// `==` and `===` decided from the bits, before the general algorithms:
-    /// the same
-    /// value that is not a double (`NaN` is not equal to itself), and
-    /// `null` or `undefined` against anything (phase 3 M5, on Richards'
+    /// `==` and `===` decided from the bits, before the general algorithms: the
+    /// same value that is not a double (`NaN` is not equal to itself), and
+    /// `null` or `undefined` against anything (measured on Richards'
     /// `x == null` tests). `None` for the rest.
     #[inline(always)]
     fn quick(self, heap: &Heap, x: Value, y: Value) -> Option<bool> {
@@ -2617,11 +2781,11 @@ enum Returned {
     Resume(u32),
 }
 
-/// The suspension opcodes (section 4.3). Each saves the running frame into
-/// its activation record and leaves it: `InitialYield` returns the new
-/// generator to the caller, `AsyncStart` runs the body and returns the
-/// promise, `Yield`, `YieldStar` and `Await` leave the nested loop of the
-/// resumption (their frame is its entry frame).
+/// The suspension opcodes. Each saves the running frame into its activation
+/// record and leaves it: `InitialYield` returns the new generator to the
+/// caller, `AsyncStart` runs the body and returns the promise, `Yield`,
+/// `YieldStar` and `Await` leave the nested loop of the resumption (their frame
+/// is its entry frame).
 #[inline(never)]
 fn suspend_op(
     cx: &mut Cx<'_>,
@@ -2662,7 +2826,21 @@ fn suspend_op(
             suspend::save_frame(cx, frame, unit, pc as u32, record, suspend::START);
             let done = cx.heap.vm.frames.pop().expect("the async frame");
             cx.heap.vm.top = done.base;
-            let promise = suspend::start_async(cx, record)?;
+            // The body runs on a frame entered from here: the backtrace
+            // places the caller at its call.
+            let entered = done.flags & frame_flags::ENTRY == 0 && done.return_pc > 0;
+            if entered {
+                cx.heap.vm.natives.push(super::NativeSite {
+                    depth: cx.heap.vm.frames.len() as u32,
+                    pc: done.return_pc - 1,
+                    callee: Value::UNDEFINED,
+                });
+            }
+            let promise = suspend::start_async(cx, record);
+            if entered {
+                cx.heap.vm.natives.pop();
+            }
+            let promise = promise?;
             if done.flags & frame_flags::ENTRY != 0 {
                 return Ok(Returned::Exit(promise));
             }

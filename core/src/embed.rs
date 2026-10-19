@@ -1,7 +1,6 @@
-//! The embedder's entries (phase 6, section 2): the object, property,
-//! conversion and value-construction operations the root crate's API
-//! exposes, each one engine entry over the internal operations the loop
-//! uses.
+//! The embedder's entries: the object, property, conversion and
+//! value-construction operations the root crate's API exposes, each one engine
+//! entry over the internal operations the loop uses.
 //!
 //! Rooting: every `Value` passed in must be rooted by the caller (a handle
 //! from [`Runtime::hold`], a fixed root, or a value the caller just received
@@ -267,10 +266,44 @@ impl Runtime {
         crate::vm::error::new_error(&mut self.cx(), kind, Value::string(message))
     }
 
+    /// A new error object located at `file:line:column` (a compile error):
+    /// `fileName`, `lineNumber` and `columnNumber`, and a `stack` that
+    /// starts there, the running frames after it.
+    pub fn new_located_error(
+        &mut self,
+        kind: ErrorKind,
+        message: &str,
+        file: &str,
+        line: u32,
+        column: u32,
+    ) -> Result<Value, HeapError> {
+        let message = self.heap.alloc_string(message)?;
+        let location = crate::vm::error::Location { file, line, column };
+        crate::vm::error::new_error_at(
+            &mut self.cx(),
+            kind,
+            Value::string(message),
+            Some(location),
+            0,
+        )
+    }
+
     /// A pending promise of `%Promise.prototype%`.
     pub fn new_promise(&mut self) -> Result<ObjectId, Throw> {
         let prototype = self.realm.intrinsic(crate::Intrinsic::PromisePrototype);
         crate::vm::jobs::new_promise(&mut self.cx(), prototype)
+    }
+
+    /// QuickJS's `JS_DetachArrayBuffer`: detaches an ArrayBuffer; anything
+    /// else is ignored.
+    pub fn detach_array_buffer(&mut self, value: Value) -> Result<(), Throw> {
+        let is_buffer = value.as_object().is_some_and(|object| {
+            self.heap.internal_tag(object) == crate::heap::object::InternalTag::ArrayBuffer
+        });
+        if is_buffer {
+            crate::builtins::detach_buffer(&mut self.cx(), value)?;
+        }
+        Ok(())
     }
 
     // ---- primitives ----

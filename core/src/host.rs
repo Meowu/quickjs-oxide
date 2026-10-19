@@ -1,7 +1,6 @@
-//! The host boundary (phase 4, section 6.3): what the core asks of its
-//! embedder. `oxide-core` reaches the platform only through this trait, so
-//! it stays dependency-free and a port (the PSP build of phase 5) supplies
-//! its own implementation.
+//! The host boundary: what the core asks of its embedder. `oxide-core` reaches
+//! the platform only through this trait, so it stays dependency-free and a port
+//! supplies its own implementation.
 
 /// Which output stream `print` and the console write to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,19 +23,21 @@ pub enum RejectionEvent {
 /// The embedder's services. Every method has a default suitable for a
 /// standalone runtime: the process's streams, the system clock and UTC.
 pub trait Host {
-    /// Writes host output (`print`). The default writes to the process's
+    /// Writes host output (`print`): UTF-8, with a lone surrogate of the
+    /// JavaScript string encoded as is (WTF-8), as QuickJS's
+    /// `JS_ToCStringLen` writes it. The default writes to the process's
     /// streams.
-    fn write(&mut self, stream: Stream, text: &str) {
+    fn write(&mut self, stream: Stream, text: &[u8]) {
         use std::io::Write;
         match stream {
             Stream::Stdout => {
                 let mut out = std::io::stdout().lock();
-                let _ = out.write_all(text.as_bytes());
+                let _ = out.write_all(text);
                 let _ = out.flush();
             }
             Stream::Stderr => {
                 let mut out = std::io::stderr().lock();
-                let _ = out.write_all(text.as_bytes());
+                let _ = out.write_all(text);
                 let _ = out.flush();
             }
         }
@@ -72,7 +73,7 @@ pub trait Host {
     }
 
     /// The text of the file at `path`, for the CLI's `load` and `read`
-    /// (`oxide-run --std`). The default reads the process's file system.
+    /// (`qjs --std`). The default reads the process's file system.
     fn read_file(&mut self, path: &str) -> Option<String> {
         std::fs::read_to_string(path).ok()
     }

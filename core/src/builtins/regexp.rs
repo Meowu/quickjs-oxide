@@ -1,17 +1,17 @@
-//! `RegExp` (phase 4, section 6.1 row 4): the constructor with `IsRegExp`,
-//! `RegExp.escape`, `%RegExp.prototype%`'s `exec` (with `groups` and
-//! `indices`), `test`, `toString`, `compile`, the flag accessors and the
-//! `Symbol.match`, `matchAll`, `replace`, `search` and `split` protocol, and
-//! `%RegExpStringIteratorPrototype%`. Programs run on a string's own
-//! one-byte or two-byte storage. `Symbol.species` is dropped (phase 0):
-//! `matchAll` and `split` construct `%RegExp%`.
+//! `RegExp`: the constructor with `IsRegExp`, `RegExp.escape`,
+//! `%RegExp.prototype%`'s `exec` (with `groups` and `indices`), `test`,
+//! `toString`, `compile`, the flag accessors and the `Symbol.match`,
+//! `matchAll`, `replace`, `search` and `split` protocol, and
+//! `%RegExpStringIteratorPrototype%`. Programs run on a string's own one-byte
+//! or two-byte storage. `Symbol.species` is dropped: `matchAll` and `split`
+//! construct `%RegExp%`.
 
 use oxide_regexp::{ExecError, RegExpFlags, RegExpMatch};
 
 use super::string::{substitution, substring_value};
 use super::{
-    Native, accessor, install_constructor, methods, plain_object, string_units, symbol_method,
-    this_string, to_string_id, to_string_tag,
+    Native, accessor, install_constructor, link_constructor, methods, plain_object, string_units,
+    symbol_method, to_string_id, to_string_tag,
 };
 use crate::heap::HeapError;
 use crate::heap::object::{InternalTag, ObjectKind};
@@ -38,7 +38,8 @@ const FLAG_GETTERS: [(Native, u8); 8] = [
 
 pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     let prototype = cx.realm.intrinsic(Intrinsic::RegExpPrototype);
-    let constructor = install_constructor(cx, Native::RegExpConstructor, prototype)?;
+    // QuickJS's `js_regexp_funcs` and `js_regexp_proto_funcs`, in order.
+    let constructor = install_constructor(cx, Native::RegExpConstructor)?;
     cx.set_intrinsic(Intrinsic::RegExp, constructor);
     methods(cx, constructor, &[Native::RegExpEscape])?;
     let species = WellKnown::key(cx.realm.symbols.species);
@@ -50,58 +51,34 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         Some(Native::SpeciesGetter),
         None,
     )?;
+    super::getter(cx, prototype, "flags", Native::RegExpFlags)?;
+    super::getter(cx, prototype, "source", Native::RegExpSource)?;
+    // `hasIndices` comes last there, though first in `flags`.
+    for &(native, _) in FLAG_GETTERS[1..].iter().chain(&FLAG_GETTERS[..1]) {
+        super::getter(cx, prototype, native.js_name(), native)?;
+    }
     methods(
         cx,
         prototype,
         &[
-            Native::RegExpCompile,
             Native::RegExpExec,
+            Native::RegExpCompile,
             Native::RegExpTest,
             Native::RegExpToString,
         ],
     )?;
-    super::getter(cx, prototype, "flags", Native::RegExpFlags)?;
-    super::getter(cx, prototype, "source", Native::RegExpSource)?;
-    for (native, _) in FLAG_GETTERS {
-        super::getter(cx, prototype, native.js_name(), native)?;
-    }
     let symbols = cx.realm.symbols;
     let flags = PropertyFlags::data(true, false, true);
-    symbol_method(
-        cx,
-        prototype,
-        symbols.match_,
-        Native::RegExpSymbolMatch,
-        flags,
-    )?;
-    symbol_method(
-        cx,
-        prototype,
-        symbols.match_all,
-        Native::RegExpSymbolMatchAll,
-        flags,
-    )?;
-    symbol_method(
-        cx,
-        prototype,
-        symbols.replace,
-        Native::RegExpSymbolReplace,
-        flags,
-    )?;
-    symbol_method(
-        cx,
-        prototype,
-        symbols.search,
-        Native::RegExpSymbolSearch,
-        flags,
-    )?;
-    symbol_method(
-        cx,
-        prototype,
-        symbols.split,
-        Native::RegExpSymbolSplit,
-        flags,
-    )?;
+    for (symbol, native) in [
+        (symbols.replace, Native::RegExpSymbolReplace),
+        (symbols.match_, Native::RegExpSymbolMatch),
+        (symbols.match_all, Native::RegExpSymbolMatchAll),
+        (symbols.search, Native::RegExpSymbolSearch),
+        (symbols.split, Native::RegExpSymbolSplit),
+    ] {
+        symbol_method(cx, prototype, symbol, native, flags)?;
+    }
+    link_constructor(cx, constructor, prototype)?;
     let iterator_prototype = cx.realm.intrinsic(Intrinsic::IteratorPrototype);
     let string_iterator = plain_object(cx, Some(iterator_prototype), 2)?;
     cx.set_intrinsic(Intrinsic::RegExpStringIteratorPrototype, string_iterator);
@@ -192,6 +169,8 @@ pub(super) fn constructor(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Thro
     } else {
         (pattern, flags)
     };
+    // RegExpAlloc (the prototype), then RegExpInitialize (the pattern,
+    // then the flags).
     let prototype =
         internal::prototype_from_constructor(cx, new_target, Intrinsic::RegExpPrototype)?;
     root(cx, Value::object(prototype));
@@ -200,6 +179,7 @@ pub(super) fn constructor(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Thro
     } else {
         atom(cx, source)?
     };
+    root(cx, Value::string(source));
     let flags = if flags.is_undefined() {
         cx.realm.names.empty
     } else {
@@ -213,7 +193,7 @@ pub(super) fn constructor(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Thro
 pub(super) fn compile(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let this = site.this(cx);
     let Some(object) = regexp_object(cx, this) else {
-        return Err(error::type_error(cx, "not a RegExp"));
+        return Err(error::object_expected(cx, "RegExp"));
     };
     let (pattern, flags) = (site.arg(cx, 0), site.arg(cx, 1));
     let (source, flags) = if let Some(other) = regexp_object(cx, pattern) {
@@ -248,35 +228,34 @@ pub(super) fn escape(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     };
     let text = units(cx, string);
     let mut out = Vec::with_capacity(text.len() * 2);
-    let hex = |out: &mut Vec<u16>, unit: u16| {
-        let text = if unit <= 0xFF {
-            format!("\\x{unit:02x}")
-        } else {
-            format!("\\u{unit:04x}")
-        };
-        out.extend(text.encode_utf16());
-    };
-    for (index, &unit) in text.iter().enumerate() {
-        let alphanumeric = (unit as u8 as u16 == unit) && (unit as u8).is_ascii_alphanumeric();
-        if index == 0 && alphanumeric {
-            hex(&mut out, unit);
-            continue;
-        }
-        match unit {
-            0x5E | 0x24 | 0x5C | 0x2E | 0x2A | 0x2B | 0x3F | 0x28 | 0x29 | 0x5B | 0x5D | 0x7B
-            | 0x7D | 0x7C | 0x2F => {
+    let push_text = |out: &mut Vec<u16>, text: String| out.extend(text.encode_utf16());
+    // QuickJS's `js_regexp_escape`, by code point.
+    for (index, point) in char::decode_utf16(text.iter().copied()).enumerate() {
+        let point = point.map_or_else(|error| u32::from(error.unpaired_surrogate()), u32::from);
+        let first = index == 0;
+        match point {
+            9..=13 => {
                 out.push(u16::from(b'\\'));
-                out.push(unit);
+                out.push(u16::from(b"tnvfr"[point as usize - 9]));
             }
-            0x09 => out.extend("\\t".encode_utf16()),
-            0x0A => out.extend("\\n".encode_utf16()),
-            0x0B => out.extend("\\v".encode_utf16()),
-            0x0C => out.extend("\\f".encode_utf16()),
-            0x0D => out.extend("\\r".encode_utf16()),
-            0x2C | 0x2D | 0x3D | 0x3C | 0x3E | 0x23 | 0x26 | 0x21 | 0x25 | 0x3A | 0x3B | 0x40
-            | 0x7E | 0x27 | 0x60 | 0x22 => hex(&mut out, unit),
-            0x20
-            | 0xA0
+            0..=32 => push_text(&mut out, format!("\\x{point:02x}")),
+            33..=127 => {
+                let byte = point as u8;
+                if byte.is_ascii_alphanumeric() {
+                    if first {
+                        push_text(&mut out, format!("\\x{point:02x}"));
+                        continue;
+                    }
+                } else if b",-=<>#&!%:;@~'`\"".contains(&byte) {
+                    push_text(&mut out, format!("\\x{point:02x}"));
+                    continue;
+                } else if byte != b'_' {
+                    out.push(u16::from(b'\\'));
+                }
+                out.push(point as u16);
+            }
+            128..=255 => push_text(&mut out, format!("\\x{point:02x}")),
+            0xD800..=0xDFFF
             | 0x1680
             | 0x2000..=0x200A
             | 0x2028
@@ -284,21 +263,12 @@ pub(super) fn escape(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
             | 0x202F
             | 0x205F
             | 0x3000
-            | 0xFEFF => hex(&mut out, unit),
-            0xD800..=0xDFFF => {
-                let paired = if unit < 0xDC00 {
-                    text.get(index + 1)
-                        .is_some_and(|&next| (0xDC00..0xE000).contains(&next))
-                } else {
-                    index > 0 && (0xD800..0xDC00).contains(&text[index - 1])
-                };
-                if paired {
-                    out.push(unit);
-                } else {
-                    hex(&mut out, unit);
-                }
+            | 0xFEFF => push_text(&mut out, format!("\\u{point:04x}")),
+            _ => {
+                let mut buffer = [0; 2];
+                let point = char::from_u32(point).expect("a scalar value");
+                out.extend_from_slice(point.encode_utf16(&mut buffer));
             }
-            _ => out.push(unit),
         }
     }
     string_units(cx, &out)
@@ -318,7 +288,10 @@ fn this_record(cx: &mut Cx<'_>, site: &CallSite) -> Result<Option<u32>, Throw> {
             return Ok(None);
         }
     }
-    Err(error::type_error(cx, "not a RegExp"))
+    if this.as_object().is_none() {
+        return Err(error::type_error(cx, "not an object"));
+    }
+    Err(error::object_expected(cx, "RegExp"))
 }
 
 /// `EscapeRegExpPattern`: `/` outside a class and line terminators escaped,
@@ -820,10 +793,11 @@ fn intrinsic_exec(cx: &mut Cx<'_>, object: ObjectId) -> Result<bool, Throw> {
         property::Lookup::Hit(property::Found::Data(exec)) => exec,
         _ => return Ok(false),
     };
-    Ok(exec.as_object().is_some_and(|exec| {
+    let intrinsic = exec.as_object().is_some_and(|exec| {
         cx.heap.object_kind(exec) == ObjectKind::Function
             && cx.heap.function_record(exec).native == Native::RegExpExec.index()
-    }))
+    });
+    Ok(intrinsic)
 }
 
 /// `RegExpExec(R, S)`.
@@ -837,13 +811,13 @@ fn regexp_exec(cx: &mut Cx<'_>, object: ObjectId, string: StringId) -> Result<Va
         if result.as_object().is_none() && !result.is_null() {
             return Err(error::type_error(
                 cx,
-                "exec result must be an object or null",
+                "RegExp exec method must return an object or null",
             ));
         }
         return Ok(result);
     }
     if cx.heap.object_kind(object) != ObjectKind::RegExp {
-        return Err(error::type_error(cx, "not a RegExp"));
+        return Err(error::object_expected(cx, "RegExp"));
     }
     builtin_exec(cx, object, string)
 }
@@ -851,7 +825,7 @@ fn regexp_exec(cx: &mut Cx<'_>, object: ObjectId, string: StringId) -> Result<Va
 pub(super) fn exec(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let this = site.this(cx);
     let Some(object) = regexp_object(cx, this) else {
-        return Err(error::type_error(cx, "not a RegExp"));
+        return Err(error::object_expected(cx, "RegExp"));
     };
     let string = site.arg(cx, 0);
     let string = to_string_id(cx, string)?;
@@ -859,16 +833,36 @@ pub(super) fn exec(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
 }
 
 pub(super) fn test(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
+    // 22.2.6.16: an object receiver, the input by ToString, then
+    // RegExpExec (its `exec`, or the built-in matcher).
     let this = site.this(cx);
-    let Some(object) = this.as_object() else {
+    if this.as_object().is_none() {
         return Err(error::type_error(cx, "not an object"));
-    };
-    let string = site.arg(cx, 0);
-    let string = to_string_id(cx, string)?;
-    if cx.heap.object_kind(object) == ObjectKind::RegExp && intrinsic_exec(cx, object)? {
+    }
+    let input = site.arg(cx, 0);
+    let string = to_string_id(cx, input)?;
+    root(cx, Value::string(string));
+    if let Some(object) = regexp_object(cx, this)
+        && intrinsic_exec(cx, object)?
+    {
         return Ok(Value::bool(builtin_match(cx, object, string)?.is_some()));
     }
-    Ok(Value::bool(!regexp_exec(cx, object, string)?.is_null()))
+    let exec = property::get(cx, this, Names::key(cx.realm.names.exec))?;
+    if ops::is_callable(cx.heap, exec) {
+        root(cx, exec);
+        let result = crate::vm::call(cx, exec, this, &[Value::string(string)])?;
+        if result.as_object().is_none() && !result.is_null() {
+            return Err(error::type_error(
+                cx,
+                "RegExp exec method must return an object or null",
+            ));
+        }
+        return Ok(Value::bool(!result.is_null()));
+    }
+    let Some(object) = regexp_object(cx, this) else {
+        return Err(error::object_expected(cx, "RegExp"));
+    };
+    Ok(Value::bool(builtin_match(cx, object, string)?.is_some()))
 }
 
 // ---- the Symbol protocol ----
@@ -993,6 +987,7 @@ pub(super) fn symbol_match_all(cx: &mut Cx<'_>, site: CallSite) -> Result<Value,
     let object = this_object(cx, &site)?;
     let string = site.arg(cx, 0);
     let string = to_string_id(cx, string)?;
+    root(cx, Value::string(string));
     let flags = flags_text(cx, object)?;
     let flags_value = string_units(cx, &flags)?;
     root(cx, flags_value);
@@ -1037,7 +1032,7 @@ pub(super) fn string_iterator_next(cx: &mut Cx<'_>, site: CallSite) -> Result<Va
         .as_object()
         .filter(|&object| cx.heap.internal_tag(object) == InternalTag::RegExpStringIterator)
     else {
-        return Err(error::type_error(cx, "not a RegExp string iterator"));
+        return Err(error::object_expected(cx, "RegExp String Iterator"));
     };
     let slots = cx.heap.internal(iterator).slots.clone();
     if slots[4] == Value::TRUE {
@@ -1076,6 +1071,10 @@ pub(super) fn symbol_replace(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, T
         let replacement = to_string_id(cx, replace_value)?;
         Some(units(cx, replacement))
     };
+    // Unobservably the generic path's work: every flag getter and `exec`
+    // are the intrinsics (QuickJS's string-replacement fast path checks
+    // only `flags`, `global` and `unicode`, so it skips reads of the
+    // others' own getters).
     if let Some(flags) = pristine_exec_flags(cx, object)? {
         return replace_pristine(cx, object, string, flags, replace_value, replacement);
     }
@@ -1106,7 +1105,10 @@ pub(super) fn symbol_replace(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, T
     let mut next_position = 0usize;
     for result in results {
         let result_object = result.as_object().expect("a match result");
-        let result_length = internal::length_of_array_like(cx, result_object)?;
+        // QuickJS's `js_get_length32`: `ToUint32(Get(result, "length"))`.
+        let result_length =
+            internal::get_property(cx, result_object, Names::key(cx.realm.names.length))?;
+        let result_length = crate::vm::number::to_uint32(ops::to_number(cx, result_length)?);
         let capture_count = result_length.saturating_sub(1);
         let matched = matched_text(cx, result)?;
         root(cx, Value::string(matched));
@@ -1114,7 +1116,7 @@ pub(super) fn symbol_replace(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, T
         let index = internal::get_property(cx, result_object, Names::key(cx.realm.names.index))?;
         let position =
             internal::to_integer_or_infinity(cx, index)?.clamp(0.0, length as f64) as usize;
-        let mut captures: Vec<Value> = Vec::with_capacity(capture_count as usize);
+        let mut captures: Vec<Value> = Vec::new();
         for n in 1..=capture_count {
             let key = internal::number_key(cx, n as f64)?;
             let capture = internal::get_property(cx, result_object, key)?;
@@ -1135,6 +1137,13 @@ pub(super) fn symbol_replace(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, T
             args.push(Value::string(string));
             if !groups.is_undefined() {
                 args.push(groups);
+            }
+            // QuickJS calls the function through `apply` over the array.
+            if args.len() > 65_534 {
+                return Err(error::range_error(
+                    cx,
+                    "too many arguments in function call (only 65534 allowed)",
+                ));
             }
             let value = crate::vm::call(cx, replace_value, Value::UNDEFINED, &args)?;
             let value = to_string_id(cx, value)?;
@@ -1281,7 +1290,7 @@ fn replace_pristine(
             next_position = range.end;
         }
         if accumulated.len() > super::string::MAX_STRING {
-            return Err(error::range_error(cx, "invalid string length"));
+            return Err(error::string_too_long(cx));
         }
     }
     if next_position < text.len() {
@@ -1300,49 +1309,42 @@ fn substitute_with_groups(
     groups: Option<ObjectId>,
     replacement: &[u16],
 ) -> Result<Vec<u16>, Throw> {
-    // Group values are read in replacement order first: `Get` may run
-    // getters, which `substitution`'s callback cannot.
-    let mut named: Vec<(Vec<u16>, Option<Vec<u16>>)> = Vec::new();
-    if let Some(groups) = groups {
-        let mut at = 0;
-        while at + 1 < replacement.len() {
-            if replacement[at] == u16::from(b'$') && replacement[at + 1] == u16::from(b'<') {
-                if let Some(close) = replacement[at + 2..]
-                    .iter()
-                    .position(|&unit| unit == u16::from(b'>'))
-                {
-                    let name = replacement[at + 2..at + 2 + close].to_vec();
-                    let key = cx
-                        .heap
-                        .property_key_units(&name)
-                        .map_err(|error| error::heap_error(cx, error))?;
-                    let value = internal::get_property(cx, groups, key)?;
-                    let value = if value.is_undefined() {
-                        None
-                    } else {
-                        let value = to_string_id(cx, value)?;
-                        Some(units(cx, value))
-                    };
-                    named.push((name, value));
-                    at += close + 3;
-                    continue;
-                }
-                break;
-            }
-            at += 1;
-        }
+    let Some(groups) = groups else {
+        return substitution(text, position, matched, captures, &|_| None, replacement)
+            .ok_or_else(|| error::string_too_long(cx));
+    };
+    // `Get` may run getters, which `substitution`'s callback cannot: a first
+    // pass records the `$<name>` tokens in order, each is then read (and
+    // converted) once per token as QuickJS does, and a second pass
+    // consumes the values in that order.
+    let names = std::cell::RefCell::new(Vec::<Vec<u16>>::new());
+    let record = |name: &[u16]| -> Option<Option<Vec<u16>>> {
+        names.borrow_mut().push(name.to_vec());
+        Some(None)
+    };
+    let _ = substitution(text, position, matched, captures, &record, replacement);
+    let mut values = Vec::new();
+    for name in names.into_inner() {
+        let key = cx
+            .heap
+            .property_key_units(&name)
+            .map_err(|error| error::heap_error(cx, error))?;
+        let value = internal::get_property(cx, groups, key)?;
+        values.push(if value.is_undefined() {
+            None
+        } else {
+            let value = to_string_id(cx, value)?;
+            Some(units(cx, value))
+        });
     }
-    let lookup = |name: &[u16]| -> Option<Option<Vec<u16>>> {
-        groups?;
-        Some(
-            named
-                .iter()
-                .find(|(key, _)| key.as_slice() == name)
-                .and_then(|(_, value)| value.clone()),
-        )
+    let next = std::cell::Cell::new(0usize);
+    let lookup = |_: &[u16]| -> Option<Option<Vec<u16>>> {
+        let index = next.get();
+        next.set(index + 1);
+        Some(values.get(index).cloned().flatten())
     };
     substitution(text, position, matched, captures, &lookup, replacement)
-        .ok_or_else(|| error::range_error(cx, "invalid string length"))
+        .ok_or_else(|| error::string_too_long(cx))
 }
 
 /// `RegExp.prototype[Symbol.search](string)`.
@@ -1373,6 +1375,7 @@ pub(super) fn symbol_split(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Thr
     let object = this_object(cx, &site)?;
     let string = site.arg(cx, 0);
     let string = to_string_id(cx, string)?;
+    root(cx, Value::string(string));
     let mut flags = flags_text(cx, object)?;
     let unicode = has(&flags, b'u') || has(&flags, b'v');
     // A non-sticky original searches for the next match where the sticky
@@ -1424,7 +1427,7 @@ pub(super) fn symbol_split(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Thr
         }
         return internal::array_from_list(cx, &parts).map(Value::object);
     }
-    let fast = intrinsic_exec(cx, splitter)?;
+    let fast = cx.heap.object_kind(splitter) == ObjectKind::RegExp && intrinsic_exec(cx, splitter)?;
     let push = |cx: &mut Cx<'_>, parts: &mut Vec<Value>, value: Value| {
         root(cx, value);
         parts.push(value);
@@ -1465,25 +1468,37 @@ pub(super) fn symbol_split(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Thr
                 _ => (None, Vec::new()),
             }
         } else {
+            // QuickJS's order: the captures are read only after the piece
+            // before the match is pushed, and only up to the limit.
             set_last_index(cx, splitter, index_value(q as u64))?;
             let result = regexp_exec(cx, splitter, string)?;
-            match result.as_object() {
-                None => (None, Vec::new()),
-                Some(result_object) => {
-                    root(cx, result);
-                    let end = last_index(cx, splitter)?.min(size as u64) as usize;
-                    let count =
-                        internal::length_of_array_like(cx, result_object)?.saturating_sub(1);
-                    let mut captures = Vec::new();
-                    for n in 1..=count {
-                        let key = internal::number_key(cx, n as f64)?;
-                        let value = internal::get_property(cx, result_object, key)?;
-                        root(cx, value);
-                        captures.push(value);
-                    }
-                    (Some(end), captures)
+            let Some(result_object) = result.as_object() else {
+                q = advance(cx, string, q as u64, unicode) as usize;
+                continue 'split;
+            };
+            root(cx, result);
+            let end = last_index(cx, splitter)?.min(size as u64) as usize;
+            if end == p {
+                q = advance(cx, string, q as u64, unicode) as usize;
+                continue 'split;
+            }
+            let piece = substring_value(cx, string, p, q)?;
+            push(cx, &mut parts, piece);
+            if parts.len() == limit {
+                break 'split;
+            }
+            p = end;
+            let count = internal::length_of_array_like(cx, result_object)?;
+            for n in 1..count {
+                let key = internal::number_key(cx, n as f64)?;
+                let value = internal::get_property(cx, result_object, key)?;
+                push(cx, &mut parts, value);
+                if parts.len() == limit {
+                    break 'split;
                 }
             }
+            q = p;
+            continue 'split;
         };
         match end {
             Some(end) if end != p => {
@@ -1521,7 +1536,7 @@ pub(crate) fn delegate(
 ) -> Result<Option<Value>, Throw> {
     let this = site.this(cx);
     if this.is_undefined() || this.is_null() {
-        return Err(error::type_error(cx, "not an object"));
+        return Err(error::type_error(cx, "cannot convert to object"));
     }
     // Only an object's method is consulted (a primitive's prototype is
     // not, as of ES2025).
@@ -1560,27 +1575,70 @@ pub(crate) fn delegate(
     crate::vm::call(cx, method, argument, &call_args).map(Some)
 }
 
-/// `String.prototype.match`/`matchAll`/`search` without a delegate: a new
-/// RegExp over the argument, then its `Symbol` method.
-pub(crate) fn create_and_invoke(
+/// `String.prototype.match`, `matchAll` (`global`) and `search` (22.1.3.13,
+/// 22.1.3.14, 22.1.3.22): an object argument's `Symbol` method is read (for
+/// `matchAll` after the `g` flag of a regular expression is checked) and
+/// called unless undefined; otherwise the receiver is converted and
+/// RegExpCreate over the argument (with `"g"` for `matchAll`) has its method
+/// invoked.
+pub(crate) fn string_match(
     cx: &mut Cx<'_>,
     site: &CallSite,
     symbol: crate::SymbolId,
-    flags: &str,
+    global: bool,
 ) -> Result<Value, Throw> {
-    let string = this_string(cx, site)?;
+    let this = site.this(cx);
+    if this.is_undefined() || this.is_null() {
+        return Err(error::type_error(cx, "cannot convert to object"));
+    }
     let argument = site.arg(cx, 0);
-    let source = if argument.is_undefined() {
-        cx.realm.names.empty
-    } else {
-        atom(cx, argument)?
-    };
-    let flags = cx
-        .heap
-        .intern(flags)
-        .map_err(|error| error::heap_error(cx, error))?;
-    let regexp = crate::vm::regexp::regexp_object(cx, source, flags)?;
-    root(cx, regexp);
     let key = WellKnown::key(symbol);
+    if let Some(object) = argument.as_object() {
+        if global {
+            check_global_flag(cx, object)?;
+        }
+        if let Some(method) = internal::get_method(cx, argument, key)? {
+            root(cx, method);
+            return crate::vm::call(cx, method, argument, &[this]);
+        }
+    }
+    let string = to_string_id(cx, this)?;
+    root(cx, Value::string(string));
+    // RegExpCreate(argument, flags): the pattern by ToString, no IsRegExp.
+    let pattern = if argument.is_undefined() {
+        Value::string(cx.realm.names.empty)
+    } else {
+        Value::string(to_string_id(cx, argument)?)
+    };
+    root(cx, pattern);
+    let constructor = Value::object(cx.realm.intrinsic(Intrinsic::RegExp));
+    let regexp = if global {
+        let flags = Value::string(
+            cx.heap
+                .intern("g")
+                .map_err(|error| error::heap_error(cx, error))?,
+        );
+        crate::vm::construct(cx, constructor, &[pattern, flags], constructor)?
+    } else {
+        crate::vm::construct(cx, constructor, &[pattern], constructor)?
+    };
+    root(cx, regexp);
     internal::invoke(cx, regexp, key, &[Value::string(string)])
+}
+
+/// A regular expression (`IsRegExp`) must have a `flags` with `g`
+/// (`replaceAll` and `matchAll`, step 2.b).
+pub(crate) fn check_global_flag(cx: &mut Cx<'_>, object: ObjectId) -> Result<(), Throw> {
+    if !is_regexp(cx, Value::object(object))? {
+        return Ok(());
+    }
+    let flags = internal::get_property(cx, object, Names::key(cx.realm.names.flags))?;
+    if flags.is_undefined() || flags.is_null() {
+        return Err(error::type_error(cx, "cannot convert to object"));
+    }
+    let flags = to_string_id(cx, flags)?;
+    if !units(cx, flags).contains(&u16::from(b'g')) {
+        return Err(error::type_error(cx, "regexp must have the 'g' flag"));
+    }
+    Ok(())
 }
