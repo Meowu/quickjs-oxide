@@ -40,9 +40,9 @@ use oxide_core::bytecode::{
     Capture, CodeBuilder, CodeUnit, CodeUnitId, Handler, Opcode, ValidateError, flags,
 };
 use oxide_core::vm::compile::Compiler;
-use oxide_core::{HeapError, ObjectId, PropertyKey, Runtime, Value as CoreValue};
+use oxide_core::{HeapError, ObjectId, PropertyKey, Runtime, StringId, Value as CoreValue};
 
-use self::analysis::{Analysis, analyze};
+use self::analysis::{Analysis, analyze_into};
 use crate::engine::code::bytecode::{
     ApplyKind, ArgumentsKind, DefineMethodKind, Instruction, IteratorCallKind, PrivateNameSource,
 };
@@ -125,7 +125,8 @@ pub(crate) fn lower_script_into(
     let mark = runtime.heap_mut().roots().mark();
     let result = (|| {
         let mut constants = HashMap::new();
-        let root = lower_tree(runtime, script, None, &mut constants)?;
+        let mut tree = TreeCache::default();
+        let root = lower_tree(runtime, &mut tree, script, None, &mut constants)?;
         let order = runtime.code().tree(root);
         let tables: Vec<&[CoreValue]> = order.iter().map(|id| constants[id].as_slice()).collect();
         let function = runtime.instantiate(root, &tables)?;
@@ -303,37 +304,71 @@ fn negated_jump(op: Opcode) -> Option<Opcode> {
 /// for this function's captures.
 fn lower_tree(
     runtime: &mut Compiler<'_>,
+    tree: &mut TreeCache,
     function: &UnlinkedFunction,
     parent: Option<Layout>,
     constants: &mut HashMap<CodeUnitId, Vec<CoreValue>>,
 ) -> Result<CodeUnitId, LowerError> {
-    let layout = Layout::of(function, &analyze(function.code())?)?;
+    let mut analysis = tree.analyses.pop().unwrap_or_default();
+    analyze_into(function.code(), &mut analysis, &mut tree.analysis_scratch)?;
+    let layout = Layout::of(function, &analysis)?;
     let mut children = Vec::new();
     for constant in function.constants() {
         if let Some(child) = constant.as_child() {
-            children.push(lower_tree(runtime, child, Some(layout), constants)?);
+            children.push(lower_tree(runtime, tree, child, Some(layout), constants)?);
         }
     }
-    let (unit, pool) = lower_function(runtime, function, parent, children)?;
+    let (unit, pool) = lower_function(runtime, tree, function, analysis, layout, parent, children)?;
     let id = runtime.publish(unit)?;
     constants.insert(id, pool);
     Ok(id)
 }
 
-/// Lowers one function whose children are already published.
+/// Lowers one function whose children are already published, given its
+/// analysis and the layout that analysis gives it.
 fn lower_function(
     runtime: &mut Compiler<'_>,
+    tree: &mut TreeCache,
     function: &UnlinkedFunction,
+    analysis: Analysis,
+    layout: Layout,
     parent: Option<Layout>,
     children: Vec<CodeUnitId>,
 ) -> Result<(CodeUnit, Vec<CoreValue>), LowerError> {
     check_surface(function)?;
-    let analysis = analyze(function.code())?;
     let is_script = parent.is_none() && !function.metadata().is_module;
-    let mut lowerer = Lowerer::new(runtime, function, analysis, is_script)?;
+    let mut lowerer = Lowerer::new(runtime, tree, function, analysis, layout, is_script)?;
     lowerer.prologue()?;
     lowerer.body()?;
     lowerer.finish(parent, children)
+}
+
+/// What the lowering of one tree keeps from one function to the next.
+#[derive(Default)]
+struct TreeCache {
+    /// The key and the atom of each string of the tree, by its address; the
+    /// string is kept, so the address is not reused while the entry is.
+    keys: HashMap<usize, (JsString, PropertyKey)>,
+    atoms: HashMap<usize, (JsString, StringId)>,
+    /// The tree's file name, converted once.
+    filename: Option<(JsString, std::rc::Rc<str>)>,
+    /// Buffers kept for the next function: analyses not in use (a parent's
+    /// stays in use while its children lower) and the lowering's own; one
+    /// function lowers at a time.
+    analyses: Vec<Analysis>,
+    analysis_scratch: analysis::Scratch,
+    lowering: LowerScratch,
+}
+
+/// A [`Lowerer`]'s buffers between functions, empty.
+#[derive(Default)]
+struct LowerScratch {
+    labels: Vec<Option<u32>>,
+    fixups: Vec<(u32, usize)>,
+    origins: Vec<usize>,
+    stack: Vec<Entry>,
+    name_keys: Vec<Option<PropertyKey>>,
+    local_keys: Vec<Option<PropertyKey>>,
 }
 
 /// Where a function's locals and temporaries live. The window of 256
@@ -647,24 +682,27 @@ fn method_flags(kind: DefineMethodKind, enumerable: bool) -> u32 {
     kind | if enumerable { method::ENUMERABLE } else { 0 }
 }
 
-/// Whether QuickJS's `JS_NewAtom` makes `units` a tagged integer atom: the
+/// Whether QuickJS's `JS_NewAtom` makes `string` a tagged integer atom: the
 /// canonical decimal spelling of an integer up to `JS_ATOM_MAX_INT`.
-fn is_tagged_int_atom(units: &[u16]) -> bool {
-    let canonical = match units {
-        [unit] => (u16::from(b'0')..=u16::from(b'9')).contains(unit),
-        [first, rest @ ..] => {
-            (u16::from(b'1')..=u16::from(b'9')).contains(first)
-                && rest
-                    .iter()
-                    .all(|unit| (u16::from(b'0')..=u16::from(b'9')).contains(unit))
+fn is_tagged_int_atom(string: &JsString) -> bool {
+    let len = string.len();
+    if len == 0 || len > 10 {
+        return false;
+    }
+    let mut value: u64 = 0;
+    for (index, unit) in string.utf16_units().enumerate() {
+        let Some(digit) = unit
+            .checked_sub(u16::from(b'0'))
+            .filter(|digit| *digit <= 9)
+        else {
+            return false;
+        };
+        if index == 0 && digit == 0 && len > 1 {
+            return false;
         }
-        [] => false,
-    };
-    canonical
-        && units.len() <= 10
-        && String::from_utf16_lossy(units)
-            .parse::<u64>()
-            .is_ok_and(|value| value <= i32::MAX as u64)
+        value = value * 10 + u64::from(digit);
+    }
+    value <= i32::MAX as u64
 }
 
 fn string_units(string: &JsString) -> Vec<u16> {
@@ -678,6 +716,7 @@ const CAPTURE_BIT: u32 = 1 << 31;
 
 struct Lowerer<'a, 'c> {
     runtime: &'a mut Compiler<'c>,
+    tree: &'a mut TreeCache,
     function: &'a UnlinkedFunction,
     code: &'a [Instruction],
     analysis: Analysis,
@@ -703,6 +742,10 @@ struct Lowerer<'a, 'c> {
     max_scratch: u32,
     pool: Vec<CoreValue>,
     pool_index: HashMap<u32, u32>,
+    /// The key of each string constant used as a name, and of each
+    /// local's name.
+    name_keys: Vec<Option<PropertyKey>>,
+    local_keys: Vec<Option<PropertyKey>>,
     child_ordinal: HashMap<u32, u32>,
     this_keys: HashSet<u32>,
     /// Register PCs of the calls written as a direct `eval` (for the
@@ -723,14 +766,15 @@ struct Lowerer<'a, 'c> {
 impl<'a, 'c> Lowerer<'a, 'c> {
     fn new(
         runtime: &'a mut Compiler<'c>,
+        tree: &'a mut TreeCache,
         function: &'a UnlinkedFunction,
         analysis: Analysis,
+        layout: Layout,
         is_script: bool,
     ) -> Result<Self, LowerError> {
         let metadata = function.metadata();
         let arguments = u32::from(metadata.argument_count);
         let locals = u32::from(metadata.local_count);
-        let layout = Layout::of(function, &analysis)?;
         let mut captured_arguments = vec![false; arguments as usize];
         let mut captured_locals = vec![false; locals as usize];
         let mut child_ordinal = HashMap::new();
@@ -751,6 +795,17 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             }
         }
         let code = function.code();
+        let scratch = &mut tree.lowering;
+        let mut labels = std::mem::take(&mut scratch.labels);
+        labels.resize(code.len(), None);
+        let mut name_keys = std::mem::take(&mut scratch.name_keys);
+        name_keys.resize(function.constants().len(), None);
+        let mut local_keys = std::mem::take(&mut scratch.local_keys);
+        local_keys.resize(function.local_definitions().len(), None);
+        let fixups = std::mem::take(&mut scratch.fixups);
+        let origins = std::mem::take(&mut scratch.origins);
+        let stack = std::mem::take(&mut scratch.stack);
+        debug_assert!(fixups.is_empty() && origins.is_empty() && stack.is_empty());
         // A mapped `arguments` object aliases the parameters
         // through cells, so every parameter of such a function is one.
         if code
@@ -761,18 +816,19 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         }
         Ok(Lowerer {
             runtime,
+            tree,
             function,
             code,
             is_script,
             builder: CodeBuilder::new(),
-            stack: Vec::new(),
+            stack,
             temp_base: layout.temp_base,
             layout,
             captured_arguments,
             captured_locals,
-            labels: vec![None; code.len()],
-            fixups: Vec::new(),
-            origins: Vec::new(),
+            labels,
+            fixups,
+            origins,
             direct_eval_sites: Vec::new(),
             next_scratch: 0,
             result_scratch: 0,
@@ -783,6 +839,8 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             max_scratch: 0,
             pool: Vec::new(),
             pool_index: HashMap::new(),
+            name_keys,
+            local_keys,
             child_ordinal,
             this_keys: HashSet::new(),
             analysis,
@@ -1300,16 +1358,37 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         }
     }
 
+    /// The key `string` spells, once per string of the tree.
     fn key(&mut self, string: &JsString) -> Result<PropertyKey, LowerError> {
-        Ok(self
-            .runtime
-            .heap_mut()
-            .property_key_units(&string_units(string))?)
+        if let Some(&(_, key)) = self.tree.keys.get(&string.address()) {
+            return Ok(key);
+        }
+        let heap = self.runtime.heap_mut();
+        let key = match string.flat_latin1() {
+            Some(bytes) => heap.property_key_latin1(bytes)?,
+            None => heap.property_key_units(&string_units(string))?,
+        };
+        self.tree
+            .keys
+            .insert(string.address(), (string.clone(), key));
+        Ok(key)
+    }
+
+    /// The key of a message or other text of the lowering's own.
+    fn static_key(&mut self, text: &'static str) -> Result<PropertyKey, LowerError> {
+        Ok(self.runtime.heap_mut().property_key(text)?)
     }
 
     fn name_key(&mut self, constant: u32) -> Result<PropertyKey, LowerError> {
+        if let Some(&Some(key)) = self.name_keys.get(constant as usize) {
+            return Ok(key);
+        }
         let string = self.constant_string(constant)?;
-        self.key(string)
+        let key = self.key(string)?;
+        if let Some(slot) = self.name_keys.get_mut(constant as usize) {
+            *slot = Some(key);
+        }
+        Ok(key)
     }
 
     fn closure_key(&mut self, closure: u16) -> Result<PropertyKey, LowerError> {
@@ -1320,26 +1399,44 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             .ok_or_else(|| LowerError::Internal("closure variable out of range".into()))?;
         match variable.name {
             ClosureVariableName::Constant(constant) => self.name_key(constant),
-            _ => self.key(&JsString::from_static("")),
+            _ => self.static_key(""),
         }
     }
 
     fn local_key(&mut self, local: u16) -> Result<PropertyKey, LowerError> {
-        let name = self
-            .function
+        if let Some(&Some(key)) = self.local_keys.get(local as usize) {
+            return Ok(key);
+        }
+        let function = self.function;
+        let key = match function
             .local_definitions()
             .get(local as usize)
-            .and_then(|definition| definition.name.clone())
-            .unwrap_or_else(|| JsString::from_static(""));
-        self.key(&name)
+            .and_then(|definition| definition.name.as_ref())
+        {
+            Some(name) => self.key(name)?,
+            None => self.static_key("")?,
+        };
+        if let Some(slot) = self.local_keys.get_mut(local as usize) {
+            *slot = Some(key);
+        }
+        Ok(key)
     }
 
-    /// An atom value for a string constant (atoms are strong roots, so the
-    /// pool needs no rooting until it is attached).
-    fn atom_value(&mut self, units: &[u16]) -> Result<CoreValue, LowerError> {
-        Ok(CoreValue::string(
-            self.runtime.heap_mut().intern_units(units)?,
-        ))
+    /// An atom value for a string of the tree, once per string (atoms are
+    /// strong roots, so the pool needs no rooting until it is attached).
+    fn atom_value(&mut self, string: &JsString) -> Result<CoreValue, LowerError> {
+        if let Some(&(_, atom)) = self.tree.atoms.get(&string.address()) {
+            return Ok(CoreValue::string(atom));
+        }
+        let heap = self.runtime.heap_mut();
+        let atom = match string.flat_latin1() {
+            Some(bytes) => heap.intern_latin1(bytes)?,
+            None => heap.intern_units(&string_units(string))?,
+        };
+        self.tree
+            .atoms
+            .insert(string.address(), (string.clone(), atom));
+        Ok(CoreValue::string(atom))
     }
 
     fn pool_entry(&mut self, index: u32) -> Result<Entry, LowerError> {
@@ -1369,18 +1466,17 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             PrimitiveValue::Int(value) => return Ok(Entry::Int(*value)),
             PrimitiveValue::Float(value) => CoreValue::number(*value),
             PrimitiveValue::String(string) => {
-                let units = string_units(string);
-                if is_tagged_int_atom(&units) {
+                if is_tagged_int_atom(string) {
                     // QuickJS keeps a literal spelling an index up to 2^31 - 1
                     // as its own constant-pool string, not an atom: two such
                     // literals are distinct values (`Array.prototype.sort`'s
                     // identity shortcut observes this).
                     let heap = self.runtime.heap_mut();
-                    let value = CoreValue::string(heap.alloc_string_units(&units)?);
+                    let value = CoreValue::string(heap.alloc_string_units(&string_units(string))?);
                     heap.roots().push(value);
                     value
                 } else {
-                    self.atom_value(&units)?
+                    self.atom_value(string)?
                 }
             }
             PrimitiveValue::BigInt(value) => {
@@ -1511,9 +1607,10 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 self.checked.clear();
                 // A Catch marker survives a join only above its region's
                 // handler; every other entry is canonical.
-                let markers: Vec<usize> = self.analysis.regions[pc]
-                    .iter()
-                    .map(|&region| self.analysis.catches[region as usize])
+                let markers: Vec<usize> = self
+                    .analysis
+                    .chain(pc)
+                    .map(|(_, region)| region)
                     .filter(|region| !region.iterator)
                     .map(|region| region.marker_depth as usize)
                     .collect();
@@ -1909,10 +2006,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 }
             }
             I::NipCatch => {
-                let region = *self.analysis.regions[pc]
-                    .last()
+                let (_, region) = self
+                    .analysis
+                    .chain(pc)
+                    .next()
                     .ok_or_else(|| LowerError::Internal("NipCatch outside a region".into()))?;
-                let marker = self.analysis.catches[region as usize].marker_depth as usize;
+                let marker = region.marker_depth as usize;
                 let (depth, value) = self.pop()?;
                 self.stack.truncate(marker);
                 if value == Entry::Canon {
@@ -1949,8 +2048,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             I::InitializeModuleImportCollision(closure) => self.store_captured(closure, false)?,
             I::ThrowDeleteSuper => {
                 let (_, _) = self.pop_operands::<3>()?;
-                let message =
-                    self.key(&JsString::from_static("unsupported reference to 'super'"))?;
+                let message = self.static_key("unsupported reference to 'super'")?;
                 self.emit(|b| b.key(Opcode::ThrowReference, message));
                 self.stack.push(Entry::Undefined);
             }
@@ -2161,9 +2259,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 self.emit(|b| b.a(Opcode::IterCheckObject, value));
             }
             I::ThrowIteratorMissingThrow => {
-                let message = self.key(&JsString::from_static(
-                    "iterator does not have a throw method",
-                ))?;
+                let message = self.static_key("iterator does not have a throw method")?;
                 self.emit(|b| b.key(Opcode::ThrowType, message));
             }
 
@@ -2382,8 +2478,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     ClosureVariableKind::PrivateGetter
                     | ClosureVariableKind::PrivateGetterSetter => Opcode::CallPrivateGetter,
                     ClosureVariableKind::PrivateSetter => {
-                        let message =
-                            self.key(&JsString::from_static("private class field has no getter"))?;
+                        let message = self.static_key("private class field has no getter")?;
                         self.emit(|b| b.key(Opcode::ThrowType, message));
                         self.stack.push(Entry::Undefined);
                         return Ok(1);
@@ -2407,8 +2502,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     ClosureVariableKind::PrivateSetter => Opcode::CallPrivateSetter,
                     ClosureVariableKind::PrivateField => Opcode::PutPrivate,
                     _ => {
-                        let message =
-                            self.key(&JsString::from_static("private class field is read-only"))?;
+                        let message = self.static_key("private class field is read-only")?;
                         self.emit(|b| b.key(Opcode::ThrowType, message));
                         return Ok(1);
                     }
@@ -2687,9 +2781,12 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             .get(index as usize)
             .and_then(|constant| constant.as_regexp())
             .ok_or_else(|| LowerError::Internal(format!("constant {index} is not a RegExp")))?;
-        let flags: Vec<u16> = program.flags().canonical_string().encode_utf16().collect();
-        let source = self.atom_value(&string_units(pattern))?;
-        let flags = self.atom_value(&flags)?;
+        let source = self.atom_value(pattern)?;
+        let flags = CoreValue::string(
+            self.runtime
+                .heap_mut()
+                .intern(&program.flags().canonical_string())?,
+        );
         let slot = self.pool.len() as u32;
         self.pool.push(source);
         self.pool.push(flags);
@@ -2739,10 +2836,11 @@ impl<'a, 'c> Lowerer<'a, 'c> {
 
     /// The depth of the innermost iterator record active at stack PC `pc`.
     fn innermost_iterator(&self, pc: usize) -> Result<usize, LowerError> {
-        let region = *self.analysis.regions[pc]
-            .last()
+        let (_, region) = self
+            .analysis
+            .chain(pc)
+            .next()
             .ok_or_else(|| LowerError::Internal("no iterator record".into()))?;
-        let region = self.analysis.catches[region as usize];
         if !region.iterator {
             return Err(LowerError::Internal("innermost region is a catch".into()));
         }
@@ -2794,13 +2892,13 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         let mut cooked_values = Vec::with_capacity(cooked.len());
         for string in cooked {
             cooked_values.push(match string {
-                Some(string) => self.atom_value(&string_units(string))?,
+                Some(string) => self.atom_value(string)?,
                 None => CoreValue::UNDEFINED,
             });
         }
         let mut raw_values = Vec::with_capacity(raw.len());
         for string in raw {
-            raw_values.push(self.atom_value(&string_units(string))?);
+            raw_values.push(self.atom_value(string)?);
         }
         let object = self
             .runtime
@@ -3187,7 +3285,9 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         };
         let name_atom = match self.function.func_name() {
             Some(name) if !name.is_empty() => {
-                Some(self.runtime.heap_mut().intern_units(&string_units(name))?)
+                Some(self.atom_value(name)?.as_string().ok_or_else(|| {
+                    LowerError::Internal("a function name atom is not a string".into())
+                })?)
             }
             _ => None,
         };
@@ -3201,8 +3301,26 @@ impl<'a, 'c> Lowerer<'a, 'c> {
         let name = self
             .function
             .func_name()
-            .map(|name| String::from_utf16_lossy(&string_units(name)))
+            .map(|name| match name.flat_latin1() {
+                Some(bytes) if bytes.is_ascii() => {
+                    String::from_utf8(bytes.to_vec()).expect("ASCII is UTF-8")
+                }
+                _ => String::from_utf16_lossy(&string_units(name)),
+            })
             .unwrap_or_default();
+        let filename = self
+            .function
+            .debug()
+            .map(|debug| match &self.tree.filename {
+                Some((string, converted)) if string.same_representation(&debug.filename) => {
+                    converted.clone()
+                }
+                _ => {
+                    let converted = std::rc::Rc::<str>::from(debug.filename.to_utf8_lossy());
+                    self.tree.filename = Some((debug.filename.clone(), converted.clone()));
+                    converted
+                }
+            });
         let positions = self.positions(self.builder.pc() as usize);
         let mut unit = self.builder.finish(UnitLayout {
             register_count,
@@ -3224,10 +3342,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             name_atom,
             length: metadata.defined_argument_count,
             source,
-            filename: self
-                .function
-                .debug()
-                .map(|debug| std::rc::Rc::from(debug.filename.to_utf8_lossy())),
+            filename,
         });
         unit.debug.positions = positions;
         unit.debug.definition = self
@@ -3236,6 +3351,21 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             .and_then(|debug| debug.pc2line.as_ref())
             .and_then(|table| table.definition.one_based());
         unit.direct_eval_sites = self.direct_eval_sites.into();
+        let tree = &mut *self.tree;
+        tree.analyses.push(self.analysis);
+        let scratch = &mut tree.lowering;
+        self.labels.clear();
+        scratch.labels = self.labels;
+        self.name_keys.clear();
+        scratch.name_keys = self.name_keys;
+        self.local_keys.clear();
+        scratch.local_keys = self.local_keys;
+        self.fixups.clear();
+        scratch.fixups = self.fixups;
+        self.origins.clear();
+        scratch.origins = self.origins;
+        self.stack.clear();
+        scratch.stack = self.stack;
         Ok((unit, self.pool))
     }
 
@@ -3250,11 +3380,21 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             return Box::new([]);
         };
         let mut positions: Vec<oxide_core::bytecode::SourcePosition> = Vec::new();
+        // The entries are sorted by pc and the origins rise but for the
+        // stubs at the end: walk forward, and search again on a step back.
+        let entries = &table.entries;
+        let mut after = 0;
+        let mut previous = 0;
         for (pc, &origin) in self.origins.iter().take(len).enumerate() {
-            // `Pc2LineTable::lookup` scans; the entries are sorted by pc.
-            let after = table
-                .entries
-                .partition_point(|entry| entry.pc <= origin as u32);
+            let origin = origin as u32;
+            if origin < previous {
+                after = entries.partition_point(|entry| entry.pc <= origin);
+            } else {
+                while entries.get(after).is_some_and(|entry| entry.pc <= origin) {
+                    after += 1;
+                }
+            }
+            previous = origin;
             let position = after
                 .checked_sub(1)
                 .map_or(table.definition, |at| table.entries[at].position);
@@ -3318,10 +3458,14 @@ impl<'a, 'c> Lowerer<'a, 'c> {
 
     /// One handler entry per run of register instructions inside a catch
     /// region, innermost regions first.
+    ///
+    /// One pass over the instructions keeps the regions open at the current
+    /// one, outermost first, each with the instruction its run started at; a
+    /// region's position in that stack is its nesting.
     fn handlers(&self, stubs: &[Option<(u32, u16)>]) -> Result<Vec<Handler>, LowerError> {
-        let mut entries = Vec::new();
+        let mut destinations = Vec::with_capacity(self.analysis.catches.len());
         for (region, catch) in self.analysis.catches.iter().enumerate() {
-            let (target, register) = match stubs[region] {
+            destinations.push(match stubs[region] {
                 Some(stub) => stub,
                 None => {
                     let target = self.labels[catch.target]
@@ -3332,49 +3476,54 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                         })?;
                     (target, register)
                 }
-            };
-            let region = region as u32;
-            let mut start = None;
-            let mut nesting = 0;
-            for (at, &origin) in self.origins.iter().enumerate() {
-                let regions = self
-                    .analysis
-                    .regions
-                    .get(origin)
-                    .map_or(&[][..], |r| &r[..]);
-                let inside = regions.iter().position(|&active| active == region);
-                match (inside, start) {
-                    (Some(level), None) => {
-                        start = Some(at as u32);
-                        nesting = level;
-                    }
-                    (None, Some(first)) => {
-                        entries.push((
-                            nesting,
-                            Handler {
-                                start: first,
-                                end: at as u32,
-                                target,
-                                register,
-                            },
-                        ));
-                        start = None;
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(first) = start {
+            });
+        }
+        let mut entries = Vec::new();
+        let mut open: Vec<(u32, u32)> = Vec::new();
+        let mut close = |open: &mut Vec<(u32, u32)>, keep: usize, end: u32| {
+            while open.len() > keep {
+                let (region, start) = open.pop().expect("an open region");
+                let (target, register) = destinations[region as usize];
                 entries.push((
-                    nesting,
+                    open.len(),
                     Handler {
-                        start: first,
-                        end: self.origins.len() as u32,
+                        start,
+                        end,
                         target,
                         register,
                     },
                 ));
             }
+        };
+        let mut entered = Vec::new();
+        for (at, &origin) in self.origins.iter().enumerate() {
+            let innermost = self
+                .analysis
+                .regions
+                .get(origin)
+                .copied()
+                .unwrap_or(analysis::NO_REGION);
+            if open.last().map(|&(region, _)| region) == Some(innermost)
+                || (open.is_empty() && innermost == analysis::NO_REGION)
+            {
+                continue;
+            }
+            // The regions active here, innermost first, down to the first
+            // one already open: those above it close, these open.
+            entered.clear();
+            let mut keep = 0;
+            for (region, catch) in self.analysis.chain(origin) {
+                let level = catch.level as usize;
+                if open.get(level).is_some_and(|&(open, _)| open == region) {
+                    keep = level + 1;
+                    break;
+                }
+                entered.push(region);
+            }
+            close(&mut open, keep, at as u32);
+            open.extend(entered.iter().rev().map(|&region| (region, at as u32)));
         }
+        close(&mut open, 0, self.origins.len() as u32);
         entries.sort_by_key(|&(nesting, handler)| (std::cmp::Reverse(nesting), handler.start));
         Ok(entries.into_iter().map(|(_, handler)| handler).collect())
     }
