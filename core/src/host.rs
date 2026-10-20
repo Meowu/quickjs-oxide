@@ -1,4 +1,4 @@
-//! The host boundary: what the core asks of its embedder. `oxide-core` reaches
+//! The host boundary: what the core asks of its embedder. `quickjs-oxide-core` reaches
 //! the platform only through this trait, so it stays dependency-free and a port
 //! supplies its own implementation.
 
@@ -76,6 +76,13 @@ pub trait Host {
     /// (`qjs --std`). The default reads the process's file system.
     fn read_file(&mut self, path: &str) -> Option<String> {
         std::fs::read_to_string(path).ok()
+    }
+
+    /// Polled about every thousand loop back-edges and calls while a
+    /// script runs: `true` stops the script with an uncatchable
+    /// `InternalError: interrupted`. The default never interrupts.
+    fn interrupt(&mut self) -> bool {
+        false
     }
 }
 

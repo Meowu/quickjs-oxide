@@ -1,4 +1,4 @@
-//! Lowering from the compiler's stack code to `oxide-core`'s register code.
+//! Lowering from the compiler's stack code to `quickjs-oxide-core`'s register code.
 //!
 //! The input is the [`UnlinkedFunction`] tree the front end compiles:
 //! QuickJS-shaped stack code whose operand-stack depth is static at every
@@ -3398,6 +3398,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 }
             });
         let positions = self.positions(self.builder.pc() as usize);
+        self.builder.mark_back_edges();
         let mut unit = self.builder.finish(UnitLayout {
             register_count,
             parameter_count: metadata.argument_count,

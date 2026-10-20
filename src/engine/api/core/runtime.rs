@@ -1,28 +1,54 @@
 //! The API's runtime: one `Rc<RefCell<…>>` at the
 //! boundary around `oxide_core::Runtime`. Every method borrows the cell for
-//! one engine entry; a host callback that calls back in without its
-//! [`Scope`](super::Scope) gets [`RuntimeError::Reentered`].
+//! one engine entry; a host function or callback that calls back in through
+//! a `Context` or `Runtime` instead of its scope gets
+//! [`RuntimeError::Reentered`].
 
 use std::cell::{Cell, RefCell, RefMut};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use oxide_core::Handle;
 use oxide_core::host::Host;
 use oxide_core::vm::module::ModuleTables;
-use oxide_core::{Intrinsic, MemoryReport, RuntimeOptions};
+use oxide_core::{MemoryReport, NativeCx, RuntimeOptions};
 
 use super::RuntimeError;
 use super::context::Context;
 use super::module::ModuleLoader;
+use super::ops::View;
 use super::property::{
-    AccessorValue, CompleteOrdinaryPropertyDescriptor, DescriptorField, Key,
-    OrdinaryPropertyDescriptor, PropertyKey, WellKnownSymbol,
+    CompleteOrdinaryPropertyDescriptor, OrdinaryPropertyDescriptor, PropertyKey, WellKnownSymbol,
 };
 use super::value::{CallableRef, ObjectRef, Slot, SymbolRef, Value};
 use crate::engine::code::debug::DebugInfoMode;
 use crate::engine::value::JsString;
-use crate::engine::value::bigint::JsBigInt;
+
+/// Interrupts a runtime's running script from any thread: the script stops
+/// at its next poll (about every thousand loop back-edges and calls)
+/// with [`RuntimeError::Interrupted`], uncatchable by the script. The flag
+/// stays set until [`InterruptHandle::clear`], so every script after it is
+/// interrupted too.
+#[derive(Clone, Debug)]
+pub struct InterruptHandle {
+    flag: Arc<AtomicBool>,
+}
+
+impl InterruptHandle {
+    pub fn interrupt(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+
+    pub fn clear(&self) {
+        self.flag.store(false, Ordering::Relaxed);
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+}
 
 /// A runtime: one heap, one realm, one job queue. Cloning shares it.
 #[derive(Clone)]
@@ -30,19 +56,26 @@ pub struct Runtime {
     pub(crate) shared: Rc<Shared>,
 }
 
-/// A module compiled by `Context::compile_module*`, waiting for the core to
-/// load it by name.
-pub(crate) struct Preloaded {
-    pub(crate) function: ObjectRef,
-    pub(crate) tables: ModuleTables,
-    pub(crate) import_meta: Vec<(String, Value)>,
+/// A module compiled by `Context::compile_module*` or defined by
+/// `Context::define_module`, waiting for the core to load it by name.
+pub(crate) enum Preloaded {
+    Compiled {
+        function: ObjectRef,
+        tables: ModuleTables,
+        import_meta: Vec<(String, Value)>,
+    },
+    Synthetic(Vec<(String, Value)>),
 }
 
 pub(crate) struct Shared {
     pub(crate) inner: RefCell<Inner>,
     /// Handles whose last reference dropped while the runtime was borrowed;
-    /// released by the next entry.
+    /// released by the next entry or when the host function running ends.
     released: RefCell<Vec<Handle>>,
+    /// A host function panicked: every later entry fails.
+    pub(crate) poisoned: Cell<bool>,
+    /// The core's interrupt flag, which `InterruptHandle`s share.
+    interrupt: Arc<AtomicBool>,
     pub(crate) loader: RefCell<Option<Box<dyn ModuleLoader>>>,
     pub(crate) modules: RefCell<HashMap<String, Preloaded>>,
     pub(crate) debug_info: Cell<DebugInfoMode>,
@@ -60,21 +93,17 @@ impl Shared {
         }
     }
 
-    fn drain_released(&self, inner: &mut Inner) {
+    /// Releases the handles dropped while the runtime was borrowed.
+    pub(crate) fn drain_released(&self, core: &mut NativeCx<'_>) {
         let released = std::mem::take(&mut *self.released.borrow_mut());
         for handle in released {
-            inner.core.release(handle);
+            core.release(handle);
         }
     }
 }
 
 pub(crate) struct Inner {
     pub(crate) core: oxide_core::Runtime,
-    /// The pending exception (`RuntimeError::Exception`).
-    pub(crate) exception: Option<Value>,
-    /// Handles an entry took for converted arguments; released when the
-    /// entry ends.
-    temps: Vec<Handle>,
 }
 
 /// Host stack an outermost entry keeps below the loop's re-entry budget for
@@ -109,10 +138,13 @@ pub(crate) struct Entry<'a> {
 impl Drop for Entry<'_> {
     fn drop(&mut self) {
         CURRENT.with(|current| current.borrow_mut().pop());
-        let temps = std::mem::take(&mut self.inner.temps);
-        for handle in temps {
-            self.inner.core.release(handle);
-        }
+    }
+}
+
+impl Entry<'_> {
+    /// The operations' view of the entered runtime.
+    pub(crate) fn view(&mut self) -> View<'_> {
+        View::new(self.inner.core.native_cx(), self.shared)
     }
 }
 
@@ -133,245 +165,10 @@ impl std::ops::DerefMut for Entry<'_> {
 /// Makes a handle-owning reference from a held handle.
 pub(crate) fn slot(shared: &Rc<Shared>, handle: Handle, value: oxide_core::Value) -> Rc<Slot> {
     Rc::new(Slot {
-        shared: Rc::clone(shared),
+        shared: Rc::downgrade(shared),
         handle,
         value,
     })
-}
-
-impl Entry<'_> {
-    /// Copies a core value out: primitives as data, objects and symbols as
-    /// new handles. `value` must still be live (just returned or rooted).
-    pub(crate) fn lift(&mut self, value: oxide_core::Value) -> Result<Value, RuntimeError> {
-        use oxide_core::value::Kind;
-        Ok(match value.kind() {
-            Kind::Undefined => Value::Undefined,
-            Kind::Null => Value::Null,
-            Kind::Bool => Value::Bool(value.as_bool().unwrap_or(false)),
-            Kind::Int32 => Value::Int(value.as_int32().unwrap_or(0)),
-            Kind::Number => Value::Float(value.as_f64().unwrap_or(f64::NAN)),
-            Kind::String => {
-                let units = self.core.string_units(value).unwrap_or_default();
-                Value::String(JsString::try_from_utf16(units)?)
-            }
-            Kind::BigInt => {
-                let decimal = self.core.bigint_decimal(value).unwrap_or_default();
-                Value::BigInt(
-                    JsBigInt::from_decimal_unchecked(&decimal)
-                        .ok_or(RuntimeError::Invariant("a BigInt's decimal text"))?,
-                )
-            }
-            Kind::Symbol => Value::Symbol(SymbolRef {
-                slot: slot(self.shared, self.inner.core.hold(value), value),
-            }),
-            Kind::Object => Value::Object(ObjectRef {
-                slot: slot(self.shared, self.inner.core.hold(value), value),
-            }),
-            _ => Value::Undefined,
-        })
-    }
-
-    pub(crate) fn lift_object(&mut self, object: oxide_core::ObjectId) -> ObjectRef {
-        let value = oxide_core::Value::object(object);
-        ObjectRef {
-            slot: slot(self.shared, self.inner.core.hold(value), value),
-        }
-    }
-
-    /// The core value of `value`, rooted until the entry ends.
-    pub(crate) fn lower(&mut self, value: &Value) -> Result<oxide_core::Value, RuntimeError> {
-        let lowered = match value {
-            Value::Undefined => oxide_core::Value::UNDEFINED,
-            Value::Null => oxide_core::Value::NULL,
-            Value::Bool(value) => oxide_core::Value::bool(*value),
-            Value::Int(value) => oxide_core::Value::int32(*value),
-            Value::Float(value) => oxide_core::Value::number(*value),
-            Value::String(text) => {
-                let units: Vec<u16> = text.utf16_units().collect();
-                let value = self.inner.core.new_string_units(&units)?;
-                self.temp(value);
-                value
-            }
-            Value::BigInt(big) => {
-                let decimal = big
-                    .to_string_radix(10)
-                    .map_err(|error| RuntimeError::Internal(format!("{error:?}")))?;
-                let value = self
-                    .inner
-                    .core
-                    .new_bigint(&decimal)
-                    .ok_or(RuntimeError::Invariant("a BigInt's decimal text"))??;
-                self.temp(value);
-                value
-            }
-            Value::Symbol(symbol) => self.own(symbol.slot.as_ref())?,
-            Value::Object(object) => self.own(object.slot.as_ref())?,
-        };
-        Ok(lowered)
-    }
-
-    fn own(&self, slot: &Slot) -> Result<oxide_core::Value, RuntimeError> {
-        if Rc::ptr_eq(&slot.shared, self.shared) {
-            Ok(slot.value)
-        } else {
-            Err(RuntimeError::Invariant("a value of another runtime"))
-        }
-    }
-
-    pub(crate) fn object(&self, object: &ObjectRef) -> Result<oxide_core::ObjectId, RuntimeError> {
-        self.own(&object.slot)?
-            .as_object()
-            .ok_or(RuntimeError::Invariant("an object reference"))
-    }
-
-    fn temp(&mut self, value: oxide_core::Value) {
-        let handle = self.inner.core.hold(value);
-        self.inner.temps.push(handle);
-    }
-
-    /// The core key of `key`, rooted until the entry ends.
-    pub(crate) fn key(
-        &mut self,
-        key: &PropertyKey,
-    ) -> Result<oxide_core::PropertyKey, RuntimeError> {
-        let key = match &key.0 {
-            Key::Index(index) => oxide_core::PropertyKey::index(*index).map_or_else(
-                || {
-                    let units: Vec<u16> = index.to_string().encode_utf16().collect();
-                    self.inner.core.key_from_units(&units)
-                },
-                Ok,
-            )?,
-            Key::String(text) => {
-                let units: Vec<u16> = text.utf16_units().collect();
-                self.inner.core.key_from_units(&units)?
-            }
-            // The symbol's handle roots it.
-            Key::Symbol(symbol) => {
-                let value = self.own(&symbol.slot)?;
-                return self
-                    .inner
-                    .core
-                    .key_from_symbol(value)
-                    .ok_or(RuntimeError::Invariant("a symbol reference"));
-            }
-        };
-        // An atom lives only while something names it.
-        if let Some(value) = key.heap_value() {
-            self.temp(value);
-        }
-        Ok(key)
-    }
-
-    /// The API key of a core key.
-    pub(crate) fn lift_key(
-        &mut self,
-        key: oxide_core::PropertyKey,
-    ) -> Result<PropertyKey, RuntimeError> {
-        Ok(match self.inner.core.key_name(key) {
-            oxide_core::KeyName::Index(index) => PropertyKey(Key::Index(index)),
-            oxide_core::KeyName::String(units) => {
-                PropertyKey(Key::String(JsString::try_from_utf16(units)?))
-            }
-            oxide_core::KeyName::Symbol(symbol) => match self.lift(symbol)? {
-                Value::Symbol(symbol) => PropertyKey(Key::Symbol(symbol)),
-                _ => return Err(RuntimeError::Invariant("a symbol key")),
-            },
-        })
-    }
-
-    /// Records a throw as the pending exception; the error to return.
-    pub(crate) fn thrown(&mut self, thrown: oxide_core::Throw) -> RuntimeError {
-        let out_of_memory = self.inner.core.intrinsic(Intrinsic::OutOfMemoryError);
-        if thrown.0.as_object() == Some(out_of_memory) {
-            return RuntimeError::OutOfMemory;
-        }
-        match self.lift(thrown.0) {
-            Ok(value) => {
-                self.inner.exception = Some(value);
-                RuntimeError::Exception
-            }
-            Err(error) => error,
-        }
-    }
-
-    /// Converts a core result, recording a throw.
-    pub(crate) fn complete(
-        &mut self,
-        result: Result<oxide_core::Value, oxide_core::Throw>,
-    ) -> Result<Value, RuntimeError> {
-        match result {
-            Ok(value) => self.lift(value),
-            Err(thrown) => Err(self.thrown(thrown)),
-        }
-    }
-
-    pub(crate) fn complete_with<T>(
-        &mut self,
-        result: Result<T, oxide_core::Throw>,
-    ) -> Result<T, RuntimeError> {
-        result.map_err(|thrown| self.thrown(thrown))
-    }
-
-    /// A descriptor in the core's form, its values rooted until the entry
-    /// ends. Accessor fields that are not callable were rejected by the
-    /// type already.
-    pub(crate) fn lower_descriptor(
-        &mut self,
-        descriptor: &OrdinaryPropertyDescriptor,
-    ) -> Result<oxide_core::PropertyDescriptor, RuntimeError> {
-        let accessor = |entry: &mut Self, field: &DescriptorField<AccessorValue>| match field {
-            DescriptorField::Absent => Ok(None),
-            DescriptorField::Present(AccessorValue::Undefined) => {
-                Ok(Some(oxide_core::Value::UNDEFINED))
-            }
-            DescriptorField::Present(AccessorValue::Callable(function)) => {
-                entry.own(&function.0.slot).map(Some)
-            }
-        };
-        Ok(oxide_core::PropertyDescriptor {
-            value: match &descriptor.value {
-                DescriptorField::Absent => None,
-                DescriptorField::Present(value) => Some(self.lower(value)?),
-            },
-            get: accessor(self, &descriptor.get)?,
-            set: accessor(self, &descriptor.set)?,
-            writable: descriptor.writable.into_option(),
-            enumerable: descriptor.enumerable.into_option(),
-            configurable: descriptor.configurable.into_option(),
-        })
-    }
-
-    pub(crate) fn lift_descriptor(
-        &mut self,
-        descriptor: oxide_core::PropertyDescriptor,
-    ) -> Result<CompleteOrdinaryPropertyDescriptor, RuntimeError> {
-        if descriptor.is_accessor() {
-            let callable = |entry: &mut Self, value: Option<oxide_core::Value>| {
-                Ok::<_, RuntimeError>(match value {
-                    Some(value) if !value.is_undefined() => match entry.lift(value)? {
-                        Value::Object(object) => Some(CallableRef(object)),
-                        _ => None,
-                    },
-                    _ => None,
-                })
-            };
-            Ok(CompleteOrdinaryPropertyDescriptor::Accessor {
-                get: callable(self, descriptor.get)?,
-                set: callable(self, descriptor.set)?,
-                enumerable: descriptor.enumerable.unwrap_or(false),
-                configurable: descriptor.configurable.unwrap_or(false),
-            })
-        } else {
-            let value = descriptor.value.unwrap_or(oxide_core::Value::UNDEFINED);
-            Ok(CompleteOrdinaryPropertyDescriptor::Data {
-                value: self.lift(value)?,
-                writable: descriptor.writable.unwrap_or(false),
-                enumerable: descriptor.enumerable.unwrap_or(false),
-                configurable: descriptor.configurable.unwrap_or(false),
-            })
-        }
-    }
 }
 
 /// What `run_pending_job` did.
@@ -405,6 +202,10 @@ pub struct PromiseSnapshot {
 }
 
 impl PromiseSnapshot {
+    pub(crate) fn new(state: PromiseState, result: Value) -> Self {
+        PromiseSnapshot { state, result }
+    }
+
     pub fn try_clone(&self) -> Result<Self, RuntimeError> {
         Ok(self.clone())
     }
@@ -462,14 +263,13 @@ impl Runtime {
             normalize: super::module::normalize_shim,
             load: super::module::load_shim,
         });
+        let interrupt = core.native_cx().interrupt_flag();
         Runtime {
             shared: Rc::new(Shared {
-                inner: RefCell::new(Inner {
-                    core,
-                    exception: None,
-                    temps: Vec::new(),
-                }),
+                interrupt,
+                inner: RefCell::new(Inner { core }),
                 released: RefCell::new(Vec::new()),
+                poisoned: Cell::new(false),
                 loader: RefCell::new(None),
                 modules: RefCell::new(HashMap::new()),
                 debug_info: Cell::new(DebugInfoMode::Full),
@@ -486,13 +286,17 @@ impl Runtime {
 
     /// Starts one engine entry.
     pub(crate) fn enter(&self) -> Result<Entry<'_>, RuntimeError> {
+        if self.shared.poisoned.get() {
+            return Err(RuntimeError::Poisoned);
+        }
         let mut inner = self
             .shared
             .inner
             .try_borrow_mut()
             .map_err(|_| RuntimeError::Reentered)?;
-        self.shared.drain_released(&mut inner);
+        self.shared.drain_released(&mut inner.core.native_cx());
         if CURRENT.with(|current| current.borrow().is_empty()) {
+            inner.core.native_cx().clear_interrupted();
             // The loop's re-entries may use the thread's stack past what this
             // entry needs to unwind an error: QuickJS's one-MiB budget, which
             // its frames reach at the depths its nesting tests pin, takes
@@ -535,6 +339,13 @@ impl Runtime {
         Rc::ptr_eq(&self.shared, &other.shared)
     }
 
+    /// The handle another thread interrupts this runtime's scripts with.
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        InterruptHandle {
+            flag: Arc::clone(&self.shared.interrupt),
+        }
+    }
+
     /// Whether `Atomics.wait` may block.
     pub fn set_can_block(&self, can_block: bool) -> Result<(), RuntimeError> {
         self.enter()?.core.set_can_block(can_block);
@@ -572,9 +383,9 @@ impl Runtime {
         Ok(self.enter()?.core.has_pending_jobs())
     }
 
-    /// Runs the oldest pending job. A job that throws leaves its value as
-    /// the pending exception and returns `RuntimeError::Exception`; the
-    /// queue keeps the jobs after it. Rejected inside an execution turn,
+    /// Runs the oldest pending job. A job that throws returns
+    /// `RuntimeError::Exception` with the thrown value; the queue keeps the
+    /// jobs after it. Rejected inside an execution turn,
     /// leaving the job queued.
     pub fn run_pending_job(&self) -> Result<PendingJobOutcome, RuntimeError> {
         if self.shared.turns.get() > 0 {
@@ -584,7 +395,7 @@ impl Runtime {
         }
         let mut entry = self.enter()?;
         let result = entry.inner.core.run_pending_job();
-        match entry.complete_with(result)? {
+        match entry.view().complete_with(result)? {
             true => Ok(PendingJobOutcome::Executed),
             false => Ok(PendingJobOutcome::NoJob),
         }
@@ -623,22 +434,7 @@ impl Runtime {
         &self,
         promise: &ObjectRef,
     ) -> Result<Option<PromiseSnapshot>, RuntimeError> {
-        let mut entry = self.enter()?;
-        let value = oxide_core::Value::object(entry.object(promise)?);
-        let Some((state, result)) = entry.core.promise_state(value) else {
-            return Ok(None);
-        };
-        let state = match state {
-            1 => PromiseState::Fulfilled,
-            2 => PromiseState::Rejected,
-            _ => PromiseState::Pending,
-        };
-        let result = if state == PromiseState::Pending {
-            Value::Undefined
-        } else {
-            entry.lift(result)?
-        };
-        Ok(Some(PromiseSnapshot { state, result }))
+        self.enter()?.view().promise_snapshot(promise)
     }
 
     /// Keeps every rejected promise without a handler until one is attached
@@ -652,20 +448,22 @@ impl Runtime {
     /// order; the list is emptied.
     pub fn take_unhandled_rejections(&self) -> Result<Vec<(ObjectRef, Value)>, RuntimeError> {
         let mut entry = self.enter()?;
-        let promises = entry.core.unhandled_rejections().to_vec();
+        let promises = entry.inner.core.unhandled_rejections().to_vec();
         let mut rejections = Vec::with_capacity(promises.len());
+        let mut view = entry.view();
         for promise in promises {
-            let reason = entry
+            let reason = view
                 .core
                 .promise_state(promise)
                 .map_or(oxide_core::Value::UNDEFINED, |(_, reason)| reason);
-            let promise = entry.lift(promise)?;
-            let reason = entry.lift(reason)?;
+            let promise = view.lift(promise)?;
+            let reason = view.lift(reason)?;
             if let Value::Object(promise) = promise {
                 rejections.push((promise, reason));
             }
         }
-        entry.core.clear_unhandled_rejections();
+        drop(view);
+        entry.inner.core.clear_unhandled_rejections();
         Ok(rejections)
     }
 
@@ -825,46 +623,21 @@ impl Runtime {
     }
 
     pub fn new_symbol(&self, description: Option<JsString>) -> Result<SymbolRef, RuntimeError> {
-        let mut entry = self.enter()?;
-        let units: Option<Vec<u16>> = description.map(|text| text.utf16_units().collect());
-        let symbol = entry.inner.core.new_symbol(units.as_deref())?;
-        match entry.lift(symbol)? {
-            Value::Symbol(symbol) => Ok(symbol),
-            _ => Err(RuntimeError::Invariant("a new symbol")),
-        }
+        self.enter()?.view().new_symbol(description)
     }
 
     pub fn symbol_description(&self, symbol: &SymbolRef) -> Result<Option<JsString>, RuntimeError> {
-        let entry = self.enter()?;
-        let value = entry.own_value(&symbol.slot)?;
-        entry
-            .core
-            .symbol_description(value)
-            .map(JsString::try_from_utf16)
-            .transpose()
-            .map_err(RuntimeError::from)
+        self.enter()?.view().symbol_description(symbol)
     }
 
     pub fn well_known_symbol(&self, symbol: WellKnownSymbol) -> Result<SymbolRef, RuntimeError> {
-        let mut entry = self.enter()?;
-        let value = entry
-            .core
-            .well_known_symbol(symbol.name())
-            .ok_or(RuntimeError::Invariant("a well-known symbol"))?;
-        match entry.lift(value)? {
-            Value::Symbol(symbol) => Ok(symbol),
-            _ => Err(RuntimeError::Invariant("a well-known symbol")),
-        }
+        self.enter()?.view().well_known_symbol(symbol)
     }
 
     // ---- objects ----
 
     pub fn get_prototype_of(&self, object: &ObjectRef) -> Result<Option<ObjectRef>, RuntimeError> {
-        let mut entry = self.enter()?;
-        let id = entry.object(object)?;
-        let result = entry.inner.core.get_prototype_of(id);
-        let prototype = entry.complete_with(result)?;
-        Ok(prototype.map(|prototype| entry.lift_object(prototype)))
+        self.enter()?.view().get_prototype_of(object)
     }
 
     pub fn set_prototype_of(
@@ -872,41 +645,25 @@ impl Runtime {
         object: &ObjectRef,
         prototype: Option<&ObjectRef>,
     ) -> Result<bool, RuntimeError> {
-        let mut entry = self.enter()?;
-        let id = entry.object(object)?;
-        let prototype = prototype.map(|p| entry.object(p)).transpose()?;
-        let result = entry.inner.core.set_prototype_of(id, prototype);
-        entry.complete_with(result)
+        self.enter()?.view().set_prototype_of(object, prototype)
     }
 
     /// The object as a callable reference; `None` when it is not callable.
     pub fn as_callable(&self, object: &ObjectRef) -> Result<Option<CallableRef>, RuntimeError> {
-        let entry = self.enter()?;
-        let value = entry.own_value(&object.slot)?;
-        Ok(entry
-            .core
-            .is_callable(value)
-            .then(|| CallableRef(object.clone())))
+        self.enter()?.view().as_callable(object)
     }
 
     pub fn is_constructor(&self, object: &ObjectRef) -> Result<bool, RuntimeError> {
-        let entry = self.enter()?;
-        let value = entry.own_value(&object.slot)?;
-        Ok(entry.core.is_constructor(value))
+        self.enter()?.view().is_constructor(object)
     }
 
     /// `IsArray`.
     pub fn is_array_object(&self, object: &ObjectRef) -> Result<bool, RuntimeError> {
-        let mut entry = self.enter()?;
-        let value = entry.own_value(&object.slot)?;
-        let result = entry.inner.core.is_array(value);
-        entry.complete_with(result)
+        self.enter()?.view().is_array_object(object)
     }
 
     pub fn is_error_object(&self, object: &ObjectRef) -> Result<bool, RuntimeError> {
-        let entry = self.enter()?;
-        let value = entry.own_value(&object.slot)?;
-        Ok(entry.core.is_error(value))
+        self.enter()?.view().is_error_object(object)
     }
 
     pub fn define_own_property(
@@ -931,11 +688,7 @@ impl Runtime {
         object: &ObjectRef,
         key: &PropertyKey,
     ) -> Result<bool, RuntimeError> {
-        let mut entry = self.enter()?;
-        let id = entry.object(object)?;
-        let key = entry.key(key)?;
-        let result = entry.inner.core.delete_property(id, key);
-        entry.complete_with(result)
+        self.enter()?.view().delete_property(object, key)
     }
 
     pub fn has_property(
@@ -943,11 +696,7 @@ impl Runtime {
         object: &ObjectRef,
         key: &PropertyKey,
     ) -> Result<bool, RuntimeError> {
-        let mut entry = self.enter()?;
-        let id = entry.object(object)?;
-        let key = entry.key(key)?;
-        let result = entry.inner.core.has_property(id, key);
-        entry.complete_with(result)
+        self.enter()?.view().has_property(object, key)
     }
 
     pub fn has_own_property(
@@ -955,48 +704,28 @@ impl Runtime {
         object: &ObjectRef,
         key: &PropertyKey,
     ) -> Result<bool, RuntimeError> {
-        let mut entry = self.enter()?;
-        let id = entry.object(object)?;
-        let key = entry.key(key)?;
-        let result = entry.inner.core.has_own_property(id, key);
-        entry.complete_with(result)
+        self.enter()?.view().has_own_property(object, key)
     }
 
     pub fn own_property_keys(&self, object: &ObjectRef) -> Result<Vec<PropertyKey>, RuntimeError> {
-        let mut entry = self.enter()?;
-        let id = entry.object(object)?;
-        let result = entry.inner.core.own_property_keys(id);
-        let keys = entry.complete_with(result)?;
-        keys.into_iter().map(|key| entry.lift_key(key)).collect()
+        self.enter()?.view().own_property_keys(object)
     }
 
     /// `typeof value`.
     pub fn type_of(&self, value: &Value) -> Result<String, RuntimeError> {
-        let mut entry = self.enter()?;
-        let value = entry.lower(value)?;
-        Ok(entry.inner.core.type_of(value))
+        self.enter()?.view().type_of(value)
     }
 
     /// QuickJS's `JS_PrintValue`: what `print` and an uncaught-exception dump
     /// show. Runs no JavaScript (no accessor, trap or coercion).
     pub fn print_value(&self, value: &Value) -> Result<String, RuntimeError> {
-        let mut entry = self.enter()?;
-        let value = entry.lower(value)?;
-        Ok(entry.inner.core.print_value(value))
+        self.enter()?.view().print_value(value)
     }
 
     /// [`Runtime::print_value`] as the bytes QuickJS writes: a lone
     /// surrogate of a raw name, message or stack as its own three bytes
     /// (WTF-8) instead of U+FFFD.
     pub fn qjs_print_value_bytes(&self, value: &Value) -> Result<Vec<u8>, RuntimeError> {
-        let mut entry = self.enter()?;
-        let value = entry.lower(value)?;
-        Ok(entry.inner.core.print_value_bytes(value))
-    }
-}
-
-impl Entry<'_> {
-    pub(crate) fn own_value(&self, slot: &Slot) -> Result<oxide_core::Value, RuntimeError> {
-        self.own(slot)
+        self.enter()?.view().qjs_print_value_bytes(value)
     }
 }

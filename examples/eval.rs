@@ -20,14 +20,13 @@ fn main() -> ExitCode {
     }
 
     let runtime = Runtime::new_with_host_services(quickjs_oxide_host::SystemHost::default());
-    let mut context = runtime.new_context().expect("create context");
+    let context = runtime.new_context().expect("create context");
     match context.eval(&source) {
         Ok(value) => {
             println!("{}", completion_text(value));
             ExitCode::SUCCESS
         }
-        Err(RuntimeError::Exception) => {
-            let exception = context.take_exception().ok().flatten();
+        Err(RuntimeError::Exception(exception)) => {
             eprintln!("uncaught JavaScript exception: {exception:?}");
             ExitCode::from(1)
         }

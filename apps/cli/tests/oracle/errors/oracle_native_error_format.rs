@@ -51,7 +51,7 @@ fn native_error_format_matches_pinned_quickjs() {
 
 #[test]
 fn explicit_error_constructor_message_bypasses_the_native_throw_buffer() {
-    let (runtime, mut context) = host_runtime_context();
+    let (runtime, context) = host_runtime_context();
     let global = context.global_object().unwrap();
     let error_key = runtime.intern_property_key("Error").unwrap();
     let Value::Object(error_constructor) = context.get_property(&global, &error_key).unwrap()
@@ -112,11 +112,9 @@ fn rust_observations(cases: &[Vec<u16>]) -> Vec<Observation> {
         .map(|units| JsString::try_from_utf16(units.iter().copied()).unwrap())
         .collect::<Vec<_>>();
     let observe = |context: &mut quickjs_oxide::engine::api::core::Context| {
-        assert_eq!(
-            context.eval("\nnew Number.isFinite"),
-            Err(RuntimeError::Exception)
-        );
-        let Some(Value::Object(error)) = context.take_exception().unwrap() else {
+        let Err(RuntimeError::Exception(Value::Object(error))) =
+            context.eval("\nnew Number.isFinite")
+        else {
             panic!("native constructor failure did not install an Error object");
         };
         let Value::String(name) = context.get_property(&error, &name_key).unwrap() else {

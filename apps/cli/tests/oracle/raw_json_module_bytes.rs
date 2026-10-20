@@ -5,8 +5,8 @@ use crate::quickjs_raw_source_oracle::{
 use crate::runtime_observation::hex_bytes;
 use crate::runtime_observation::host_runtime;
 use quickjs_oxide::engine::api::core::{
-    Context, ModuleImportAttributes, ModuleLoader, ModuleSource, NativeErrorKind, Runtime,
-    RuntimeError, Scope, Value,
+    Context, ModuleImportAttributes, ModuleLoader, ModuleScope, ModuleSource, NativeErrorKind,
+    Runtime, RuntimeError, Value,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,7 +287,7 @@ struct RawJsonModuleLoader {
 impl ModuleLoader for RawJsonModuleLoader {
     fn load(
         &mut self,
-        scope: &mut Scope<'_>,
+        scope: &mut ModuleScope<'_>,
         normalized_name: &str,
         _attributes: &ModuleImportAttributes,
     ) -> Result<ModuleSource, Value> {
@@ -371,15 +371,22 @@ fn oxide_observation(case: &Case) -> RawModuleObservation {
                 "raw JSON module observer could not read its result: {error}"
             )),
         },
-        Err(RuntimeError::Exception) => oxide_exception(&runtime, &mut context, case),
+        Err(RuntimeError::Exception(exception)) => {
+            oxide_exception(&runtime, &mut context, case, exception)
+        }
         Err(error) => RawModuleObservation::EngineFailure(error.to_string()),
     };
     drop(registration);
     observation
 }
 
-fn oxide_exception(runtime: &Runtime, context: &mut Context, case: &Case) -> RawModuleObservation {
-    let Some(Value::Object(error)) = context.take_exception().unwrap() else {
+fn oxide_exception(
+    runtime: &Runtime,
+    context: &mut Context,
+    case: &Case,
+    exception: Value,
+) -> RawModuleObservation {
+    let Value::Object(error) = exception else {
         return RawModuleObservation::EngineFailure(
             "raw JSON module exception was not an object".to_owned(),
         );

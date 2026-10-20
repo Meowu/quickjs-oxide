@@ -106,6 +106,12 @@ pub enum ModuleSource {
     Json(JsonText),
     /// A JSON5 module (QuickJS's extended JSON, `type: "json5"`).
     Json5(JsonText),
+    /// A module whose exports the embedder supplies, each a binding of
+    /// its own (`default` is the default export); the values must be
+    /// rooted by the loader.
+    Synthetic {
+        exports: Vec<(String, Value)>,
+    },
 }
 
 /// A JSON module's text: UTF-16 units, and the units that stand for bytes
@@ -314,6 +320,7 @@ fn load(cx: &mut Cx<'_>, name: &str, attributes: &[(String, String)]) -> Result<
         }
         ModuleSource::Json(text) => json_module(cx, name, &text, false),
         ModuleSource::Json5(text) => json_module(cx, name, &text, true),
+        ModuleSource::Synthetic { exports } => synthetic_module(cx, name, &exports),
     };
     cx.heap.roots().truncate(mark);
     let module = result?;
@@ -346,18 +353,44 @@ fn json_module(
 ) -> Result<ObjectId, Throw> {
     let value = crate::builtins::json_module_text(cx, text, name, extended)?;
     cx.heap.roots().push(value);
+    synthetic_module(cx, name, &[("default".into(), value)])
+}
+
+/// A module of the given exports: one non-lexical binding per name, set to
+/// its value, and nothing to evaluate.
+fn synthetic_module(
+    cx: &mut Cx<'_>,
+    name: &str,
+    exports: &[(String, Value)],
+) -> Result<ObjectId, Throw> {
+    if exports.len() > usize::from(u16::MAX) {
+        return Err(error::throw(
+            cx,
+            ErrorKind::Range,
+            "too many module exports",
+        ));
+    }
+    for (_, value) in exports {
+        cx.heap.roots().push(*value);
+    }
     let tables = ModuleTables {
-        bindings: vec![ModuleBinding::Declaration { lexical: false }],
-        exports: vec![ModuleExport {
-            name: "default".into(),
-            target: ExportTarget::Local(0),
-        }],
+        bindings: vec![ModuleBinding::Declaration { lexical: false }; exports.len()],
+        exports: exports
+            .iter()
+            .enumerate()
+            .map(|(index, (name, _))| ModuleExport {
+                name: name.as_str().into(),
+                target: ExportTarget::Local(index as u16),
+            })
+            .collect(),
         ..ModuleTables::default()
     };
     let module = create(cx, name, None, tables, &[])?;
-    let holder = cell(cx, module, 0);
-    cx.heap
-        .scope_set(ScopeId(holder.as_object().unwrap().index()), 0, 0, value);
+    for (index, (_, value)) in exports.iter().enumerate() {
+        let holder = cell(cx, module, index as u16);
+        cx.heap
+            .scope_set(ScopeId(holder.as_object().unwrap().index()), 0, 0, *value);
+    }
     Ok(module)
 }
 
@@ -832,6 +865,7 @@ fn evaluate(cx: &mut Cx<'_>, module: ObjectId) -> Result<ObjectId, Throw> {
     set_slot(cx, module, CAPABILITY, Value::object(promise));
     let mut stack = Vec::new();
     match inner_evaluate(cx, module, &mut stack, 0) {
+        Err(throw) if !super::error::catchable(cx) => return Err(throw),
         Err(Throw(thrown)) => {
             for member in stack {
                 data_mut(cx, member).status = Status::Evaluated;
@@ -1007,6 +1041,7 @@ fn async_fulfilled(cx: &mut Cx<'_>, module: ObjectId) -> Result<(), Throw> {
             execute_async(cx, member)?;
         } else {
             match execute(cx, member) {
+                Err(throw) if !super::error::catchable(cx) => return Err(throw),
                 Err(Throw(thrown)) => async_rejected(cx, member, thrown),
                 Ok(_) => {
                     let record = data_mut(cx, member);
@@ -1158,6 +1193,10 @@ pub(crate) fn import(
         Ok(())
     })();
     if let Err(Throw(thrown)) = outcome {
+        if !super::error::catchable(cx) {
+            cx.heap.roots().truncate(mark);
+            return Err(Throw(thrown));
+        }
         super::jobs::reject_promise(cx, promise, thrown);
     }
     cx.heap.roots().truncate(mark);
@@ -1212,6 +1251,9 @@ pub(crate) fn module_import_job(cx: &mut Cx<'_>, site: CallSite) -> Result<Value
         )
     })();
     if let Err(Throw(thrown)) = outcome {
+        if !super::error::catchable(cx) {
+            return Err(Throw(thrown));
+        }
         super::jobs::reject_promise(cx, promise, thrown);
     }
     Ok(Value::UNDEFINED)
@@ -1277,13 +1319,13 @@ impl crate::Runtime {
     /// Drops the module named `name` from the name map: a later import of
     /// the name loads it again. Modules that imported it keep the record.
     pub fn forget_module(&mut self, name: &str) {
-        self.host.modules.remove(name);
+        self.native_cx().forget_module(name);
     }
 
     /// Loads, links and evaluates the module named `name` (already
     /// normalized); returns the promise of its evaluation, unrooted.
     pub fn run_module(&mut self, name: &str) -> Result<Value, Throw> {
-        run(&mut self.cx(), name).map(Value::object)
+        self.native_cx().run_module(name)
     }
 
     /// [`Runtime::run_module`](crate::Runtime::run_module) with the step
@@ -1299,6 +1341,23 @@ impl crate::Runtime {
 
     /// The state of a promise (0 pending, 1 fulfilled, 2 rejected) and its
     /// result.
+    pub fn promise_state(&mut self, promise: Value) -> Option<(i32, Value)> {
+        self.native_cx().promise_state(promise)
+    }
+}
+
+impl crate::NativeCx<'_> {
+    /// [`Runtime::forget_module`](crate::Runtime::forget_module).
+    pub fn forget_module(&mut self, name: &str) {
+        self.host.modules.remove(name);
+    }
+
+    /// [`Runtime::run_module`](crate::Runtime::run_module).
+    pub fn run_module(&mut self, name: &str) -> Result<Value, Throw> {
+        run(&mut self.cx(), name).map(Value::object)
+    }
+
+    /// [`Runtime::promise_state`](crate::Runtime::promise_state).
     pub fn promise_state(&mut self, promise: Value) -> Option<(i32, Value)> {
         let cx = self.cx();
         let object = promise.as_object()?;

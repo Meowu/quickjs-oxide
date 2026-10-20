@@ -7,15 +7,8 @@ use quickjs_oxide::engine::api::core::{JsString, RuntimeError, Value};
 fn top_level_for_await_uses_pinned_quickjs_syntax_diagnostic() {
     let (runtime, mut context) = host_runtime_context();
     let (source, expected) = ("for await(var value of 'a')value", "expecting '('");
-    let Err(RuntimeError::Exception) = context.compile(source) else {
-        panic!("top-level for-await was not rejected: {source}");
-    };
-    let Value::Object(error) = context
-        .take_exception()
-        .expect("take top-level for-await exception")
-        .expect("top-level for-await exception is present")
-    else {
-        panic!("top-level for-await did not materialize an Error object: {source}");
+    let Err(RuntimeError::Exception(Value::Object(error))) = context.compile(source) else {
+        panic!("top-level for-await did not throw an Error object: {source}");
     };
     assert_eq!(
         error_string_property(&runtime, &mut context, &error, "message", source),
@@ -27,8 +20,8 @@ fn top_level_for_await_uses_pinned_quickjs_syntax_diagnostic() {
 #[test]
 fn for_of_cross_realm_regression() {
     let runtime = host_runtime();
-    let mut defining = runtime.new_context().expect("create context");
-    let mut caller = runtime.new_context().expect("create context");
+    let defining = runtime.new_context().expect("create context");
+    let caller = runtime.new_context().expect("create context");
     let bytecode = defining
         .compile("(function(){var result='';for(var value of 'ab')result+=value;return result})()")
         .unwrap();

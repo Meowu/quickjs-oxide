@@ -723,6 +723,12 @@ natives! {
     Read => crate::vm::compile::read, "read", 1;
     LoadScript => crate::vm::compile::load_script, "__loadScript", 1;
     PerformanceNow => global::performance_now, "now", 0;
+
+    /// An embedder's function (`NativeCx::new_host_function`); its name
+    /// and length are its own properties.
+    HostFunction => crate::vm::native::host_call, "", 0;
+    /// An embedder's function that `new` may call.
+    HostConstructor => crate::vm::native::host_call, "", 0, constructor;
 }
 
 impl Native {
@@ -1373,6 +1379,7 @@ pub(crate) fn detach_array_buffer(cx: &mut Cx<'_>, site: CallSite) -> Result<Val
 
 pub(crate) use bigint::to_bigint;
 pub(crate) use buffer::detach as detach_buffer;
+pub(crate) use buffer::new_array_buffer;
 pub(crate) use date::iso_string as date_iso_string;
 pub(crate) use generator::async_from_sync_iterator;
 pub(crate) use json::json_module_text;

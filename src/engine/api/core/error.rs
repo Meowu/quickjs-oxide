@@ -2,18 +2,25 @@
 
 use std::fmt;
 
+use super::value::Value;
 use crate::engine::api::error::Error;
 use crate::engine::value::JsStringError;
 
 /// Why an API call failed.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RuntimeError {
-    /// JavaScript threw: the value is the context's pending exception
-    /// ([`Context::take_exception`](super::Context::take_exception)).
-    Exception,
-    /// An API call was made from inside a host callback without its
-    /// [`Scope`](super::Scope).
+    /// JavaScript threw this value.
+    Exception(Value),
+    /// An API call was made through a `Context` or `Runtime` from inside a
+    /// host function or callback, which has its own scope.
     Reentered,
+    /// The script was interrupted ([`InterruptHandle`](super::InterruptHandle)
+    /// or [`Host::interrupt`](super::Host::interrupt)); no `catch` or
+    /// `finally` of it ran.
+    Interrupted,
+    /// A host function panicked while the runtime ran it; the runtime's
+    /// state is unknown and every later call fails.
+    Poisoned,
     /// The engine does not have this (`"realms"`).
     Unsupported(&'static str),
     /// The front end rejected the source.
@@ -29,9 +36,13 @@ pub enum RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RuntimeError::Exception => f.write_str("JavaScript exception"),
+            RuntimeError::Exception(_) => f.write_str("JavaScript exception"),
             RuntimeError::Reentered => {
                 f.write_str("the runtime was re-entered from a host callback")
+            }
+            RuntimeError::Interrupted => f.write_str("interrupted"),
+            RuntimeError::Poisoned => {
+                f.write_str("the runtime is poisoned: a host function panicked")
             }
             RuntimeError::Unsupported(what) => write!(f, "{what} are not supported"),
             RuntimeError::Compile(error) => write!(f, "{error}"),

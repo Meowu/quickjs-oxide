@@ -245,7 +245,7 @@ const SCRIPT_SEPARATOR: &str = "\n// ---\n";
 
 /// Evaluate the case in a fresh runtime and format its completion(s) in JS.
 fn observe_oxide_completion(case: &Case, arrays: bool) -> String {
-    let (runtime, mut context) = host_runtime_context();
+    let (runtime, context) = host_runtime_context();
     let Ok(Value::Object(formatter)) = context.eval(OXIDE_FORMATTER) else {
         panic!("{}: formatter did not evaluate", case.name);
     };
@@ -257,13 +257,7 @@ fn observe_oxide_completion(case: &Case, arrays: bool) -> String {
     for script in case.source.split(SCRIPT_SEPARATOR) {
         let (kind, value) = match context.eval(script) {
             Ok(value) => ("return", value),
-            Err(RuntimeError::Exception) => (
-                "throw",
-                context
-                    .take_exception()
-                    .unwrap_or_else(|error| panic!("{}: take exception: {error}", case.name))
-                    .unwrap_or_else(|| panic!("{}: exception was missing", case.name)),
-            ),
+            Err(RuntimeError::Exception(exception)) => ("throw", exception),
             Err(error) => panic!("Rust engine failure for {}: {error}", case.name),
         };
         let kind = Value::String(JsString::try_from_utf8(kind).unwrap());
@@ -282,16 +276,17 @@ fn observe_oxide_completion(case: &Case, arrays: bool) -> String {
 /// Like [`observe_oxide_completion`], but returned values and thrown
 /// primitives are rendered by `normalize_rust_value_units`.
 fn observe_oxide_units(case: &Case) -> String {
-    let (runtime, mut context) = host_runtime_context();
+    let (runtime, context) = host_runtime_context();
     match context.eval(&case.source) {
         Ok(value) => normalize_rust_value_units(&value),
-        Err(RuntimeError::Exception) => match context.take_exception() {
-            Ok(Some(Value::Object(object))) if runtime.as_callable(&object).unwrap().is_none() => {
-                observe_oxide_completion(case, false)
-            }
-            Ok(Some(value)) => format!("throw|{}", normalize_rust_value_units(&value)),
-            other => panic!("{}: missing exception: {other:?}", case.name),
-        },
+        Err(RuntimeError::Exception(Value::Object(object)))
+            if runtime.as_callable(&object).unwrap().is_none() =>
+        {
+            observe_oxide_completion(case, false)
+        }
+        Err(RuntimeError::Exception(value)) => {
+            format!("throw|{}", normalize_rust_value_units(&value))
+        }
         Err(error) => panic!("Rust engine failure for {}: {error}", case.name),
     }
 }

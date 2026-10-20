@@ -63,7 +63,7 @@ fn label_of(value: Result<Value, RuntimeError>) -> String {
     match value {
         Ok(Value::String(label)) => label.to_utf8_lossy(),
         Ok(other) => format!("unexpected:{other:?}"),
-        Err(RuntimeError::Exception) => "UNCAUGHT".to_owned(),
+        Err(RuntimeError::Exception(_)) => "UNCAUGHT".to_owned(),
         Err(error) => format!("ERROR:{error}"),
     }
 }
@@ -82,7 +82,7 @@ fn run_child(mut arguments: impl Iterator<Item = String>) -> ExitCode {
         .unwrap_or(PARSE_DEPTH);
 
     let runtime = Runtime::new_with_host_services(SystemHost::default());
-    let mut context = runtime.new_context().expect("create context");
+    let context = runtime.new_context().expect("create context");
 
     match mode.as_str() {
         "shallow" => {

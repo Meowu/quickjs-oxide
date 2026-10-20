@@ -476,10 +476,7 @@ impl Runtime {
     /// Runs `install` with the atoms it interns pinned, as the builtins'
     /// are.
     fn installing<T>(&mut self, install: impl FnOnce(&mut Cx<'_>) -> T) -> T {
-        let mode = self.heap.set_atom_mode(crate::heap::AtomMode::Pin);
-        let result = install(&mut self.cx());
-        self.heap.set_atom_mode(mode);
-        result
+        self.native_cx().installing(install)
     }
 
     /// The loop's view of the runtime.
@@ -569,13 +566,13 @@ impl Runtime {
     /// Defines qjs's `--std` globals, `load` and `read`, over the host's
     /// [`read_file`](crate::host::Host::read_file).
     pub fn install_std(&mut self) -> Result<(), HeapError> {
-        self.installing(crate::builtins::install_std)
+        self.native_cx().install_std()
     }
 
     /// Defines `qjs`'s helpers as QuickJS's `js_std_add_helpers` does:
     /// `console`, `scriptArgs` when given, `print`.
     pub fn install_qjs_helpers(&mut self, script_args: Option<&[String]>) -> Result<(), HeapError> {
-        self.installing(|cx| crate::builtins::install_qjs_helpers(cx, script_args))
+        self.native_cx().install_qjs_helpers(script_args)
     }
 
     /// Defines qjs's `scriptArgs`.
@@ -586,8 +583,7 @@ impl Runtime {
     /// Runs a script function (from [`Runtime::instantiate`]) with the
     /// global object as `this`. The result is unrooted.
     pub fn run_script(&mut self, script: ObjectId) -> Result<Value, Throw> {
-        let global = Value::object(self.realm.global);
-        self.call(Value::object(script), global, &[])
+        self.native_cx().run_script(script)
     }
 
     /// Runs pending jobs until the queue is empty; the host calls it at its
@@ -615,7 +611,7 @@ impl Runtime {
     /// Calls `function`; the result or the thrown value is unrooted. The
     /// caller keeps `function` alive (a handle or a rooted object).
     pub fn call(&mut self, function: Value, this: Value, args: &[Value]) -> Result<Value, Throw> {
-        crate::vm::call(&mut self.cx(), function, this, args)
+        self.native_cx().call(function, this, args)
     }
 
     /// `ToString(value)` as Rust text, for hosts printing a result or an
@@ -819,9 +815,7 @@ impl Runtime {
 
     /// An ordinary object inheriting from `%Object.prototype%`.
     pub fn new_object(&mut self) -> Result<ObjectId, HeapError> {
-        let prototype = self.intrinsic(Intrinsic::ObjectPrototype);
-        self.heap
-            .alloc_object(ObjectKind::Ordinary, Some(prototype), 4)
+        self.native_cx().new_object()
     }
 
     pub fn new_array(&mut self, capacity: u32) -> Result<ObjectId, HeapError> {
@@ -915,7 +909,7 @@ impl Runtime {
 
     /// Holds `value` for the embedder until [`Runtime::release`].
     pub fn hold(&mut self, value: Value) -> Handle {
-        self.heap.handles().create(value)
+        self.native_cx().hold(value)
     }
 
     pub fn held(&self, handle: Handle) -> Value {
@@ -923,6 +917,6 @@ impl Runtime {
     }
 
     pub fn release(&mut self, handle: Handle) {
-        self.heap.handles().release(handle);
+        self.native_cx().release(handle);
     }
 }

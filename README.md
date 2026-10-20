@@ -2,7 +2,7 @@
 
 A JavaScript engine written entirely in safe Rust, with zero `unsafe`, that
 targets the behavior of [QuickJS](https://bellard.org/quickjs/) 2026-06-04.
-Its core, `oxide-core`, compiles every function to register bytecode and runs
+Its core, `quickjs-oxide-core`, compiles every function to register bytecode and runs
 it in one loop with inline caches, over a NaN-boxed value heap and a
 mark-sweep collector.
 
@@ -88,7 +88,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`examples/eval.rs` handles every completion value and uncaught exceptions.
+A Rust closure becomes a JavaScript function; its arguments are converted
+to the closure's parameter types:
+
+```rust
+use quickjs_oxide::engine::api::core::{Runtime, Scope};
+
+let runtime = Runtime::new();
+let context = runtime.context();
+let global = context.global_object()?;
+context.define_function(&global, "add", 2, |_: &mut Scope<'_>, a: f64, b: f64| Ok(a + b))?;
+assert_eq!(context.eval("add(40, 2)")?.as_number(), Some(42.0));
+```
+
+`examples/eval.rs` handles every completion value and uncaught exceptions;
+`examples/host.rs` shows host functions, a host object, a promise settled
+from Rust, a native module and an interrupt.
 Code compiled through `eval`/`compile` lives as long as the runtime; an
 application that evaluates input repeatedly (a REPL) passes
 `EvalOptions::default().transient()` so that each input's code is freed
@@ -103,14 +118,14 @@ The language, built-ins and ES modules (static and dynamic `import`,
 top-level `await`, import attributes, JSON modules) follow ECMA-262 within
 QuickJS 2026-06-04's feature set, apart from the five ledger entries above.
 The `std` and `os` modules, the REPL, `Worker`, `qjsc` and the C API are not
-yet supported. [Compatibility](docs/compatibility.md) details the baseline,
+yet supported; the Rust embedding API provides the C API's equivalents. [Compatibility](docs/compatibility.md) details the baseline,
 how conformance is measured, the approved deviations and the full product
 surface.
 
 ## Documentation
 
 - [Compatibility with QuickJS 2026-06-04](docs/compatibility.md)
-- [Architecture](docs/architecture.md) and [implementation status](docs/status.md)
+- [Architecture](docs/architecture.md), [embedding internals](docs/embedding.md) and [implementation status](docs/status.md)
 - [Test262 baseline and metrics](docs/test262.md)
 - [Execution](docs/performance/execution.md), [the heap](docs/heap.md), [performance](docs/performance/README.md) and [profiling](docs/profiling.md)
 - [Browser playground](docs/playground.md), [releases](docs/release.md) and the [changelog](CHANGELOG.md)
@@ -130,9 +145,9 @@ npm ci && npx playwright install chromium && npm run test:browser
 ```
 
 `rust-toolchain.toml` pins the toolchain. The core (bytecode, heap, loop and
-builtins) lives in the `oxide-core` crate (`core/`), the front end, the
+builtins) lives in the `quickjs-oxide-core` crate (`core/`), the front end, the
 register lowering and the embedding API in the root crate (`src/`), the
-regular-expression engine and Unicode tables in the `oxide-regexp` crate
+regular-expression engine and Unicode tables in the `quickjs-oxide-regexp` crate
 (`regexp/`), host adapters in `adapters/`, the CLI and WebAssembly apps in
 `apps/`, and the Test262 runner in `conformance/test262`; the
 [architecture guide](docs/architecture.md) describes each crate's

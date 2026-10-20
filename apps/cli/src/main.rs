@@ -4,8 +4,8 @@
 use quickjs_oxide::QUICKJS_COMPAT_VERSION;
 use quickjs_oxide::engine::api::core::{
     Context, DebugInfoMode, HeapLimits, JsString, ModuleImportAttributes, ModuleLoader,
-    ModuleSource, NativeErrorKind, PromiseState, QjsHelpers, Runtime, RuntimeError, RuntimeOptions,
-    Scope, Value, declare_thread_stack, number_to_string, quickjs_detect_module_bytes,
+    ModuleScope, ModuleSource, NativeErrorKind, PromiseState, QjsHelpers, Runtime, RuntimeError,
+    RuntimeOptions, Value, declare_thread_stack, number_to_string, quickjs_detect_module_bytes,
 };
 use quickjs_oxide_host::SystemHost;
 use std::io::Write as _;
@@ -326,11 +326,11 @@ struct FileModuleLoader;
 impl ModuleLoader for FileModuleLoader {
     fn load(
         &mut self,
-        scope: &mut Scope<'_>,
+        scope: &mut ModuleScope<'_>,
         name: &str,
         attributes: &ModuleImportAttributes,
     ) -> Result<ModuleSource, Value> {
-        let throw = |scope: &mut Scope<'_>, kind: NativeErrorKind, message: String| {
+        let throw = |scope: &mut ModuleScope<'_>, kind: NativeErrorKind, message: String| {
             scope
                 .new_native_error(kind, &message)
                 .unwrap_or(Value::Undefined)
@@ -463,8 +463,7 @@ fn evaluate(request: &EvaluationRequest) -> ExitCode {
     };
     let code = match evaluation {
         Ok(value) => {
-            if !drain_pending_jobs(&runtime, &mut context) || report_unhandled_rejections(&runtime)
-            {
+            if !drain_pending_jobs(&runtime) || report_unhandled_rejections(&runtime) {
                 ExitCode::from(1)
             } else {
                 if options.print_result {
@@ -477,8 +476,8 @@ fn evaluate(request: &EvaluationRequest) -> ExitCode {
             report_exception(&runtime, &exception);
             ExitCode::from(1)
         }
-        Err(Failure::Runtime(RuntimeError::Exception)) => {
-            report_pending_exception(&runtime, &mut context);
+        Err(Failure::Runtime(RuntimeError::Exception(exception))) => {
+            report_exception(&runtime, &exception);
             ExitCode::from(1)
         }
         Err(Failure::Runtime(error)) => {
@@ -497,15 +496,15 @@ enum Failure {
     Rejected(Value),
 }
 
-/// Drain the job queue the way `js_std_loop` does: a job that leaves a
-/// pending exception is reported and the queue keeps draining. Returns
-/// `false` when an internal error (not a JavaScript exception) stopped it.
-fn drain_pending_jobs(runtime: &Runtime, context: &mut Context) -> bool {
+/// Drain the job queue the way `js_std_loop` does: a job that throws is
+/// reported and the queue keeps draining. Returns `false` when an internal
+/// error (not a JavaScript exception) stopped it.
+fn drain_pending_jobs(runtime: &Runtime) -> bool {
     loop {
         match runtime.run_pending_job() {
             Ok(outcome) if outcome.executed() => {}
             Ok(_) => return true,
-            Err(RuntimeError::Exception) => report_pending_exception(runtime, context),
+            Err(RuntimeError::Exception(exception)) => report_exception(runtime, &exception),
             Err(error) => {
                 report_runtime_error(&error);
                 return false;
@@ -573,7 +572,7 @@ fn evaluate_module(
             PromiseState::Pending => match runtime.run_pending_job() {
                 Ok(outcome) if outcome.executed() => {}
                 Ok(_) => std::thread::yield_now(),
-                Err(RuntimeError::Exception) => report_pending_exception(runtime, context),
+                Err(RuntimeError::Exception(exception)) => report_exception(runtime, &exception),
                 Err(error) => return Err(Failure::Runtime(error)),
             },
         }
@@ -600,13 +599,6 @@ fn report_runtime_error(error: &RuntimeError) {
     match error {
         RuntimeError::OutOfMemory => eprintln!("InternalError: out of memory"),
         other => eprintln!("{other}"),
-    }
-}
-
-fn report_pending_exception(runtime: &Runtime, context: &mut Context) {
-    match context.take_exception().ok().flatten() {
-        Some(exception) => report_exception(runtime, &exception),
-        None => eprintln!("JavaScript exception"),
     }
 }
 
@@ -680,7 +672,7 @@ mod tests {
     #[test]
     fn error_dump_uses_raw_shadowing_and_never_executes_getters() {
         let runtime = Runtime::new_with_host_services(quickjs_oxide_host::SystemHost::default());
-        let mut context = runtime.context();
+        let context = runtime.context();
         let Value::Object(error) = context.eval("new Error(\"boom\")").unwrap() else {
             panic!("Error constructor did not return an object");
         };
@@ -689,7 +681,7 @@ mod tests {
             .unwrap()
             .expect("Error has a prototype");
         let Value::Object(getter_object) = context
-            .eval("(function diagnosticGetter(){ throw \"getter ran\"; })")
+            .eval("(function diagnosticGetter(){ globalThis.getterRan = true; throw \"getter ran\"; })")
             .unwrap()
         else {
             panic!("getter expression did not return an object");
@@ -723,13 +715,13 @@ mod tests {
             );
         }
 
-        assert!(!context.has_exception().expect("runtime state"));
         assert_eq!(
             format_exception(&runtime, &Value::Object(error)),
             Some("Error".to_owned())
         );
-        assert!(
-            !context.has_exception().expect("runtime state"),
+        assert_eq!(
+            context.eval("globalThis.getterRan").unwrap(),
+            Value::Undefined,
             "diagnostic getter was executed"
         );
     }
@@ -737,7 +729,7 @@ mod tests {
     #[test]
     fn error_dump_reads_exactly_one_raw_prototype_level() {
         let runtime = Runtime::new_with_host_services(quickjs_oxide_host::SystemHost::default());
-        let mut context = runtime.context();
+        let context = runtime.context();
         let Value::Object(error) = context.eval("new Error()").unwrap() else {
             panic!("Error constructor did not return an object");
         };

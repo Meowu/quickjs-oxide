@@ -232,12 +232,10 @@ fn scoped_function_conflicts_and_global_annex_order_match_quickjs() {
         );
     }
 
-    let (runtime, mut context) = test_context();
-    assert_eq!(
-        context.eval("{function lateGlobalLexical(){}}let lateGlobalLexical;"),
-        Err(RuntimeError::Exception)
-    );
-    let Value::Object(error) = context.take_exception().unwrap().unwrap() else {
+    let (runtime, context) = test_context();
+    let Err(RuntimeError::Exception(Value::Object(error))) =
+        context.eval("{function lateGlobalLexical(){}}let lateGlobalLexical;")
+    else {
         panic!("Annex B global lexical collision did not throw an Error object");
     };
     let message = runtime.intern_property_key("message").unwrap();
